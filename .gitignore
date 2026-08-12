@@ -1,0 +1,27 @@
+# Ignorar carpetas de compilación local de ROS 2
+build/
+install/
+log/
+
+# Ignorar cachés de Python
+__pycache__/
+*.pyc
+
+# Ignorar configuraciones ocultas locales de VS Code
+.vscode/
+
+# Entornos y artefactos
+.venv/
+*.egg-info/
+*.tar.gz
+
+# Ignorar secrets y archivos de entorno
+.env
+src/earth-rovers-sdk/.env
+
+# IDEs / OS
+.idea/
+.DS_Store
+
+# Logs
+*.log
