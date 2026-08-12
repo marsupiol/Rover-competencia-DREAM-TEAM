@@ -23,12 +23,6 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-# --- INSTALACIÓN DEL NODO PUENTE ---
-install(PROGRAMS
-  scripts/earth_rover_bridge.py
-  DESTINATION lib/${PROJECT_NAME}
-)
-
 # --- INSTALACIÓN DE DIRECTORIOS COMPLEMENTARIOS ---
 install(DIRECTORY 
   config 

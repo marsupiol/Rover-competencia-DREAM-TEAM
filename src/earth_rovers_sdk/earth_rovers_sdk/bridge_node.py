@@ -25,6 +25,7 @@ from std_msgs.msg import Float32
 CONTROL_RATE_HZ = 10.0
 CMD_VEL_TIMEOUT_S = 0.5
 CONTROL_HTTP_TIMEOUT_S = 1.0
+GRAVITY_M_S2 = 9.80665
 
 # Covariances are tuning knobs for the EKF.
 # Increase values to make the filter trust the sensor less, decrease to trust it more.
@@ -247,7 +248,13 @@ class EarthRoverBridge(Node):
             gps = NavSatFix()
             gps.header.stamp = now
             gps.header.frame_id = "earth_rover_gps"
-            gps.status.status = NavSatStatus.STATUS_FIX
+            
+            gps_signal = data.get("gps_signal")
+            if gps_signal is not None and float(gps_signal) < 10:
+                gps.status.status = NavSatStatus.STATUS_NO_FIX
+            else:
+                gps.status.status = NavSatStatus.STATUS_FIX
+                
             gps.status.service = NavSatStatus.SERVICE_GPS
             gps.latitude = float(lat)
             gps.longitude = float(lng)
@@ -281,9 +288,9 @@ class EarthRoverBridge(Node):
             imu.header.frame_id = "base_link"
             if accels:
                 sample = accels[-1]
-                imu.linear_acceleration.x = float(sample[0])
-                imu.linear_acceleration.y = float(sample[1])
-                imu.linear_acceleration.z = float(sample[2])
+                imu.linear_acceleration.x = float(sample[0]) * GRAVITY_M_S2
+                imu.linear_acceleration.y = float(sample[1]) * GRAVITY_M_S2
+                imu.linear_acceleration.z = float(sample[2]) * GRAVITY_M_S2
             if gyros:
                 sample = gyros[-1]
                 imu.angular_velocity.x = math.radians(float(sample[0]))

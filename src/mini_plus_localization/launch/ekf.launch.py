@@ -26,16 +26,42 @@ def generate_launch_description():
         parameters=[{'sdk_url': LaunchConfiguration('sdk_url')}]
     )
 
-    ekf_node = Node(
+    ekf_odom_node = Node(
         package='robot_localization',
         executable='ekf_node',
-        name='ekf_filter_node',
+        name='ekf_filter_node_odom',
         output='screen',
-        parameters=[config_dir]
+        parameters=[config_dir],
+        remappings=[('odometry/filtered', 'odometry/filtered/local')]
+    )
+
+    navsat_transform_node = Node(
+        package='robot_localization',
+        executable='navsat_transform_node',
+        name='navsat_transform',
+        output='screen',
+        parameters=[config_dir],
+        remappings=[
+            ('gps/fix', '/earth_rover/gps'),
+            ('imu/data', '/imu/data'),
+            ('odometry/filtered', 'odometry/filtered/local'),
+            ('odometry/gps', '/odometry/gps'),
+        ]
+    )
+
+    ekf_map_node = Node(
+        package='robot_localization',
+        executable='ekf_node',
+        name='ekf_filter_node_map',
+        output='screen',
+        parameters=[config_dir],
+        remappings=[('odometry/filtered', 'odometry/filtered/map')]
     )
 
     return LaunchDescription([
         sdk_url_arg,
         bridge_node,
-        ekf_node
+        ekf_odom_node,
+        navsat_transform_node,
+        ekf_map_node
     ])
