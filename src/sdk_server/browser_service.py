@@ -8,7 +8,9 @@ from dotenv import load_dotenv
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOTENV_PATH = os.path.join(BASE_DIR, ".env")
+load_dotenv(DOTENV_PATH)
 
 logger = logging.getLogger("browser_service")
 
