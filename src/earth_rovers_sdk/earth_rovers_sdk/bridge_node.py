@@ -15,15 +15,55 @@ import rclpy
 import requests
 import websocket
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Quaternion, Twist
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import BatteryState, Image, Imu, NavSatFix
+from sensor_msgs.msg import BatteryState, Image, Imu, NavSatFix, NavSatStatus
 from std_msgs.msg import Float32
 
 CONTROL_RATE_HZ = 10.0
 CMD_VEL_TIMEOUT_S = 0.5
 CONTROL_HTTP_TIMEOUT_S = 1.0
+
+# Covariances are tuning knobs for the EKF.
+# Increase values to make the filter trust the sensor less, decrease to trust it more.
+ODOM_POSE_COVARIANCE = [
+    0.5, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.5, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.5, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.5, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.1,
+]
+ODOM_TWIST_COVARIANCE = [
+    0.1, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.1, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.5, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.5, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.2,
+]
+IMU_ORIENTATION_COVARIANCE = [
+    0.01, 0.0, 0.0,
+    0.0, 0.01, 0.0,
+    0.0, 0.0, 0.1,
+]
+IMU_ANGULAR_VELOCITY_COVARIANCE = [
+    0.02, 0.0, 0.0,
+    0.0, 0.02, 0.0,
+    0.0, 0.0, 0.05,
+]
+IMU_LINEAR_ACCELERATION_COVARIANCE = [
+    0.2, 0.0, 0.0,
+    0.0, 0.2, 0.0,
+    0.0, 0.0, 0.4,
+]
+GPS_POSITION_COVARIANCE = [
+    5.0, 0.0, 0.0,
+    0.0, 5.0, 0.0,
+    0.0, 0.0, 10.0,
+]
 
 
 class EarthRoverBridge(Node):
@@ -46,6 +86,7 @@ class EarthRoverBridge(Node):
         )
         self.gps_pub = self.create_publisher(NavSatFix, "earth_rover/gps", sensor_qos)
         self.imu_pub = self.create_publisher(Imu, "imu/data", sensor_qos)
+        self.odom_pub = self.create_publisher(Odometry, "/wheel_odom", sensor_qos)
         self.battery_pub = self.create_publisher(
             BatteryState, "earth_rover/battery", sensor_qos
         )
@@ -53,10 +94,47 @@ class EarthRoverBridge(Node):
             Float32, "earth_rover/heading", sensor_qos
         )
 
+        self.declare_parameter("odom_pose_covariance", ODOM_POSE_COVARIANCE)
+        self.declare_parameter("odom_twist_covariance", ODOM_TWIST_COVARIANCE)
+        self.declare_parameter(
+            "imu_orientation_covariance", IMU_ORIENTATION_COVARIANCE
+        )
+        self.declare_parameter(
+            "imu_angular_velocity_covariance", IMU_ANGULAR_VELOCITY_COVARIANCE
+        )
+        self.declare_parameter(
+            "imu_linear_acceleration_covariance", IMU_LINEAR_ACCELERATION_COVARIANCE
+        )
+        self.declare_parameter("gps_position_covariance", GPS_POSITION_COVARIANCE)
+
+        self._odom_pose_covariance = self.get_parameter(
+            "odom_pose_covariance"
+        ).value
+        self._odom_twist_covariance = self.get_parameter(
+            "odom_twist_covariance"
+        ).value
+        self._imu_orientation_covariance = self.get_parameter(
+            "imu_orientation_covariance"
+        ).value
+        self._imu_angular_velocity_covariance = self.get_parameter(
+            "imu_angular_velocity_covariance"
+        ).value
+        self._imu_linear_acceleration_covariance = self.get_parameter(
+            "imu_linear_acceleration_covariance"
+        ).value
+        self._gps_position_covariance = self.get_parameter(
+            "gps_position_covariance"
+        ).value
+
         self._latest_cmd = None
         self._last_cmd_at = 0.0
         self._stopped = True
         self._cmd_lock = threading.Lock()
+
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._last_odom_time = None
+        self._last_yaw = None
         self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, command_qos)
 
         self._session = requests.Session()
@@ -114,6 +192,10 @@ class EarthRoverBridge(Node):
             if time.monotonic() - deadline > interval:
                 deadline = time.monotonic()
 
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
+
     def _feed_loop(self):
         url = f"{self.sdk_url}/feed?view=front&fps={self.feed_fps}"
         while self._running and rclpy.ok():
@@ -165,15 +247,24 @@ class EarthRoverBridge(Node):
             gps = NavSatFix()
             gps.header.stamp = now
             gps.header.frame_id = "earth_rover_gps"
+            gps.status.status = NavSatStatus.STATUS_FIX
+            gps.status.service = NavSatStatus.SERVICE_GPS
             gps.latitude = float(lat)
             gps.longitude = float(lng)
+            gps.position_covariance = self._gps_position_covariance
+            gps.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
             self.gps_pub.publish(gps)
 
         orientation = data.get("orientation")
+        yaw = None
         if orientation is not None:
             heading = Float32()
             heading.data = float(orientation)
             self.heading_pub.publish(heading)
+            try:
+                yaw = math.radians(float(orientation))
+            except (TypeError, ValueError):
+                yaw = None
 
         battery = data.get("battery")
         if battery is not None:
@@ -187,7 +278,7 @@ class EarthRoverBridge(Node):
         if accels or gyros:
             imu = Imu()
             imu.header.stamp = now
-            imu.header.frame_id = "earth_rover_imu"
+            imu.header.frame_id = "base_link"
             if accels:
                 sample = accels[-1]
                 imu.linear_acceleration.x = float(sample[0])
@@ -198,7 +289,73 @@ class EarthRoverBridge(Node):
                 imu.angular_velocity.x = math.radians(float(sample[0]))
                 imu.angular_velocity.y = math.radians(float(sample[1]))
                 imu.angular_velocity.z = math.radians(float(sample[2]))
+            
+            # Llenar la orientación con el yaw de la brújula si está disponible
+            if yaw is not None:
+                imu.orientation.x = 0.0
+                imu.orientation.y = 0.0
+                imu.orientation.z = math.sin(yaw / 2.0)
+                imu.orientation.w = math.cos(yaw / 2.0)
+            else:
+                imu.orientation.x = 0.0
+                imu.orientation.y = 0.0
+                imu.orientation.z = 0.0
+                imu.orientation.w = 1.0
+
+            imu.orientation_covariance = self._imu_orientation_covariance
+            imu.angular_velocity_covariance = self._imu_angular_velocity_covariance
+            imu.linear_acceleration_covariance = self._imu_linear_acceleration_covariance
             self.imu_pub.publish(imu)
+
+        speed = data.get("speed")
+        speed_m_s = None
+        if speed is not None:
+            try:
+                speed_m_s = float(speed)
+            except (TypeError, ValueError):
+                speed_m_s = None
+
+        yaw_rate = None
+        if gyros:
+            try:
+                yaw_rate = math.radians(float(gyros[-1][2]))
+            except (TypeError, ValueError, IndexError):
+                yaw_rate = None
+
+        current_time = time.monotonic()
+        dt = None
+        if self._last_odom_time is not None:
+            dt = current_time - self._last_odom_time
+        if speed_m_s is not None and yaw is not None and dt is not None and dt > 0:
+            self._odom_x += speed_m_s * math.cos(yaw) * dt
+            self._odom_y += speed_m_s * math.sin(yaw) * dt
+
+        if speed_m_s is not None and yaw is not None:
+            if yaw_rate is None and self._last_yaw is not None and dt is not None and dt > 0:
+                yaw_rate = self._normalize_angle(yaw - self._last_yaw) / dt
+            self._last_yaw = yaw
+            self._last_odom_time = current_time
+
+            odom = Odometry()
+            odom.header.stamp = now
+            odom.header.frame_id = "odom"
+            odom.child_frame_id = "base_link"
+            odom.pose.pose.position.x = self._odom_x
+            odom.pose.pose.position.y = self._odom_y
+            odom.pose.pose.position.z = 0.0
+            odom.pose.pose.orientation = Quaternion(
+                x=0.0,
+                y=0.0,
+                z=math.sin(yaw / 2.0),
+                w=math.cos(yaw / 2.0),
+            )
+            odom.pose.covariance = self._odom_pose_covariance
+            odom.twist.twist.linear.x = speed_m_s
+            odom.twist.twist.linear.y = 0.0
+            odom.twist.twist.linear.z = 0.0
+            odom.twist.twist.angular.z = yaw_rate if yaw_rate is not None else 0.0
+            odom.twist.covariance = self._odom_twist_covariance
+            self.odom_pub.publish(odom)
 
     def destroy_node(self):
         self._running = False
