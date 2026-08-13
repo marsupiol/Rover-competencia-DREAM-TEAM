@@ -1,0 +1,24 @@
+gps_waypoint_controller:
+  ros__parameters:
+    goal_tolerance_m: 3.0
+    goal_dwell_s: 1.5
+    max_linear_speed: 0.55
+    min_linear_speed: 0.22
+    max_angular_speed: 0.45
+    max_drive_angular_speed: 0.22
+    kp_angular: 0.006
+    kd_angular: 0.04
+    kp_linear: 0.05
+    turn_in_place_threshold_deg: 28.0
+    drive_heading_deadband_deg: 6.0
+    max_steering_error_deg: 90.0
+    heading_filter_alpha: 0.18
+    angular_filter_alpha: 0.5
+    heading_offset_deg: 0.0
+    invert_angular: false
+    stuck_timeout_s: 8.0
+    progress_epsilon_m: 0.8
+    recovery_backup_s: 1.8
+    recovery_turn_s: 2.5
+    recovery_reverse_speed: -0.25
+    recovery_turn_speed: 0.45

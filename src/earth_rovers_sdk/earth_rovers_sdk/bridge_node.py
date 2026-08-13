@@ -3,6 +3,15 @@
 This module is adapted from `mini_plus_localization/scripts/earth_rover_bridge.py`
 and exposed as a `console_scripts` entrypoint so it can be run with
 `ros2 run earth_rovers_sdk earth_rover_bridge` after `colcon build`.
+
+Changes vs. the original version (see chat for details):
+  - Compass/magnetometer heading is converted from the "0=North, clockwise"
+    convention to the ROS/REP-103 ENU yaw convention (0=East, counter-clockwise)
+    before it's used anywhere (IMU orientation, odom orientation, dead-reckoning).
+  - IMU / Odometry / GPS publishers use RELIABLE QoS to match robot_localization's
+    default subscriber QoS (BEST_EFFORT publisher + RELIABLE subscriber = no data
+    delivered at all, which silently starves the EKF).
+  - GPS topic renamed to /gps/fix, the default navsat_transform_node expects.
 """
 
 import json
@@ -45,10 +54,13 @@ ODOM_TWIST_COVARIANCE = [
     0.0, 0.0, 0.0, 0.0, 0.5, 0.0,
     0.0, 0.0, 0.0, 0.0, 0.0, 0.2,
 ]
+# Orientation covariance is tighter on yaw (z) than the original defaults because
+# the rover's magnetometer heading is the most reliable sensor we have here.
+# Tune this down further if you find the EKF still isn't trusting it enough.
 IMU_ORIENTATION_COVARIANCE = [
     0.01, 0.0, 0.0,
     0.0, 0.01, 0.0,
-    0.0, 0.0, 0.1,
+    0.0, 0.0, 0.05,
 ]
 IMU_ANGULAR_VELOCITY_COVARIANCE = [
     0.02, 0.0, 0.0,
@@ -76,23 +88,40 @@ class EarthRoverBridge(Node):
         self.feed_fps = int(self.get_parameter("feed_fps").value)
 
         self.bridge = CvBridge()
-        sensor_qos = QoSProfile(
+
+        # Camera: best-effort is fine and desirable here, we don't want the
+        # feed thread blocked waiting for slow consumers.
+        image_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
-        command_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1)
-        self.image_pub = self.create_publisher(
-            Image, "earth_rover/front/image_raw", sensor_qos
+        # IMU / Odom / GPS feed robot_localization, whose subscriptions default
+        # to RELIABLE. A BEST_EFFORT publisher + RELIABLE subscriber pair is an
+        # incompatible QoS combination in ROS2 -- messages get silently dropped
+        # at the DDS layer and the EKF never receives anything, even though the
+        # topics look "connected". Use RELIABLE here to match.
+        filter_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
         )
-        self.gps_pub = self.create_publisher(NavSatFix, "earth_rover/gps", sensor_qos)
-        self.imu_pub = self.create_publisher(Imu, "imu/data", sensor_qos)
-        self.odom_pub = self.create_publisher(Odometry, "/wheel_odom", sensor_qos)
+        command_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1)
+
+        self.image_pub = self.create_publisher(
+            Image, "earth_rover/front/image_raw", image_qos
+        )
+        # navsat_transform_node's default input topic is /gps/fix.
+        # If your launch file remaps this differently, adjust the topic name
+        # here (or add a remap in the launch file) so they match.
+        self.gps_pub = self.create_publisher(NavSatFix, "/gps/fix", filter_qos)
+        self.imu_pub = self.create_publisher(Imu, "/imu/data", filter_qos)
+        self.odom_pub = self.create_publisher(Odometry, "/wheel_odom", filter_qos)
         self.battery_pub = self.create_publisher(
-            BatteryState, "earth_rover/battery", sensor_qos
+            BatteryState, "earth_rover/battery", image_qos
         )
         self.heading_pub = self.create_publisher(
-            Float32, "earth_rover/heading", sensor_qos
+            Float32, "earth_rover/heading", image_qos
         )
 
         self.declare_parameter("odom_pose_covariance", ODOM_POSE_COVARIANCE)
@@ -107,6 +136,11 @@ class EarthRoverBridge(Node):
             "imu_linear_acceleration_covariance", IMU_LINEAR_ACCELERATION_COVARIANCE
         )
         self.declare_parameter("gps_position_covariance", GPS_POSITION_COVARIANCE)
+        # Set this to your local magnetic declination (radians, positive = East)
+        # ONLY if you'd rather correct it here instead of in navsat_transform's
+        # `magnetic_declination_radians` param (that's the more idiomatic place,
+        # this param is provided as a convenience / fallback).
+        self.declare_parameter("magnetic_declination_radians", 0.0)
 
         self._odom_pose_covariance = self.get_parameter(
             "odom_pose_covariance"
@@ -126,6 +160,9 @@ class EarthRoverBridge(Node):
         self._gps_position_covariance = self.get_parameter(
             "gps_position_covariance"
         ).value
+        self._magnetic_declination_radians = float(
+            self.get_parameter("magnetic_declination_radians").value
+        )
 
         self._latest_cmd = None
         self._last_cmd_at = 0.0
@@ -197,6 +234,19 @@ class EarthRoverBridge(Node):
     def _normalize_angle(angle: float) -> float:
         return math.atan2(math.sin(angle), math.cos(angle))
 
+    def _compass_heading_to_enu_yaw(self, heading_deg: float) -> float:
+        """Convert a compass heading (degrees, 0=North, clockwise-positive) into
+        a ROS/REP-103 ENU yaw (radians, 0=East, counter-clockwise-positive).
+
+        This is the conversion robot_localization / navsat_transform assume for
+        the IMU orientation they fuse. Getting this wrong flips or offsets the
+        heading used to rotate GPS readings into the odom/map frame.
+        """
+        heading_rad = math.radians(heading_deg)
+        yaw = (math.pi / 2.0) - heading_rad
+        yaw += self._magnetic_declination_radians
+        return self._normalize_angle(yaw)
+
     def _feed_loop(self):
         url = f"{self.sdk_url}/feed?view=front&fps={self.feed_fps}"
         while self._running and rclpy.ok():
@@ -248,13 +298,13 @@ class EarthRoverBridge(Node):
             gps = NavSatFix()
             gps.header.stamp = now
             gps.header.frame_id = "earth_rover_gps"
-            
+
             gps_signal = data.get("gps_signal")
             if gps_signal is not None and float(gps_signal) < 10:
                 gps.status.status = NavSatStatus.STATUS_NO_FIX
             else:
                 gps.status.status = NavSatStatus.STATUS_FIX
-                
+
             gps.status.service = NavSatStatus.SERVICE_GPS
             gps.latitude = float(lat)
             gps.longitude = float(lng)
@@ -262,16 +312,23 @@ class EarthRoverBridge(Node):
             gps.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
             self.gps_pub.publish(gps)
 
+        # `orientation` is the rover's magnetometer-derived compass heading
+        # (degrees, 0=North, clockwise). Convert it to ROS ENU yaw once here,
+        # and reuse that single `yaw` value everywhere below (IMU quaternion,
+        # odom quaternion, dead-reckoning) so the whole pipeline is consistent.
         orientation = data.get("orientation")
         yaw = None
         if orientation is not None:
-            heading = Float32()
-            heading.data = float(orientation)
-            self.heading_pub.publish(heading)
             try:
-                yaw = math.radians(float(orientation))
+                heading_deg = float(orientation)
             except (TypeError, ValueError):
-                yaw = None
+                heading_deg = None
+            if heading_deg is not None:
+                # Publish the raw compass heading (degrees) for humans/debugging.
+                heading = Float32()
+                heading.data = heading_deg
+                self.heading_pub.publish(heading)
+                yaw = self._compass_heading_to_enu_yaw(heading_deg)
 
         battery = data.get("battery")
         if battery is not None:
@@ -295,9 +352,13 @@ class EarthRoverBridge(Node):
                 sample = gyros[-1]
                 imu.angular_velocity.x = math.radians(float(sample[0]))
                 imu.angular_velocity.y = math.radians(float(sample[1]))
+                # NOTE: this assumes the rover's gyro Z axis already follows the
+                # right-hand rule (CCW-positive, matching ROS). If the robot
+                # appears to turn the wrong way in RViz/EKF output, negate this.
                 imu.angular_velocity.z = math.radians(float(sample[2]))
-            
-            # Llenar la orientación con el yaw de la brújula si está disponible
+
+            # Fill orientation from the magnetometer-derived yaw (ENU) if we
+            # have one this cycle, otherwise leave it as identity.
             if yaw is not None:
                 imu.orientation.x = 0.0
                 imu.orientation.y = 0.0
@@ -357,6 +418,9 @@ class EarthRoverBridge(Node):
                 w=math.cos(yaw / 2.0),
             )
             odom.pose.covariance = self._odom_pose_covariance
+            # linear.x/y here are in the base_link (child) frame, per REP-103 --
+            # forward speed on x, no lateral slip assumed on y. This is correct
+            # as-is and doesn't need the yaw conversion applied to it.
             odom.twist.twist.linear.x = speed_m_s
             odom.twist.twist.linear.y = 0.0
             odom.twist.twist.linear.z = 0.0
