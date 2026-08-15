@@ -13,3 +13,8 @@ __pycache__/
 .idea/
 *.egg-info/
 .env.local
+.git/
+.github/
+src/sdk_server.backup/
+*.pid
+README.md

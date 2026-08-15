@@ -339,7 +339,14 @@ class EarthRoverBridge(Node):
             self.battery_pub.publish(batt)
 
         accels, gyros = data.get("accels") or [], data.get("gyros") or []
-        if accels or gyros:
+        # Don't publish IMU until we have a REAL compass yaw. Both EKF configs
+        # fuse absolute/relative yaw from every IMU message (imu0_config yaw
+        # index). If we publish an identity-orientation placeholder before the
+        # first compass reading arrives, navsat_transform can latch onto it
+        # while computing the datum's heading offset -- poisoning the heading
+        # for the whole run (this is what caused the growing position error /
+        # "Transform heading factor is now 1.33746" instead of ~1.0).
+        if (accels or gyros) and yaw is not None:
             imu = Imu()
             imu.header.stamp = now
             imu.header.frame_id = "base_link"
@@ -357,18 +364,11 @@ class EarthRoverBridge(Node):
                 # appears to turn the wrong way in RViz/EKF output, negate this.
                 imu.angular_velocity.z = math.radians(float(sample[2]))
 
-            # Fill orientation from the magnetometer-derived yaw (ENU) if we
-            # have one this cycle, otherwise leave it as identity.
-            if yaw is not None:
-                imu.orientation.x = 0.0
-                imu.orientation.y = 0.0
-                imu.orientation.z = math.sin(yaw / 2.0)
-                imu.orientation.w = math.cos(yaw / 2.0)
-            else:
-                imu.orientation.x = 0.0
-                imu.orientation.y = 0.0
-                imu.orientation.z = 0.0
-                imu.orientation.w = 1.0
+            # yaw is guaranteed not None here (see the guard above).
+            imu.orientation.x = 0.0
+            imu.orientation.y = 0.0
+            imu.orientation.z = math.sin(yaw / 2.0)
+            imu.orientation.w = math.cos(yaw / 2.0)
 
             imu.orientation_covariance = self._imu_orientation_covariance
             imu.angular_velocity_covariance = self._imu_angular_velocity_covariance

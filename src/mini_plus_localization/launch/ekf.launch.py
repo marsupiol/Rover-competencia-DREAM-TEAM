@@ -1,67 +1,70 @@
-import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+import os
+
 
 def generate_launch_description():
-    config_dir = os.path.join(
-        get_package_share_directory('mini_plus_localization'),
-        'config',
-        'ekf.yaml'
-    )
-
-    sdk_url_arg = DeclareLaunchArgument(
-        'sdk_url',
-        default_value='http://localhost:8000',
-        description='URL del servidor SDK del Earth Rover Mini+'
-    )
-
-    bridge_node = Node(
-        package='earth_rovers_sdk',
-        executable='earth_rover_bridge',
-        name='earth_rover_bridge',
-        output='screen',
-        parameters=[{'sdk_url': LaunchConfiguration('sdk_url')}]
-    )
-
-    ekf_odom_node = Node(
-        package='robot_localization',
-        executable='ekf_node',
-        name='ekf_filter_node_odom',
-        output='screen',
-        parameters=[config_dir],
-        remappings=[('odometry/filtered', 'odometry/filtered/local')]
-    )
-
-    navsat_transform_node = Node(
-        package='robot_localization',
-        executable='navsat_transform_node',
-        name='navsat_transform',
-        output='screen',
-        parameters=[config_dir],
-        remappings=[
-            ('gps/fix', '/earth_rover/gps'),
-            ('imu/data', '/imu/data'),
-            ('odometry/filtered', 'odometry/filtered/local'),
-            ('odometry/gps', '/odometry/gps'),
-        ]
-    )
-
-    ekf_map_node = Node(
-        package='robot_localization',
-        executable='ekf_node',
-        name='ekf_filter_node_map',
-        output='screen',
-        parameters=[config_dir],
-        remappings=[('odometry/filtered', 'odometry/filtered/map')]
-    )
+    mpl_dir = get_package_share_directory('mini_plus_localization')
+    ekf_yaml = os.path.join(mpl_dir, 'config', 'ekf.yaml')
 
     return LaunchDescription([
-        sdk_url_arg,
-        bridge_node,
-        ekf_odom_node,
-        navsat_transform_node,
-        ekf_map_node
+        # TF estatico base_link -> earth_rover_gps (asume antena en el centro
+        # del robot; ajusta --x/--y/--z si la antena esta desplazada).
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='base_link_to_gps',
+            arguments=[
+                '--x', '0', '--y', '0', '--z', '0',
+                '--yaw', '0', '--pitch', '0', '--roll', '0',
+                '--frame-id', 'base_link', '--child-frame-id', 'earth_rover_gps',
+            ],
+        ),
+
+        # EKF local (odom frame): funde /wheel_odom (vx,vy) + /imu/data (yaw, vyaw)
+        Node(
+            package='robot_localization',
+            executable='ekf_node',
+            name='ekf_filter_node_odom',
+            output='screen',
+            parameters=[ekf_yaml],
+            remappings=[('odometry/filtered', 'odometry/local')],
+        ),
+
+        # EKF global (map frame): funde wheel_odom + imu + /odometry/gps
+        Node(
+            package='robot_localization',
+            executable='ekf_node',
+            name='ekf_filter_node_map',
+            output='screen',
+            parameters=[ekf_yaml],
+            remappings=[('odometry/filtered', 'odometry/global')],
+        ),
+
+        # navsat_transform: proyecta /gps/fix a /odometry/gps y devuelve el
+        # GPS ya fusionado directo en earth_rover/gps (sin tocar er_navigation)
+        Node(
+            package='robot_localization',
+            executable='navsat_transform_node',
+            name='navsat_transform',
+            output='screen',
+            parameters=[ekf_yaml],
+            remappings=[
+                ('imu', '/imu/data'),
+                ('gps/fix', '/gps/fix'),
+                ('odometry/filtered', 'odometry/local'),
+                ('gps/filtered', 'earth_rover/gps'),
+            ],
+        ),
+
+        # Traduce el yaw fusionado (map, ENU) a heading en grados (compass),
+        # publicado en earth_rover/heading -- mismo topic que ya consumía
+        # gps_waypoint_controller.
+        Node(
+            package='mini_plus_localization',
+            executable='ekf_heading_bridge.py',
+            name='ekf_heading_bridge',
+            output='screen',
+        ),
     ])

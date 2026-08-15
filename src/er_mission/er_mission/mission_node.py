@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""ARCHIVO NO USADO — no está registrado en setup.py como entry point y no se ejecuta.
-Contiene además un bug (se suscribe a Float64 en vez de Float32 para heading).
-Se mantiene solo como referencia histórica; usar mission_manager_node.py + gps_waypoint_controller.py en su lugar.
+"""DEPRECATED: use mission_manager_node instead.
+
+This file is not registered in setup.py and is not launched by mission1.launch.py.
+It duplicated mission logic with incompatible message types (Float64 heading vs Float32
+from the SDK bridge) and is kept only as historical reference.
 
 Mission manager node for Earth Rover Mission 1.
 

@@ -1,0 +1,16 @@
+services:
+  rover:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dream-team/mini-plus-rover:jazzy
+    container_name: mini_plus_rover
+    environment:
+      # full | ekf | bridge  (ver comentarios en entrypoint.sh)
+      ROVER_MODE: "full"
+    ports:
+      - "8000:8000"
+    volumes:
+      # Montá tu .env real con credenciales (no se versiona ni se copia a la imagen).
+      - ./src/sdk_server/.env:/root/ros2_ws/src/sdk_server/.env:ro
+    restart: unless-stopped

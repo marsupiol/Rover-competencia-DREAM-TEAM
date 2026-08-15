@@ -1,33 +1,89 @@
 #!/bin/bash
 set -e
 
-# Load ROS environment
+WS=/root/ros2_ws
+
+# --- Entorno ROS ---
 source /opt/ros/jazzy/setup.bash
-
-# Source workspace (if built)
-if [ -f /root/ros2_ws/install/setup.bash ]; then
-  source /root/ros2_ws/install/setup.bash
+if [ -f "$WS/install/setup.bash" ]; then
+  source "$WS/install/setup.bash"
 fi
 
-# Start the SDK (Hypercorn) in background
-cd /root/ros2_ws/src/sdk_server
-if command -v hypercorn >/dev/null 2>&1; then
-  echo "Starting SDK server on 0.0.0.0:8000"
-  nohup hypercorn main:app --bind 0.0.0.0:8000 > /root/ros2_ws/sdk.log 2>&1 &
-else
-  echo "hypercorn not found; attempting to run with python -m hypercorn"
-  nohup python3 -m hypercorn main:app --bind 0.0.0.0:8000 > /root/ros2_ws/sdk.log 2>&1 &
+# --- .env del SDK ---
+# Si no montaste/copiaste un .env real, generamos uno a partir del sample para
+# que el contenedor al menos arranque (hay que editar credenciales reales).
+if [ ! -f "$WS/src/sdk_server/.env" ] && [ -f "$WS/src/sdk_server/.env.sample" ]; then
+  echo "[entrypoint] No hay .env en src/sdk_server; copiando .env.sample como base."
+  echo "[entrypoint] Montá tu propio .env (docker run -v ./.env:/root/ros2_ws/src/sdk_server/.env) para credenciales reales."
+  cp "$WS/src/sdk_server/.env.sample" "$WS/src/sdk_server/.env"
 fi
 
-# Give SDK a moment to start
-sleep 2
+# --- SDK server (Hypercorn) ---
+cd "$WS/src/sdk_server"
+echo "[entrypoint] Iniciando SDK server en 0.0.0.0:8000"
+nohup hypercorn main:app --bind 0.0.0.0:8000 > "$WS/sdk.log" 2>&1 &
+PIDS=("$!")
 
-# Launch ROS nodes (bridge + ekf) in foreground so container stays alive
-cd /root/ros2_ws
+echo "[entrypoint] Esperando a que el SDK responda en :8000..."
+for i in $(seq 1 15); do
+  if curl -sf http://localhost:8000/data > /dev/null 2>&1; then
+    echo "[entrypoint] SDK OK."
+    break
+  fi
+  sleep 1
+  if [ "$i" -eq 15 ]; then
+    echo "[entrypoint] ADVERTENCIA: el SDK no respondió en 15s, sigo igual."
+  fi
+done
+
+cd "$WS"
 source /opt/ros/jazzy/setup.bash
-if [ -f /root/ros2_ws/install/setup.bash ]; then
-  source /root/ros2_ws/install/setup.bash
-fi
+[ -f "$WS/install/setup.bash" ] && source "$WS/install/setup.bash"
 
-echo "Launching ROS nodes (bridge + ekf)"
-exec ros2 launch mini_plus_localization ekf.launch.py sdk_url:=http://localhost:8000
+# ROVER_MODE controla qué se lanza además del SDK:
+#   full   (default) -> bridge + EKF (mini_plus_localization) + navegación/misión (er_bringup mission1)
+#   ekf    -> sólo bridge + EKF (equivalente a la opción B de run_all.sh, sin mission1)
+#   bridge -> sólo bridge directo, sin EKF (equivalente a run_mission1_bridge.sh, opción A)
+ROVER_MODE="${ROVER_MODE:-full}"
+SDK_URL="${SDK_URL:-http://localhost:8000}"
+
+case "$ROVER_MODE" in
+  full)
+    echo "[entrypoint] ROVER_MODE=full -> bridge + EKF + navegación + misión"
+    ros2 launch mini_plus_localization ekf.launch.py sdk_url:="$SDK_URL" &
+    PIDS+=("$!")
+    sleep 3
+    ros2 launch er_bringup mission1.launch.py &
+    PIDS+=("$!")
+    ;;
+  ekf)
+    echo "[entrypoint] ROVER_MODE=ekf -> bridge + EKF (sin nodos de misión)"
+    ros2 launch mini_plus_localization ekf.launch.py sdk_url:="$SDK_URL" &
+    PIDS+=("$!")
+    ;;
+  bridge)
+    echo "[entrypoint] ROVER_MODE=bridge -> sólo bridge (sin EKF)"
+    ros2 run earth_rovers_sdk earth_rover_bridge --ros-args -p sdk_url:="$SDK_URL" &
+    PIDS+=("$!")
+    ;;
+  *)
+    echo "[entrypoint] ROVER_MODE desconocido: $ROVER_MODE (usar full|ekf|bridge)"
+    exit 1
+    ;;
+esac
+
+# Si cualquiera de los procesos (SDK, bridge/EKF, misión) muere, el contenedor
+# termina en vez de quedar "vivo" a medias. Con --restart unless-stopped en
+# docker/compose eso da un reinicio limpio de todo el stack.
+cleanup() {
+  echo "[entrypoint] Señal recibida, deteniendo procesos..."
+  for pid in "${PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT INT TERM
+
+wait -n "${PIDS[@]}"
+EXIT_CODE=$?
+echo "[entrypoint] Un proceso del stack terminó (exit $EXIT_CODE). Cerrando contenedor."
+exit "$EXIT_CODE"

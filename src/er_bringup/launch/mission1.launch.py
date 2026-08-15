@@ -1,9 +1,11 @@
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 import os
 import sys
-
+from rclpy.parameter import Parameter # Añadir a tus imports arriba
 
 def conda_python_env():
     conda_prefix = os.environ.get('CONDA_PREFIX')
@@ -27,25 +29,55 @@ def conda_python_env():
 
 
 def generate_launch_description():
-    # Directories for config files (could be empty for now)
-    er_hardware_dir = get_package_share_directory('er_hardware')
     er_navigation_dir = get_package_share_directory('er_navigation')
     er_mission_dir = get_package_share_directory('er_mission')
+    mpl_dir = get_package_share_directory('mini_plus_localization')
     node_env = conda_python_env()
 
+    ekf_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(mpl_dir, 'launch', 'ekf.launch.py')
+        )
+    )
+
     return LaunchDescription([
-        # Deshabilitado: se usa el bridge_node.py del EKF (paquete earth_rovers_sdk, otro workspace),
-        # que ya publica earth_rover/gps y earth_rover/heading con los mismos tipos/tópicos.
-        # Levantar ese stack por separado con: ros2 launch mini_plus_localization ekf.launch.py
-        # antes de correr este mission1.launch.py.
-        # Node(
-        #     package='er_hardware',
-        #     executable='sdk_bridge_node',
-        #     name='sdk_bridge_node',
-        #     output='screen',
-        #     parameters=[os.path.join(er_hardware_dir, 'config', 'bridge_params.yaml')],
-        #     additional_env=node_env,
-        # ),
+        # Bridge oficial (SDK <-> ROS2): GPS, IMU, wheel odom, camara, bateria
+        Node(
+            package='earth_rovers_sdk',
+            executable='earth_rover_bridge',
+            name='earth_rover_bridge',
+            output='screen',
+            parameters=[{
+                'sdk_url': 'http://127.0.0.1:8000',
+                # El GPS crudo resulto ser bastante fiel a la posicion real
+                # (confirmado comparando contra el chequeo del SDK), pero el
+                # EKF le daba mas peso a la velocidad integrada (odometria)
+                # que al GPS, dejando que la posicion fusionada "flotara"
+                # hacia donde el controller comandaba en vez de anclarse a
+                # la posicion real. Bajamos la covarianza del GPS (mas
+                # confianza) y subimos la de la velocidad (menos confianza).
+                'gps_position_covariance': [
+                    1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 4.0,
+                ],
+                'odom_twist_covariance': [
+                    2.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 2.0, 0.0, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.5, 0.0, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.5, 0.0,
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.5,
+                ],
+            }],
+            additional_env=node_env,
+        ),
+
+        # EKF local + global + navsat_transform + heading bridge
+        ekf_launch,
+
+        # Navegacion y mision: sin cambios, siguen escuchando earth_rover/gps
+        # y earth_rover/heading -- ahora alimentados por el EKF.
         Node(
             package='er_navigation',
             executable='gps_waypoint_controller',

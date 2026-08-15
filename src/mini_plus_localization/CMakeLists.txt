@@ -24,10 +24,18 @@ if(BUILD_TESTING)
 endif()
 
 # --- INSTALACIÓN DE DIRECTORIOS COMPLEMENTARIOS ---
+# --- INSTALACIÓN DE DIRECTORIOS COMPLEMENTARIOS ---
 install(DIRECTORY 
   config 
   launch
   DESTINATION share/${PROJECT_NAME}
 )
+
+# --- NODOS PYTHON ---
+install(PROGRAMS
+  scripts/ekf_heading_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 
 ament_package()

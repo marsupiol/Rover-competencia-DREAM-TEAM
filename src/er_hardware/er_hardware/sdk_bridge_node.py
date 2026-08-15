@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""ROS 2 Bridge Node for Earth Rovers SDK."""
+"""Minimal ROS 2 bridge for the Earth Rovers SDK (Mission 1 stack).
+
+This node is intentionally slim: GPS, heading, IMU, battery, and cmd_vel only.
+It is used by ``ros2 launch er_bringup mission1.launch.py``.
+
+Do NOT run this together with ``earth-rovers-sdk/examples/ros2/earth_rover_bridge.py``.
+Both subscribe to ``cmd_vel`` and publish the same ``earth_rover/*`` topics, so running
+both will fight over ``POST /control`` and duplicate telemetry publishers.
+
+For camera feed and the full SDK bridge, use ``earth_rover_bridge.py`` from the SDK
+repo instead of this node (but not at the same time).
+"""
 
 import json
 import math
@@ -21,7 +32,7 @@ from std_msgs.msg import Float32
 
 CONTROL_RATE_HZ = 10.0
 CMD_VEL_TIMEOUT_S = 0.5
-CONTROL_HTTP_TIMEOUT_S = 2.0
+CONTROL_HTTP_TIMEOUT_S = 1.0
 
 
 class SDKBridgeNode(Node):
@@ -60,6 +71,9 @@ class SDKBridgeNode(Node):
         self._telemetry_thread.start()
 
         self.get_logger().info(f"Earth Rover SDK Bridge active on {self.sdk_url}")
+        self.get_logger().info(
+            "Minimal bridge for Mission 1. Do not run alongside earth_rover_bridge.py."
+        )
 
     def _on_cmd_vel(self, msg: Twist):
         with self._cmd_lock:
@@ -87,9 +101,12 @@ class SDKBridgeNode(Node):
             res.raise_for_status()
             if quiet:
                 with self._cmd_lock:
-                    if self._last_cmd_at == last_cmd_at and time.monotonic() - self._last_cmd_at > CMD_VEL_TIMEOUT_S:
+                    if (
+                        self._last_cmd_at == last_cmd_at
+                        and time.monotonic() - self._last_cmd_at > CMD_VEL_TIMEOUT_S
+                    ):
                         self._stopped = True
-        except Exception as e:
+        except requests.RequestException as e:
             self.get_logger().warning(f"Control dispatch failed: {e}", throttle_duration_sec=5)
 
     def _control_loop(self):
@@ -125,8 +142,7 @@ class SDKBridgeNode(Node):
                     msg = json.loads(ws.recv())
                     if msg.get("type") in ("snapshot", "telemetry") and msg.get("data"):
                         self._publish_telemetry(msg["data"])
-            except Exception as e:
-                # Fallback to HTTP GET /data if WebSocket connection fails
+            except Exception:
                 self._poll_data_fallback()
                 time.sleep(1.0)
             finally:
@@ -140,8 +156,7 @@ class SDKBridgeNode(Node):
         try:
             res = self._session.get(f"{self.sdk_url}/data", timeout=2.0)
             if res.status_code == 200:
-                data = res.json()
-                self._publish_telemetry(data)
+                self._publish_telemetry(res.json())
         except Exception:
             pass
 
@@ -192,15 +207,17 @@ class SDKBridgeNode(Node):
         self._running = False
         self._stop_event.set()
         self._control_thread.join(timeout=1.0)
-        # Send emergency stop on exit
-        try:
-            self._session.post(
-                f"{self.sdk_url}/control",
-                json={"command": {"linear": 0, "angular": 0}},
-                timeout=1.0,
-            )
-        except Exception:
-            pass
+        for _ in range(3):
+            try:
+                res = self._session.post(
+                    f"{self.sdk_url}/control",
+                    json={"command": {"linear": 0, "angular": 0}},
+                    timeout=CONTROL_HTTP_TIMEOUT_S,
+                )
+                res.raise_for_status()
+                break
+            except requests.RequestException:
+                continue
         self._session.close()
         super().destroy_node()
 

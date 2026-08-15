@@ -1,0 +1,33 @@
+
+# 2026-08-12 18:04:40.686613
++y
+
+# 2026-08-12 18:05:15.311800
++n
+
+# 2026-08-12 18:08:26.450510
++/add src/ scripts/ run_bridge.py run_sdk.py
+
+# 2026-08-12 18:10:13.115771
++me gustaria que modificaras el archivo de bridge, el que actua como nodo de ros, para que se adapte a lo que pide mi filtro de kalman, es decir, que con la informacion que viene del sdk, logre combinarla de tal forma que el bridge publique en el topico en el que publica (datos del rover), y que el ekf tome esos datos para utilizarlos para los calculos, de forma que solo me quede a mi manualmente qaue modificar las matrices de covarianza
+
+# 2026-08-12 18:12:35.780774
++aider --model gemini/gemini-2.5-pro
+
+# 2026-08-12 18:12:54.523124
++aider --model gemini/gemini-3.5-flash
+
+# 2026-08-12 18:13:35.020100
++rm -f .aider*
+
+# 2026-08-12 18:14:22.652535
++/exit
+
+# 2026-08-12 18:15:07.308004
++/add src/earth_rovers_sdk/earth_rovers_sdk/bridge_node.py src/mini_plus_localization/config/ekf.yaml
+
+# 2026-08-12 18:15:26.597713
++Modifica el archivo bridge_node.py para que se adapte estrictamente a lo que requiere el filtro de Kalman definido en ekf.yaml. 
++Necesito que tomes la información de telemetría que viene del SDK y la formatees para que el bridge publique un mensaje de odometría (nav_msgs/msg/Odometry) exactamente en el tópico que el EKF espera consumir para sus cálculos.
++
++Regla crítica: NO modifiques ni intentes adivinar los valores de las matrices de covarianza (deja esos arrays inicializados en ceros o con valores por defecto). Esa parte la configuraré yo manualmente después. Concéntrate exclusivamente en extraer la pose y el twist del SDK, y armar el mensaje con el frame_id y timestamp correctos según el YAML.
