@@ -1,3 +1,0 @@
-[INFO] [launch]: All log files can be found below /root/.ros/log/2026-08-12-01-58-43-993452-b6e74ad5881e-16688
-[INFO] [launch]: Default logging verbosity is set to INFO
-[ERROR] [launch]: Caught exception in launch (see debug for traceback): package 'earth_rovers_sdk' found at '/root/ros2_ws/install/earth_rovers_sdk', but libexec directory '/root/ros2_ws/install/earth_rovers_sdk/lib/earth_rovers_sdk' does not exist
