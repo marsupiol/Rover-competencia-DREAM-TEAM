@@ -49,13 +49,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'sdk_url': 'http://127.0.0.1:8000',
-                # El GPS crudo resulto ser bastante fiel a la posicion real
-                # (confirmado comparando contra el chequeo del SDK), pero el
-                # EKF le daba mas peso a la velocidad integrada (odometria)
-                # que al GPS, dejando que la posicion fusionada "flotara"
-                # hacia donde el controller comandaba en vez de anclarse a
-                # la posicion real. Bajamos la covarianza del GPS (mas
-                # confianza) y subimos la de la velocidad (menos confianza).
+                # Forzamos floats estrictos (ej. 1.0 en vez de 1) para evitar fallos de parseo
                 'gps_position_covariance': [
                     1.0, 0.0, 0.0,
                     0.0, 1.0, 0.0,

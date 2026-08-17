@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-"""GPS Waypoint Navigation Controller for Earth Rover.
-
-Web-safe control:
-1. ALIGN  - short turn bursts, then full stop while telemetry catches up
-2. DRIVE  - forward once aligned
-3. WAIT   - stopped until mission manager confirms checkpoint and sends next target
+"""
+GPS Waypoint Navigation Controller for Earth Rover (IROS 2026).
+Arquitectura Híbrida: Máquina de estados reactiva con mitigación de latencia de red (Burst & Wait)
+y filtrado pasa-bajos para brújula ruidosa.
 """
 
 import math
@@ -15,11 +13,11 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Float32, String, Bool
 
-
 class GPSWaypointController(Node):
     def __init__(self):
         super().__init__("gps_waypoint_controller")
 
+        # 1. Declaración Estricta de Parámetros (Tipado Fuerte)
         self.declare_parameter("goal_tolerance_m", 3.0)
         self.declare_parameter("goal_dwell_s", 1.5)
         self.declare_parameter("align_threshold_deg", 15.0)
@@ -30,22 +28,19 @@ class GPSWaypointController(Node):
         self.declare_parameter("drive_correction_gain", 0.002)
         self.declare_parameter("max_drive_angular", 0.10)
         self.declare_parameter("invert_angular", True)
-        self.declare_parameter("control_loop_hz", 2.0)
+        self.declare_parameter("control_loop_hz", 5.0)
         self.declare_parameter("turn_burst_s", 0.35)
-        self.declare_parameter("pause_after_turn_s", 0.9)
-        self.declare_parameter("max_heading_jump_deg", 40.0)
+        self.declare_parameter("pause_after_turn_s", 2.2)
+        self.declare_parameter("max_heading_jump_deg", 90.0)
         self.declare_parameter("heading_filter_alpha", 0.35)
         self.declare_parameter("reached_publish_period_s", 1.0)
 
+        # 2. Extracción de Parámetros
         self.goal_tolerance = float(self.get_parameter("goal_tolerance_m").value)
         self.goal_dwell_s = float(self.get_parameter("goal_dwell_s").value)
         self.align_threshold = float(self.get_parameter("align_threshold_deg").value)
-        self.coarse_align_threshold = float(
-            self.get_parameter("coarse_align_threshold_deg").value
-        )
-        self.approach_align_distance = float(
-            self.get_parameter("approach_align_distance_m").value
-        )
+        self.coarse_align_threshold = float(self.get_parameter("coarse_align_threshold_deg").value)
+        self.approach_align_distance = float(self.get_parameter("approach_align_distance_m").value)
         self.forward_speed = float(self.get_parameter("forward_speed").value)
         self.turn_speed = float(self.get_parameter("turn_speed").value)
         self.drive_correction_gain = float(self.get_parameter("drive_correction_gain").value)
@@ -58,28 +53,37 @@ class GPSWaypointController(Node):
         self.reached_publish_period_s = float(self.get_parameter("reached_publish_period_s").value)
         loop_hz = max(1.0, float(self.get_parameter("control_loop_hz").value))
 
+        # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
+        reliable_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
 
+        # 4. Suscriptores y Publicadores
         self.create_subscription(NavSatFix, "earth_rover/gps", self._on_gps, sensor_qos)
         self.create_subscription(Float32, "earth_rover/heading", self._on_heading, sensor_qos)
-        self.create_subscription(NavSatFix, "earth_rover/target_waypoint", self._on_target, sensor_qos)
-        self.create_subscription(Bool, "earth_rover/navigation_pause", self._on_navigation_pause, 10)
-        self.create_subscription(String, "earth_rover/waypoint_status", self._on_mission_status, 10)
+        self.create_subscription(NavSatFix, "earth_rover/target_waypoint", self._on_target, reliable_qos)
+        self.create_subscription(Bool, "earth_rover/navigation_pause", self._on_navigation_pause, reliable_qos)
+        self.create_subscription(String, "earth_rover/waypoint_status", self._on_mission_status, reliable_qos)
 
-        self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
-        self.status_pub = self.create_publisher(String, "earth_rover/waypoint_status", 10)
+        self.cmd_pub = self.create_publisher(Twist, "cmd_vel", reliable_qos)
+        self.status_pub = self.create_publisher(String, "earth_rover/waypoint_status", reliable_qos)
 
+        # 5. Inicialización de Vectores de Estado
         self.current_lat = None
         self.current_lon = None
         self.current_heading = None
         self._raw_heading = None
-
         self.target_lat = None
         self.target_lon = None
+        
+        # Flags de Máquina de Estados
         self.active_goal = False
         self._reached_since = None
         self._awaiting_next_target = False
@@ -89,13 +93,13 @@ class GPSWaypointController(Node):
         self._burst_turn_sign = 0
         self._navigation_paused = False
 
+        # 6. Bucle de Control Principal
         self.timer = self.create_timer(1.0 / loop_hz, self._control_loop)
         self.get_logger().info(
-            "GPS Waypoint Controller ready "
-            f"(burst={self.turn_burst_s:.2f}s, pause={self.pause_after_turn_s:.2f}s, "
-            f"invert={self.invert_angular})"
+            f"Controlador Híbrido Iniciado | Loop: {loop_hz} Hz | Burst: {self.turn_burst_s}s | Filter Alpha: {self.heading_filter_alpha}"
         )
 
+    # --- CALLBACKS DE SENSORES ---
     def _on_gps(self, msg: NavSatFix):
         self.current_lat = msg.latitude
         self.current_lon = msg.longitude
@@ -109,12 +113,15 @@ class GPSWaypointController(Node):
             return
 
         jump = abs(self.angle_error_deg(raw, self.current_heading))
+        # Rechazo de anomalías magnéticas severas
         if jump > self.max_heading_jump:
             return
 
+        # Filtro EWMA (Pasa-bajos)
         delta = self.angle_error_deg(raw, self.current_heading)
         self.current_heading = (self.current_heading + self.heading_filter_alpha * delta) % 360.0
 
+    # --- CALLBACKS DE MÁQUINA DE ESTADOS ---
     def _on_target(self, msg: NavSatFix):
         self.target_lat = msg.latitude
         self.target_lon = msg.longitude
@@ -127,13 +134,13 @@ class GPSWaypointController(Node):
         self._burst_turn_sign = 0
         self._navigation_paused = False
         self._stop_robot()
-        self.get_logger().info(f"New target: ({self.target_lat}, {self.target_lon})")
+        self.get_logger().info(f"Target Fijado: ({self.target_lat:.6f}, {self.target_lon:.6f})")
 
     def _on_navigation_pause(self, msg: Bool):
         self._navigation_paused = bool(msg.data)
         if self._navigation_paused:
             self._stop_robot()
-            self.get_logger().info("Navigation paused by mission manager")
+            self.get_logger().info("Pausa comandada por mission_manager.")
 
     def _on_mission_status(self, msg: String):
         if msg.data == "MISSION_FINISHED":
@@ -141,26 +148,22 @@ class GPSWaypointController(Node):
             self._navigation_paused = True
             self.active_goal = False
             self._stop_robot()
-            self.get_logger().info("Mission finished — stopped publishing REACHED")
+            self.get_logger().info("Misión finalizada. Controlador inactivo.")
 
+    # --- MOTOR MATEMÁTICO GEODÉSICO ---
     @staticmethod
     def haversine_distance(lat1, lon1, lat2, lon2):
         r = 6371000.0
         dlat = math.radians(lat2 - lat1)
         dlon = math.radians(lon2 - lon1)
-        a = (
-            math.sin(dlat / 2.0) ** 2
-            + math.cos(math.radians(lat1))
-            * math.cos(math.radians(lat2))
-            * math.sin(dlon / 2.0) ** 2
-        )
+        a = (math.sin(dlat / 2.0) ** 2 +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2.0) ** 2)
         return r * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
 
     @staticmethod
     def calculate_bearing(lat1, lon1, lat2, lon2):
         dlon = math.radians(lon2 - lon1)
-        lat1_r = math.radians(lat1)
-        lat2_r = math.radians(lat2)
+        lat1_r, lat2_r = math.radians(lat1), math.radians(lat2)
         y = math.sin(dlon) * math.cos(lat2_r)
         x = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
         return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
@@ -172,6 +175,7 @@ class GPSWaypointController(Node):
     def _apply_angular_sign(self, angular):
         return -angular if self.invert_angular else angular
 
+    # --- HELPERS DE TIEMPO Y PUBLICACIÓN ---
     def _phase_elapsed(self, now):
         if self._align_phase_started_at is None:
             return 0.0
@@ -181,51 +185,55 @@ class GPSWaypointController(Node):
         self._align_phase = phase
         self._align_phase_started_at = now
 
-    def _publish_stop_and_status(self, status_text):
-        twist = Twist()
-        self.cmd_pub.publish(twist)
-        out = String()
-        out.data = status_text
-        self.status_pub.publish(out)
-        self.get_logger().info(status_text, throttle_duration_sec=2)
-
     def _publish_reached(self, now):
         self._stop_robot()
         msg = String()
         msg.data = "REACHED"
         self.status_pub.publish(msg)
         self._last_reached_publish_at = now
-        self.get_logger().info("Signaled REACHED to mission_manager (not SDK POST yet)")
+        self.get_logger().info("Señal REACHED publicada -> Esperando al manager.")
 
+    def _stop_robot(self):
+        self._align_phase = "PAUSE"
+        self._align_phase_started_at = None
+        self._burst_turn_sign = 0
+        self.cmd_pub.publish(Twist())
+
+    # --- BUCLE CENTRAL DE CONTROL ---
     def _control_loop(self):
         now = self.get_clock().now()
 
+        # Guarda de seguridad 1: Pausa externa
         if self._navigation_paused:
             self._stop_robot()
             return
 
+        # Guarda de seguridad 2: Esperando procesamiento de SDK
         if self._awaiting_next_target:
             self._stop_robot()
             elapsed = 0.0
             if self._last_reached_publish_at is not None:
                 elapsed = (now - self._last_reached_publish_at).nanoseconds / 1e9
+            # Re-publicar REACHED si el manager tardó en procesar
             if elapsed >= self.reached_publish_period_s:
                 self._publish_reached(now)
             return
 
+        # Guarda de seguridad 3: Datos insuficientes
         if not self.active_goal or self.current_lat is None or self.current_lon is None:
             return
 
-        distance = self.haversine_distance(
-            self.current_lat, self.current_lon, self.target_lat, self.target_lon
-        )
+        distance = self.haversine_distance(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
 
+        # 1. EVALUACIÓN DE META ALCANZADA
         if distance <= self.goal_tolerance:
             self._stop_robot()
             if self._reached_since is None:
                 self._reached_since = now
+            
+            # Filtro anti-rebote espacial (Dwell Time)
             if (now - self._reached_since).nanoseconds / 1e9 >= self.goal_dwell_s:
-                self.get_logger().info(f"Target reached ({distance:.1f}m)")
+                self.get_logger().info(f"¡Meta Alcanzada! ({distance:.1f}m error geodésico)")
                 self.active_goal = False
                 self._awaiting_next_target = True
                 self._navigation_paused = True
@@ -238,11 +246,10 @@ class GPSWaypointController(Node):
             self._stop_robot()
             return
 
-        bearing = self.calculate_bearing(
-            self.current_lat, self.current_lon, self.target_lat, self.target_lon
-        )
+        bearing = self.calculate_bearing(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
         heading_error = self.angle_error_deg(bearing, self.current_heading)
 
+        # Umbral dinámico de alineación (más estricto al acercarse)
         align_threshold = (
             self.align_threshold
             if distance <= self.approach_align_distance
@@ -250,6 +257,8 @@ class GPSWaypointController(Node):
         )
 
         twist = Twist()
+        
+        # 2. MÁQUINA DE ESTADOS: ALIGN vs DRIVE
         if abs(heading_error) > align_threshold:
             mode = "ALIGN"
             twist.linear.x = 0.0
@@ -261,7 +270,7 @@ class GPSWaypointController(Node):
                     self._burst_turn_sign = 1 if heading_error > 0.0 else -1
                     self._begin_align_phase("TURN", now)
                     twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_speed)
-            else:
+            else: # Fase TURN
                 twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_speed)
                 if elapsed >= self.turn_burst_s:
                     self._begin_align_phase("PAUSE", now)
@@ -271,7 +280,9 @@ class GPSWaypointController(Node):
             self._align_phase = "PAUSE"
             self._align_phase_started_at = None
             self._burst_turn_sign = 0
+            
             twist.linear.x = self.forward_speed
+            # Corrección suave sobre la marcha (Proporcional débil)
             correction = self.drive_correction_gain * heading_error
             twist.angular.z = self._apply_angular_sign(
                 max(-self.max_drive_angular, min(self.max_drive_angular, correction))
@@ -279,23 +290,16 @@ class GPSWaypointController(Node):
 
         self.cmd_pub.publish(twist)
 
+        # Telemetría interna para Depuración
         raw_h = self._raw_heading if self._raw_heading is not None else float("nan")
         status = (
-            f"{mode}/{self._align_phase}: dist={distance:.1f}m, bearing={bearing:.1f}, "
-            f"heading={self.current_heading:.1f}, raw={raw_h:.1f}, err={heading_error:+.1f}, "
-            f"thr={align_threshold:.0f}, linear={twist.linear.x:.2f}, angular={twist.angular.z:+.2f}"
+            f"[{mode}] dist={distance:.1f}m, "
+            f"head_err={heading_error:+.1f}°, "
+            f"cmd_v={twist.linear.x:.2f}, cmd_w={twist.angular.z:+.2f}"
         )
         out = String()
         out.data = status
         self.status_pub.publish(out)
-        self.get_logger().info(status, throttle_duration_sec=2)
-
-    def _stop_robot(self):
-        self._align_phase = "PAUSE"
-        self._align_phase_started_at = None
-        self._burst_turn_sign = 0
-        self.cmd_pub.publish(Twist())
-
 
 def main(args=None):
     rclpy.init(args=args)
@@ -308,7 +312,6 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == "__main__":
     main()

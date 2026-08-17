@@ -36,8 +36,12 @@ CMD_VEL_TIMEOUT_S = 0.5
 CONTROL_HTTP_TIMEOUT_S = 1.0
 GRAVITY_M_S2 = 9.80665
 
-# Covariances are tuning knobs for the EKF.
-# Increase values to make the filter trust the sensor less, decrease to trust it more.
+# ==============================================================================
+# TENSOR DE COVARIANZAS (Recalibración IROS 2026)
+# ==============================================================================
+# ODOMETRÍA DE RUEDAS (Cinemática)
+# Penalizamos la velocidad lineal Y (vy) porque el rover no debería patinar 
+# lateralmente. Confiamos moderadamente en vx (avance) pero asumimos deslizamiento.
 ODOM_POSE_COVARIANCE = [
     0.5, 0.0, 0.0, 0.0, 0.0, 0.0,
     0.0, 0.5, 0.0, 0.0, 0.0, 0.0,
@@ -47,37 +51,41 @@ ODOM_POSE_COVARIANCE = [
     0.0, 0.0, 0.0, 0.0, 0.0, 0.1,
 ]
 ODOM_TWIST_COVARIANCE = [
-    0.1, 0.0, 0.0, 0.0, 0.0, 0.0,
-    0.0, 0.1, 0.0, 0.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.0, 0.0, 0.0,
-    0.0, 0.0, 0.0, 0.5, 0.0, 0.0,
-    0.0, 0.0, 0.0, 0.0, 0.5, 0.0,
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.2,
-]
-# Orientation covariance is tighter on yaw (z) than the original defaults because
-# the rover's magnetometer heading is the most reliable sensor we have here.
-# Tune this down further if you find the EKF still isn't trusting it enough.
-IMU_ORIENTATION_COVARIANCE = [
-    0.01, 0.0, 0.0,
-    0.0, 0.01, 0.0,
-    0.0, 0.0, 0.05,
-]
-IMU_ANGULAR_VELOCITY_COVARIANCE = [
-    0.02, 0.0, 0.0,
-    0.0, 0.02, 0.0,
-    0.0, 0.0, 0.05,
-]
-IMU_LINEAR_ACCELERATION_COVARIANCE = [
-    0.2, 0.0, 0.0,
-    0.0, 0.2, 0.0,
-    0.0, 0.0, 0.4,
-]
-GPS_POSITION_COVARIANCE = [
-    5.0, 0.0, 0.0,
-    0.0, 5.0, 0.0,
-    0.0, 0.0, 10.0,
+    0.5,  0.0,  0.0,  0.0,  0.0,  0.0, # vx: deslizamiento longitudinal moderado
+    0.0,  2.0,  0.0,  0.0,  0.0,  0.0, # vy: penalización por resbalón lateral
+    0.0,  0.0, 10.0,  0.0,  0.0,  0.0, # vz: ignorado (rover terrestre)
+    0.0,  0.0,  0.0, 10.0,  0.0,  0.0, # roll rate: ruidoso, se ignora
+    0.0,  0.0,  0.0,  0.0, 10.0,  0.0, # pitch rate: ruidoso, se ignora
+    0.0,  0.0,  0.0,  0.0,  0.0,  0.2, # yaw rate: confiable pero sujeto a derrapes
 ]
 
+# IMU MPU-6050 (Fusión Inercial)
+# Varianzas infladas para absorber la vibración estructural de los 4 motores DC
+# y el jitter introducido por la latencia de la red 4G/LTE.
+IMU_ORIENTATION_COVARIANCE = [
+    0.01, 0.0,  0.0,
+    0.0,  0.01, 0.0,
+    0.0,  0.0,  0.01, # Magnetómetro absoluto: El ancla principal de nuestro yaw
+]
+IMU_ANGULAR_VELOCITY_COVARIANCE = [
+    0.01, 0.0,  0.0,
+    0.0,  0.01, 0.0,
+    0.0,  0.0,  0.05, # Yaw rate: penalizado para mitigar el retardo de fase de red
+]
+IMU_LINEAR_ACCELERATION_COVARIANCE = [
+    0.05, 0.0,  0.0,
+    0.0,  0.05, 0.0,
+    0.0,  0.0,  0.1,  # Z-accel: absorbe los impactos mecánicos contra el terreno
+]
+
+# SISTEMA GNSS (Posicionamiento Global)
+# Ajustado a 1 metro de precisión autónoma (Varianza = 1.0^2 = 1.0)
+GPS_POSITION_COVARIANCE = [
+    1.0,  0.0,  0.0,
+    0.0,  1.0,  0.0,
+    0.0,  0.0, 100.0, # Altitud sigue penalizada masivamente
+]
+# ==============================================================================
 
 class EarthRoverBridge(Node):
     def __init__(self):
@@ -293,29 +301,78 @@ class EarthRoverBridge(Node):
     def _publish_telemetry(self, data: dict):
         now = self.get_clock().now().to_msg()
 
+        # ---------------------------------------------------------
+        # 1. GNSS (GPS) CON COVARIANZA DINÁMICA AVANZADA
+        # ---------------------------------------------------------
         lat, lng = data.get("latitude"), data.get("longitude")
         if lat is not None and lng is not None:
             gps = NavSatFix()
             gps.header.stamp = now
             gps.header.frame_id = "earth_rover_gps"
 
-            gps_signal = data.get("gps_signal")
-            if gps_signal is not None and float(gps_signal) < 10:
-                gps.status.status = NavSatStatus.STATUS_NO_FIX
-            else:
+            # 1.1 Extracción de Metadatos del Hardware
+            gps_signal = data.get("gps_signal")   # Cantidad de satélites
+            fix_quality = data.get("fix_quality") # Flag NMEA oficial de la placa
+            
+            try:
+                hdop = float(data.get("hdop", 1.0))
+            except (TypeError, ValueError):
+                hdop = 1.0
+
+            # 1.2 Máquina de Estados de Validación de Fix
+            is_fix_valid = False
+            
+            if fix_quality is not None:
+                # Prioridad Absoluta: El hardware reporta si logró resolver la ecuación
+                if int(fix_quality) > 0:
+                    is_fix_valid = True
+            elif gps_signal is not None:
+                # Respaldo: Heurística matemática si el hardware no expone fix_quality
+                try:
+                    sats = float(gps_signal)
+                    # 4 satélites es el mínimo algebraico real para resolver x, y, z, t
+                    if sats >= 4.0: 
+                        is_fix_valid = True
+                    
+                    # Generación de HDOP sintético si el SDK no lo empaqueta
+                    if "hdop" not in data:
+                        hdop = max(1.0, 10.0 / (sats + 1e-6))
+                except (TypeError, ValueError):
+                    pass
+
+            if is_fix_valid:
                 gps.status.status = NavSatStatus.STATUS_FIX
+            else:
+                gps.status.status = NavSatStatus.STATUS_NO_FIX
+                hdop = 50.0 # Castigo masivo a la covarianza ante pérdida de anclaje
 
             gps.status.service = NavSatStatus.SERVICE_GPS
             gps.latitude = float(lat)
             gps.longitude = float(lng)
-            gps.position_covariance = self._gps_position_covariance
-            gps.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
-            self.gps_pub.publish(gps)
 
-        # `orientation` is the rover's magnetometer-derived compass heading
-        # (degrees, 0=North, clockwise). Convert it to ROS ENU yaw once here,
-        # and reuse that single `yaw` value everywhere below (IMU quaternion,
-        # odom quaternion, dead-reckoning) so the whole pipeline is consistent.
+            # 1.3 Escalado Tensorial de Covarianza
+            # Multiplicamos la matriz original completa por HDOP^2 mediante list comprehension.
+            # Esto preserva el tensor original inyectado por ROS 2 intacto.
+            hdop_factor = hdop ** 2
+            gps.position_covariance = [
+                cov * hdop_factor for cov in self._gps_position_covariance
+            ]
+            # Cambiamos a APPROXIMATED porque el HDOP es una dilución geométrica, no una varianza directa
+            gps.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
+            
+            # 1.4 Guarda de Seguridad del Grafo Computacional
+            if is_fix_valid and hdop < 20.0:
+                self.gps_pub.publish(gps)
+            else:
+                self.get_logger().warn(
+                    f"GNSS descartado (HDOP: {hdop:.1f}, Sats: {gps_signal}, Fix: {fix_quality}). "
+                    "Forzando EKF a Dead-Reckoning.",
+                    throttle_duration_sec=2.0
+                )
+
+        # ---------------------------------------------------------
+        # 2. ORIENTACIÓN MAGNÉTICA (Compass)
+        # ---------------------------------------------------------
         orientation = data.get("orientation")
         yaw = None
         if orientation is not None:
@@ -324,12 +381,14 @@ class EarthRoverBridge(Node):
             except (TypeError, ValueError):
                 heading_deg = None
             if heading_deg is not None:
-                # Publish the raw compass heading (degrees) for humans/debugging.
                 heading = Float32()
                 heading.data = heading_deg
                 self.heading_pub.publish(heading)
                 yaw = self._compass_heading_to_enu_yaw(heading_deg)
 
+        # ---------------------------------------------------------
+        # 3. BATERÍA
+        # ---------------------------------------------------------
         battery = data.get("battery")
         if battery is not None:
             batt = BatteryState()
@@ -338,42 +397,52 @@ class EarthRoverBridge(Node):
             batt.present = True
             self.battery_pub.publish(batt)
 
-        accels, gyros = data.get("accels") or [], data.get("gyros") or []
-        # Don't publish IMU until we have a REAL compass yaw. Both EKF configs
-        # fuse absolute/relative yaw from every IMU message (imu0_config yaw
-        # index). If we publish an identity-orientation placeholder before the
-        # first compass reading arrives, navsat_transform can latch onto it
-        # while computing the datum's heading offset -- poisoning the heading
-        # for the whole run (this is what caused the growing position error /
-        # "Transform heading factor is now 1.33746" instead of ~1.0).
-        if (accels or gyros) and yaw is not None:
-            imu = Imu()
-            imu.header.stamp = now
-            imu.header.frame_id = "base_link"
-            if accels:
-                sample = accels[-1]
+        # ---------------------------------------------------------
+        # 4. IMU Y ODOMETRÍA DE RUEDAS
+        # ---------------------------------------------------------
+        accels = data.get("accels") or []
+        gyros = data.get("gyros") or []
+        
+        # Verificamos que tengamos orientación absoluta para cumplir REP-105
+        if accels and yaw is not None:
+            # Iteramos sobre el array completo de 100 muestras
+            num_samples = len(accels)
+            # Frecuencia estimada: 100 muestras en 2 segundos = 50 Hz = 20ms por muestra
+            dt_sample_sec = 2.0 / num_samples 
+            
+            # Timestamp del paquete actual (la muestra más reciente)
+            base_time_sec = now.sec + (now.nanosec / 1e9)
+
+            for i, sample in enumerate(accels):
+                imu = Imu()
+                # Interpolar hacia atrás en el tiempo: la muestra 0 ocurrió hace 2 segundos
+                time_offset = dt_sample_sec * (num_samples - 1 - i)
+                sample_time = base_time_sec - time_offset
+                
+                imu.header.stamp.sec = int(sample_time)
+                imu.header.stamp.nanosec = int((sample_time - int(sample_time)) * 1e9)
+                imu.header.frame_id = "base_link"
+                
                 imu.linear_acceleration.x = float(sample[0]) * GRAVITY_M_S2
                 imu.linear_acceleration.y = float(sample[1]) * GRAVITY_M_S2
                 imu.linear_acceleration.z = float(sample[2]) * GRAVITY_M_S2
-            if gyros:
-                sample = gyros[-1]
-                imu.angular_velocity.x = math.radians(float(sample[0]))
-                imu.angular_velocity.y = math.radians(float(sample[1]))
-                # NOTE: this assumes the rover's gyro Z axis already follows the
-                # right-hand rule (CCW-positive, matching ROS). If the robot
-                # appears to turn the wrong way in RViz/EKF output, negate this.
-                imu.angular_velocity.z = math.radians(float(sample[2]))
 
-            # yaw is guaranteed not None here (see the guard above).
-            imu.orientation.x = 0.0
-            imu.orientation.y = 0.0
-            imu.orientation.z = math.sin(yaw / 2.0)
-            imu.orientation.w = math.cos(yaw / 2.0)
+                # Reutilizamos el único giro y yaw disponible en este reporte de 2s
+                if gyros:
+                    imu.angular_velocity.x = math.radians(float(gyros[-1][0]))
+                    imu.angular_velocity.y = math.radians(float(gyros[-1][1]))
+                    imu.angular_velocity.z = math.radians(float(gyros[-1][2]))
 
-            imu.orientation_covariance = self._imu_orientation_covariance
-            imu.angular_velocity_covariance = self._imu_angular_velocity_covariance
-            imu.linear_acceleration_covariance = self._imu_linear_acceleration_covariance
-            self.imu_pub.publish(imu)
+                imu.orientation.x = 0.0
+                imu.orientation.y = 0.0
+                imu.orientation.z = math.sin(yaw / 2.0)
+                imu.orientation.w = math.cos(yaw / 2.0)
+
+                imu.orientation_covariance = self._imu_orientation_covariance
+                imu.angular_velocity_covariance = self._imu_angular_velocity_covariance
+                imu.linear_acceleration_covariance = self._imu_linear_acceleration_covariance
+                
+                self.imu_pub.publish(imu)
 
         speed = data.get("speed")
         speed_m_s = None
@@ -394,6 +463,7 @@ class EarthRoverBridge(Node):
         dt = None
         if self._last_odom_time is not None:
             dt = current_time - self._last_odom_time
+            
         if speed_m_s is not None and yaw is not None and dt is not None and dt > 0:
             self._odom_x += speed_m_s * math.cos(yaw) * dt
             self._odom_y += speed_m_s * math.sin(yaw) * dt
@@ -418,9 +488,6 @@ class EarthRoverBridge(Node):
                 w=math.cos(yaw / 2.0),
             )
             odom.pose.covariance = self._odom_pose_covariance
-            # linear.x/y here are in the base_link (child) frame, per REP-103 --
-            # forward speed on x, no lateral slip assumed on y. This is correct
-            # as-is and doesn't need the yaw conversion applied to it.
             odom.twist.twist.linear.x = speed_m_s
             odom.twist.twist.linear.y = 0.0
             odom.twist.twist.linear.z = 0.0

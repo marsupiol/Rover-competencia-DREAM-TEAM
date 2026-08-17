@@ -2,6 +2,7 @@
 """Mission Manager Node for Earth Rover Mission 1."""
 
 import math
+import threading
 import requests
 import rclpy
 from rclpy.node import Node
@@ -18,8 +19,8 @@ class MissionManagerNode(Node):
         self.declare_parameter("sdk_url", "http://localhost:8000")
         self.declare_parameter("checkpoint_post_retries", 15)
         self.declare_parameter("checkpoint_post_min_interval_s", 2.0)
-        self.declare_parameter("checkpoint_max_distance_m", 14.0)
-        self.declare_parameter("proximity_dwell_s", 2.0)
+        self.declare_parameter("checkpoint_max_distance_m", 4.0)
+        self.declare_parameter("proximity_dwell_s", 15.0)
         self.declare_parameter("min_navigation_time_s", 8.0)
         self.declare_parameter("pre_post_stop_s", 2.5)
 
@@ -137,6 +138,22 @@ class MissionManagerNode(Node):
         if self.state == "NAVIGATING_CHECKPOINT":
             self._check_proximity_to_checkpoint()
 
+        if self.state == "AWAITING_HTTP_RESPONSE":
+                    if getattr(self, '_http_request_in_flight', False):
+                        return # Seguimos esperando al hilo, salimos para dejar correr otros callbacks
+                        
+                    # El hilo terminó, evaluamos resultados
+                    if self._http_response_status == 200:
+                        self.get_logger().info(f"POST Exitoso: {self._http_response_data}")
+                        self._checkpoint_post_ok = True
+                        self._last_post_response = self._http_response_data
+                        self.state = "CONFIRMING_CHECKPOINT"
+                        self._handle_checkpoint_reached()
+                    else:
+                        self.get_logger().error(f"Fallo en POST asíncrono: {self._http_response_data}")
+                        self.state = "AWAITING_SDK_CONFIRMATION"
+                    return
+        
         if self.state == "STARTING_MISSION":
             now = self.get_clock().now().nanoseconds / 1e9
             if now < self._next_start_attempt_at:
@@ -343,7 +360,7 @@ class MissionManagerNode(Node):
 
     def _notify_checkpoint_reached(self, sequence):
         if self.current_lat is None or self.current_lon is None:
-            self.get_logger().error("Cannot POST checkpoint-reached without GPS fix")
+            self.get_logger().error("Imposible publicar checkpoint sin GPS")
             return False, None
 
         now = self.get_clock().now()
@@ -354,47 +371,36 @@ class MissionManagerNode(Node):
 
         self._checkpoint_post_attempts += 1
         self._last_post_attempt_at = now
-        dist = self._distance_to_current_checkpoint()
-        dist_text = f"{dist:.1f}m" if dist is not None else "unknown"
+        
+        payload = {"latitude": self.current_lat, "longitude": self.current_lon}
+        
+        self.get_logger().info(f"Iniciando POST asíncrono para checkpoint {sequence}...")
 
-        payload = {
-            "latitude": self.current_lat,
-            "longitude": self.current_lon,
-        }
-        self.get_logger().info(
-            f"Posting /checkpoint-reached for checkpoint sequence {sequence} "
-            f"(attempt {self._checkpoint_post_attempts}, distance={dist_text}, "
-            f"GPS=({self.current_lat:.8f}, {self.current_lon:.8f}))"
-        )
+        # Flag para indicar que hay una petición en vuelo
+        self._http_request_in_flight = True
+        self._http_response_data = None
+        self._http_response_status = None
 
-        try:
-            res = requests.post(
-                f"{self.sdk_url}/checkpoint-reached",
-                json=payload,
-                timeout=15.0,
-            )
-            if res.status_code == 200:
-                data = res.json()
-                self.get_logger().info(f"Checkpoint POST OK: {data}")
-                return True, data
-
-            detail = res.text
+        def http_worker():
             try:
-                detail = res.json()
-            except Exception:
-                pass
-            self.get_logger().error(
-                f"checkpoint-reached failed ({res.status_code}): {detail}"
-            )
-            if res.status_code == 400 and "start-mission" in str(detail).lower():
-                self.get_logger().warning(
-                    "SDK mission already ended (likely completed on previous checkpoint)"
-                )
-                return "mission_ended", None
-        except Exception as e:
-            self.get_logger().error(f"checkpoint-reached error: {e}")
+                res = requests.post(f"{self.sdk_url}/checkpoint-reached", json=payload, timeout=15.0)
+                self._http_response_status = res.status_code
+                if res.status_code == 200:
+                    self._http_response_data = res.json()
+                else:
+                    self._http_response_data = res.text
+            except Exception as e:
+                self._http_response_status = "ERROR"
+                self._http_response_data = str(e)
+            finally:
+                self._http_request_in_flight = False
 
-        return False, None
+        # Lanzar hilo en background para no asfixiar el middleware DDS
+        threading.Thread(target=http_worker, daemon=True).start()
+        
+        # Inmediatamente cambiamos a un nuevo estado de espera
+        self.state = "AWAITING_HTTP_RESPONSE"
+        return "in_flight", None
 
     def _confirm_checkpoint(self, sequence, post_data):
         if post_data:
