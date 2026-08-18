@@ -257,18 +257,16 @@ class MissionManagerNode(Node):
                     pause_msg = Bool()
                     pause_msg.data = True
                     self.pause_pub.publish(pause_msg)
-                    
-                    # CORRECCIÓN: No basta con cambiar el estado. 
-                    # Debemos configurar la secuencia y FORZAR la ejecución de la función de reporte.
-                    self._pending_confirmation_sequence = self.checkpoints[self.current_checkpoint_idx]["sequence"]
-                    
-                    # Llamamos directamente a la función que armamos previamente para manejar el POST
-                    self._handle_checkpoint_reached_impl()
-                    
-                    # 2. Transicionamos directamente a la fase HTTP, saltándonos la navegación física
-                    self.state = "CONFIRMING_CHECKPOINT"
+
+                    # Reseteamos ANTES de llamar, no después (por las dudas de que
+                    # queden pisadas banderas de un checkpoint anterior)
                     self._checkpoint_post_attempts = 0
-                    self._checkpoint_post_ok = False
+                    self._checkpoint_post_ok = False 
+                    self._pending_confirmation_sequence = self.checkpoints[self.current_checkpoint_idx]["sequence"]
+
+                    # Llamamos directamente a la función que maneja el POST; ella misma
+                    # deja self.state en el valor correcto (AWAITING_HTTP_RESPONSE, etc.)
+                    self._handle_checkpoint_reached_impl()
                     
                 else:
                     # Comportamiento normal: Estamos fuera de la meta, toca conducir.

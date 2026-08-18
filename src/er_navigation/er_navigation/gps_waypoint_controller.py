@@ -36,56 +36,36 @@ class GPSWaypointController(Node):
         self.declare_parameter("heading_filter_alpha", 0.35)
         self.declare_parameter("reached_publish_period_s", 1.0)
 
-        # 2. EXTRACCIÓN Y BLINDAJE (Clamps de Seguridad)
-        
+        # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
+
         # --- Tolerancias y Distancias ---
-        raw_tolerance = float(self.get_parameter("goal_tolerance_m").value)
-        self.goal_tolerance = min(3.0, raw_tolerance)
-        self.base_goal_tolerance = self.goal_tolerance  # NUEVO: Respaldo de la tolerancia original
+        self.goal_tolerance = float(self.get_parameter("goal_tolerance_m").value)
+        self.base_goal_tolerance = self.goal_tolerance  # Respaldo de la tolerancia original
         self.goal_dwell_s = float(self.get_parameter("goal_dwell_s").value)
         self.approach_align_distance = float(self.get_parameter("approach_align_distance_m").value)
 
-        # --- Umbrales de Alineación Estrangulados ---
-        # Nota Arquitectónica: Las llaves deben coincidir exactamente con la declaración ("_deg")
-        raw_align = float(self.get_parameter("align_threshold_deg").value)
-        self.align_threshold = max(15.0, raw_align)     # CLAMP: Forzamos AL MENOS 15.0 grados
-        raw_coarse = float(self.get_parameter("coarse_align_threshold_deg").value)
-        self.coarse_align_threshold = max(25.0, raw_coarse) # CLAMP: Mínimo 25.0 grados de lejos
+        # --- Umbrales de Alineación ---
+        self.align_threshold = float(self.get_parameter("align_threshold_deg").value)
+        self.coarse_align_threshold = float(self.get_parameter("coarse_align_threshold_deg").value)
 
         # --- Dinámica de Conducción y Giro ---
         self.forward_speed = float(self.get_parameter("forward_speed").value)
-        
-        raw_turn_speed = float(self.get_parameter("turn_speed").value)
-        self.turn_speed = max(0.5, raw_turn_speed)     # CLAMP: Mínimo 0.5 rad/s
+        self.turn_speed = float(self.get_parameter("turn_speed").value)
         self.angular_speed = float(self.get_parameter("angular_speed").value)
-        
-        # --- Dinámica de Conducción en Curva (CRÍTICO) ---
-        # Como entramos a DRIVE con 15° de error, necesitamos que la corrección sobre 
-        # la marcha sea lo suficientemente agresiva para esquivar la pared.
-        raw_gain = float(self.get_parameter("drive_correction_gain").value)
-        self.drive_correction_gain = max(0.03, raw_gain) # Subimos la ganancia P (antes 0.015)
-        
-        # Le damos más autoridad al motor para curvar la trayectoria mientras avanza
-        raw_max_drive_angular = float(self.get_parameter("max_drive_angular").value)
-        self.max_drive_angular = max(0.4, raw_max_drive_angular) # Subimos el límite de giro en movimiento
+
+        # --- Dinámica de Conducción en Curva ---
+        self.drive_correction_gain = float(self.get_parameter("drive_correction_gain").value)
+        self.max_drive_angular = float(self.get_parameter("max_drive_angular").value)
         self.invert_angular = bool(self.get_parameter("invert_angular").value)
 
-        # --- Tiempos de Ráfaga y Filtros (Adaptación al Hardware) ---
         # --- Tiempos de Ráfaga y Filtros ---
-        # ESTRANGULAMIENTO CRÍTICO: Cortamos la ráfaga a máximo 0.25 segundos.
-        # Matemática: 0.5 rad/s * 0.25s = 0.125 rad = ~7 grados por ráfaga.
-        # Es el "paso" perfecto para entrar suavemente en una ventana de 4.0 grados.
-        raw_burst = float(self.get_parameter("turn_burst_s").value)
-        self.turn_burst_s = min(0.25, raw_burst)       # CLAMP: Máximo 0.25s de inyección
-        raw_pause = float(self.get_parameter("pause_after_turn_s").value)
-        self.pause_after_turn_s = max(2.2, raw_pause)  # CLAMP: Mínimo 2.2s de espera al IMU
-        
-        raw_jump = float(self.get_parameter("max_heading_jump_deg").value)
-        self.max_heading_jump = max(150.0, raw_jump)   # CLAMP: Mínimo 150 grados para evitar ceguera
-        
+        self.turn_burst_s = float(self.get_parameter("turn_burst_s").value)
+        self.pause_after_turn_s = float(self.get_parameter("pause_after_turn_s").value)
+        self.max_heading_jump = float(self.get_parameter("max_heading_jump_deg").value)
+
         self.heading_filter_alpha = float(self.get_parameter("heading_filter_alpha").value)
         self.reached_publish_period_s = float(self.get_parameter("reached_publish_period_s").value)
-        self.loop_hz = max(1.0, float(self.get_parameter("control_loop_hz").value))
+        self.loop_hz = float(self.get_parameter("control_loop_hz").value)
 
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
