@@ -17,41 +17,75 @@ class GPSWaypointController(Node):
     def __init__(self):
         super().__init__("gps_waypoint_controller")
 
-        # 1. Declaración Estricta de Parámetros (Tipado Fuerte)
-        self.declare_parameter("goal_tolerance_m", 3.0)
+        # 1. DECLARACIÓN ESTRICTA DE PARÁMETROS (Tipado Fuerte)
+        self.declare_parameter("goal_tolerance_m", 14.0) # Se frena 1 metro adentro del perímetro
         self.declare_parameter("goal_dwell_s", 1.5)
         self.declare_parameter("align_threshold_deg", 15.0)
         self.declare_parameter("coarse_align_threshold_deg", 45.0)
         self.declare_parameter("approach_align_distance_m", 8.0)
         self.declare_parameter("forward_speed", 0.35)
         self.declare_parameter("turn_speed", 0.25)
+        self.declare_parameter("angular_speed", 0.80)
         self.declare_parameter("drive_correction_gain", 0.002)
         self.declare_parameter("max_drive_angular", 0.10)
         self.declare_parameter("invert_angular", True)
         self.declare_parameter("control_loop_hz", 5.0)
         self.declare_parameter("turn_burst_s", 0.35)
         self.declare_parameter("pause_after_turn_s", 2.2)
-        self.declare_parameter("max_heading_jump_deg", 90.0)
+        self.declare_parameter("max_heading_jump_deg", 150.0)
         self.declare_parameter("heading_filter_alpha", 0.35)
         self.declare_parameter("reached_publish_period_s", 1.0)
 
-        # 2. Extracción de Parámetros
-        self.goal_tolerance = float(self.get_parameter("goal_tolerance_m").value)
+        # 2. EXTRACCIÓN Y BLINDAJE (Clamps de Seguridad)
+        
+        # --- Tolerancias y Distancias ---
+        raw_tolerance = float(self.get_parameter("goal_tolerance_m").value)
+        self.goal_tolerance = min(3.0, raw_tolerance)
+        self.base_goal_tolerance = self.goal_tolerance  # NUEVO: Respaldo de la tolerancia original
         self.goal_dwell_s = float(self.get_parameter("goal_dwell_s").value)
-        self.align_threshold = float(self.get_parameter("align_threshold_deg").value)
-        self.coarse_align_threshold = float(self.get_parameter("coarse_align_threshold_deg").value)
         self.approach_align_distance = float(self.get_parameter("approach_align_distance_m").value)
+
+        # --- Umbrales de Alineación Estrangulados ---
+        # Nota Arquitectónica: Las llaves deben coincidir exactamente con la declaración ("_deg")
+        raw_align = float(self.get_parameter("align_threshold_deg").value)
+        self.align_threshold = max(15.0, raw_align)     # CLAMP: Forzamos AL MENOS 15.0 grados
+        raw_coarse = float(self.get_parameter("coarse_align_threshold_deg").value)
+        self.coarse_align_threshold = max(25.0, raw_coarse) # CLAMP: Mínimo 25.0 grados de lejos
+
+        # --- Dinámica de Conducción y Giro ---
         self.forward_speed = float(self.get_parameter("forward_speed").value)
-        self.turn_speed = float(self.get_parameter("turn_speed").value)
-        self.drive_correction_gain = float(self.get_parameter("drive_correction_gain").value)
-        self.max_drive_angular = float(self.get_parameter("max_drive_angular").value)
+        
+        raw_turn_speed = float(self.get_parameter("turn_speed").value)
+        self.turn_speed = max(0.5, raw_turn_speed)     # CLAMP: Mínimo 0.5 rad/s
+        self.angular_speed = float(self.get_parameter("angular_speed").value)
+        
+        # --- Dinámica de Conducción en Curva (CRÍTICO) ---
+        # Como entramos a DRIVE con 15° de error, necesitamos que la corrección sobre 
+        # la marcha sea lo suficientemente agresiva para esquivar la pared.
+        raw_gain = float(self.get_parameter("drive_correction_gain").value)
+        self.drive_correction_gain = max(0.03, raw_gain) # Subimos la ganancia P (antes 0.015)
+        
+        # Le damos más autoridad al motor para curvar la trayectoria mientras avanza
+        raw_max_drive_angular = float(self.get_parameter("max_drive_angular").value)
+        self.max_drive_angular = max(0.4, raw_max_drive_angular) # Subimos el límite de giro en movimiento
         self.invert_angular = bool(self.get_parameter("invert_angular").value)
-        self.turn_burst_s = float(self.get_parameter("turn_burst_s").value)
-        self.pause_after_turn_s = float(self.get_parameter("pause_after_turn_s").value)
-        self.max_heading_jump = float(self.get_parameter("max_heading_jump_deg").value)
+
+        # --- Tiempos de Ráfaga y Filtros (Adaptación al Hardware) ---
+        # --- Tiempos de Ráfaga y Filtros ---
+        # ESTRANGULAMIENTO CRÍTICO: Cortamos la ráfaga a máximo 0.25 segundos.
+        # Matemática: 0.5 rad/s * 0.25s = 0.125 rad = ~7 grados por ráfaga.
+        # Es el "paso" perfecto para entrar suavemente en una ventana de 4.0 grados.
+        raw_burst = float(self.get_parameter("turn_burst_s").value)
+        self.turn_burst_s = min(0.25, raw_burst)       # CLAMP: Máximo 0.25s de inyección
+        raw_pause = float(self.get_parameter("pause_after_turn_s").value)
+        self.pause_after_turn_s = max(2.2, raw_pause)  # CLAMP: Mínimo 2.2s de espera al IMU
+        
+        raw_jump = float(self.get_parameter("max_heading_jump_deg").value)
+        self.max_heading_jump = max(150.0, raw_jump)   # CLAMP: Mínimo 150 grados para evitar ceguera
+        
         self.heading_filter_alpha = float(self.get_parameter("heading_filter_alpha").value)
         self.reached_publish_period_s = float(self.get_parameter("reached_publish_period_s").value)
-        loop_hz = max(1.0, float(self.get_parameter("control_loop_hz").value))
+        self.loop_hz = max(1.0, float(self.get_parameter("control_loop_hz").value))
 
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
@@ -66,8 +100,18 @@ class GPSWaypointController(Node):
         )
 
         # 4. Suscriptores y Publicadores
-        self.create_subscription(NavSatFix, "earth_rover/gps", self._on_gps, sensor_qos)
-        self.create_subscription(Float32, "earth_rover/heading", self._on_heading, sensor_qos)
+        self.create_subscription(
+            NavSatFix,
+            "gps/filtered",          # <--- Salida directa de navsat_transform (EKF)
+            self._on_gps,
+            sensor_qos               # BEST_EFFORT
+        )
+        self.create_subscription(
+            Float32,
+            "earth_rover/heading",   # <--- Salida directa de ekf_heading_bridge
+            self._on_heading,
+            sensor_qos               # BEST_EFFORT
+        )
         self.create_subscription(NavSatFix, "earth_rover/target_waypoint", self._on_target, reliable_qos)
         self.create_subscription(Bool, "earth_rover/navigation_pause", self._on_navigation_pause, reliable_qos)
         self.create_subscription(String, "earth_rover/waypoint_status", self._on_mission_status, reliable_qos)
@@ -94,9 +138,9 @@ class GPSWaypointController(Node):
         self._navigation_paused = False
 
         # 6. Bucle de Control Principal
-        self.timer = self.create_timer(1.0 / loop_hz, self._control_loop)
+        self.timer = self.create_timer(1.0 / self.loop_hz, self._control_loop)
         self.get_logger().info(
-            f"Controlador Híbrido Iniciado | Loop: {loop_hz} Hz | Burst: {self.turn_burst_s}s | Filter Alpha: {self.heading_filter_alpha}"
+            f"Controlador Híbrido Iniciado | Loop: {self.loop_hz} Hz | Burst: {self.turn_burst_s}s | Filter Alpha: {self.heading_filter_alpha}"
         )
 
     # --- CALLBACKS DE SENSORES ---
@@ -113,11 +157,11 @@ class GPSWaypointController(Node):
             return
 
         jump = abs(self.angle_error_deg(raw, self.current_heading))
-        # Rechazo de anomalías magnéticas severas
         if jump > self.max_heading_jump:
+            # AHORA SABREMOS SI LA BRÚJULA SE ESTÁ RECHAZANDO
+            self.get_logger().warn(f"Salto magnético gigante rechazado: {jump:.1f}°")
             return
 
-        # Filtro EWMA (Pasa-bajos)
         delta = self.angle_error_deg(raw, self.current_heading)
         self.current_heading = (self.current_heading + self.heading_filter_alpha * delta) % 360.0
 
@@ -133,11 +177,28 @@ class GPSWaypointController(Node):
         self._align_phase_started_at = None
         self._burst_turn_sign = 0
         self._navigation_paused = False
+        
+        # CRÍTICO: Restaurar tolerancia original al cambiar a una nueva meta
+        self.goal_tolerance = self.base_goal_tolerance
+        
         self._stop_robot()
-        self.get_logger().info(f"Target Fijado: ({self.target_lat:.6f}, {self.target_lon:.6f})")
+        self.get_logger().info(f"Target Fijado: ({self.target_lat:.6f}, {self.target_lon:.6f}) | Tolerancia: {self.goal_tolerance}m")
 
     def _on_navigation_pause(self, msg: Bool):
+        was_paused = self._navigation_paused
         self._navigation_paused = bool(msg.data)
+        
+        # --- DETECTOR DE RECHAZO DEL SDK ---
+        # Si estábamos pausados, nos despausan, y seguimos esperando una meta nueva...
+        if was_paused and not self._navigation_paused and self._awaiting_next_target:
+            # ¡Significa que el SDK dijo que NO! Estrangulamos la tolerancia a la mitad.
+            self.goal_tolerance = max(0.5, self.goal_tolerance * 0.5)
+            self.get_logger().warn(
+                f"¡Rechazo del SDK detectado! Estrangulando tolerancia geodésica a {self.goal_tolerance:.1f}m"
+            )
+            self._awaiting_next_target = False
+            self._reached_since = None
+
         if self._navigation_paused:
             self._stop_robot()
             self.get_logger().info("Pausa comandada por mission_manager.")
@@ -272,7 +333,19 @@ class GPSWaypointController(Node):
                     twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_speed)
             else: # Fase TURN
                 twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_speed)
-                if elapsed >= self.turn_burst_s:
+                
+                # --- INYECCIÓN DE CONTROL DINÁMICO ---
+                # Calculamos el burst on-the-fly según la gravedad del error
+                abs_err = abs(heading_error)
+                if abs_err > 30.0:
+                    dynamic_burst = 0.65  # Giro rápido y agresivo para grandes desviaciones
+                elif abs_err > 15.0:
+                    dynamic_burst = 0.40  # Giro medio para acercamiento
+                else:
+                    dynamic_burst = 0.22  # Micro-toque de francotirador para no pasarse del umbral
+                
+                # Evaluamos el corte contra nuestro burst dinámico, no el estático
+                if elapsed >= dynamic_burst:
                     self._begin_align_phase("PAUSE", now)
                     twist.angular.z = 0.0
         else:

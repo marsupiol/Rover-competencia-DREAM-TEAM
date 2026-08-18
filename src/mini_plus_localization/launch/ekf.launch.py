@@ -44,17 +44,20 @@ def generate_launch_description():
 
         # navsat_transform: proyecta /gps/fix a /odometry/gps y devuelve el
         # GPS ya fusionado directo en earth_rover/gps (sin tocar er_navigation)
+
+        # navsat_transform: Proyecta /gps/fix a /odometry/gps y genera /gps/filtered
         Node(
             package='robot_localization',
             executable='navsat_transform_node',
             name='navsat_transform',
             output='screen',
-            parameters=[ekf_yaml],
+            parameters=[ekf_yaml, {'use_sim_time': True}],
             remappings=[
                 ('imu', '/imu/data'),
                 ('gps/fix', '/gps/fix'),
-                ('odometry/filtered', 'odometry/local'),
-                ('gps/filtered', 'earth_rover/gps'),
+                ('odometry/filtered', 'odometry/global'),
+                # CONTRATO ESTRICTO: Salida oficial limpia
+                ('gps/filtered', 'gps/filtered'),
             ],
         ),
 

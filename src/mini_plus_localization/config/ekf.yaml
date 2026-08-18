@@ -1,9 +1,9 @@
 ekf_filter_node_odom:
   ros__parameters:
-    frequency: 30.0
+    frequency: 10.0
     
     # 1. MITIGACIÓN DE LATENCIA (4G/LTE Jitter)
-    sensor_timeout: 0.5           # Si no hay datos en 0.5s, pasa a modo Dead-Reckoning
+    sensor_timeout: 2.0           # Si no hay datos en 2s, pasa a modo Dead-Reckoning
     delay: 0.1                    # Buffer de 100ms para ordenar paquetes desordenados
     transform_time_offset: 0.05   # Publicar TF 50ms en el futuro para evitar errores de extrapolación en Nav2
     
@@ -28,22 +28,21 @@ ekf_filter_node_odom:
 
     # 3. CONFIGURACIÓN DE IMU (MPU-6050 + Brújula)
     imu0: /imu/data
-    # Leemos SOLO el Yaw absoluto de la brújula (índice 5).
-    # Desactivamos Vyaw (índice 11) porque la red 4G destruye la precisión de la derivada.
     imu0_config: [false, false, false,
-                  false, false, true,
+                  false, false, true, # Leemos yaw
                   false, false, false,
                   false, false, false,
                   false, false, false]
     imu0_differential: false
-    imu0_relative: false # Debe ser false para anclar el Norte Real de la brújula
+    # CORRECCIÓN: true garantiza que odom empiece en yaw=0 y sea continuo (cumple REP-105)
+    imu0_relative: true
 
 ekf_filter_node_map:
   ros__parameters:
-    frequency: 30.0
+    frequency: 10.0
     
     # Mismas defensas anti-latencia para el nodo global
-    sensor_timeout: 0.5
+    sensor_timeout: 2.0
     delay: 0.1
     transform_time_offset: 0.05
     two_d_mode: true
@@ -83,12 +82,20 @@ ekf_filter_node_map:
 
 navsat_transform:
   ros__parameters:
-    frequency: 30.0
-    delay: 0.0 # navsat no necesita delay si los EKF ya ordenaron la telemetría
-    magnetic_declination_radians: 0.0 # Se asume calibrado in-situ o en bridge
-    yaw_offset: 0.0
+    frequency: 10.0
+    delay: 0.0
+    magnetic_declination_radians: 0.0 
+    
+    # --- CORRECCIÓN REP-105 ---
+    # Si tu IMU marca 0° en el Norte, debemos sumarle 90° (pi/2) para que coincida con el Este de ROS 2.
+    yaw_offset: 1.570796327
+    
     zero_altitude: true
     broadcast_utm_transform: false
     publish_filtered_gps: true
-    use_odometry_yaw: false
+    
+    # --- CORRECCIÓN DE FUSIÓN ---
+    # Obligamos a navsat a usar el 'yaw' ya filtrado y perfecto del EKF, no el IMU crudo
+    use_odometry_yaw: false  
+    
     wait_for_datum: false

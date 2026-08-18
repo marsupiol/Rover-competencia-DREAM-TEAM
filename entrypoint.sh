@@ -50,9 +50,10 @@ SDK_URL="${SDK_URL:-http://localhost:8000}"
 case "$ROVER_MODE" in
   full)
     echo "[entrypoint] ROVER_MODE=full -> bridge + EKF + navegación + misión"
-    ros2 launch mini_plus_localization ekf.launch.py sdk_url:="$SDK_URL" &
-    PIDS+=("$!")
-    sleep 3
+    # mission1.launch.py ya incluye ekf.launch.py (IncludeLaunchDescription),
+    # así que NO lo lanzamos por separado acá: hacerlo duplicaba cada nodo del
+    # EKF (base_link_to_gps, ekf_filter_node_odom, ekf_filter_node_map,
+    # navsat_transform, ekf_heading_bridge) con el mismo nombre.
     ros2 launch er_bringup mission1.launch.py &
     PIDS+=("$!")
     ;;
