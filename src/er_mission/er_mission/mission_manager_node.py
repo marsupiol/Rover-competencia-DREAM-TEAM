@@ -54,7 +54,7 @@ class MissionManagerNode(Node):
         self.pause_pub = self.create_publisher(Bool, "earth_rover/navigation_pause", 10)
         self.create_subscription(
             NavSatFix, 
-            "earth_rover/gps", 
+            "gps/filtered", 
             self._on_gps, 
             sensor_qos
         )

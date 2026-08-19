@@ -51,7 +51,7 @@ def generate_launch_description():
             executable='navsat_transform_node',
             name='navsat_transform',
             output='screen',
-            parameters=[ekf_yaml, {'use_sim_time': True}],
+            parameters=[ekf_yaml],
             remappings=[
                 ('imu', '/imu/data'),
                 ('gps/fix', '/gps/fix'),
