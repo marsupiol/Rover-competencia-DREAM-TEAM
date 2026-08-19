@@ -1,0 +1,3 @@
+[submodule "src/third_party/sana-earth-rover-policy"]
+	path = src/third_party/sana-earth-rover-policy
+	url = https://github.com/sanatem/sana-earth-rover-policy.git
