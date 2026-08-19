@@ -51,12 +51,11 @@ def generate_launch_description():
             executable='navsat_transform_node',
             name='navsat_transform',
             output='screen',
-            parameters=[ekf_yaml, {'use_sim_time': True}],
+            parameters=[ekf_yaml],   # sin {'use_sim_time': True}
             remappings=[
                 ('imu', '/imu/data'),
                 ('gps/fix', '/gps/fix'),
                 ('odometry/filtered', 'odometry/global'),
-                # CONTRATO ESTRICTO: Salida oficial limpia
                 ('gps/filtered', 'gps/filtered'),
             ],
         ),

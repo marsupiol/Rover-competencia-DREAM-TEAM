@@ -67,6 +67,31 @@ class GPSWaypointController(Node):
         self.reached_publish_period_s = float(self.get_parameter("reached_publish_period_s").value)
         self.loop_hz = float(self.get_parameter("control_loop_hz").value)
 
+
+        # --- 2. NUEVA SUSCRIPCIÓN DE IA (FUSIÓN VISUAL) ---
+        # Se suscribe al tópico que escupe el nodo SAM-TP
+        self.ai_cmd_sub = self.create_subscription(
+            Twist,
+            '/perception/safe_velocity',
+            self._ai_cmd_callback,
+            10
+        )
+        
+        # Memoria de la Máquina de Estados
+        self.latest_ai_cmd = None
+        self.last_ai_time = self.get_clock().now()
+        
+        # Dead-Man Switch (Interruptor de Hombre Muerto): 0.5 segundos
+        self.ai_timeout_sec = 0.5 
+        
+        # Publicador a los motores del Rover
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        
+        # Loop de control unificado (ej. corriendo a 10 Hz / 0.1s)
+        self.control_timer = self.create_timer(0.1, self._control_loop)
+        
+        self.get_logger().info("Controlador Híbrido GPS+IA Inicializado.")
+
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -341,6 +366,33 @@ class GPSWaypointController(Node):
                 max(-self.max_drive_angular, min(self.max_drive_angular, correction))
             )
 
+        # =====================================================================
+        # 3. FUSIÓN DE COMPORTAMIENTOS (Arquitectura de Subsunción)
+        # =====================================================================
+        time_since_ai = (now - self.last_ai_time).nanoseconds / 1e9
+        
+        # Validar si la IA está "viva" y el dato es fresco
+        if self.latest_ai_cmd is not None and time_since_ai < self.ai_timeout_sec:
+            umbral_evasion_angular = 0.1  # rad/s. Si la IA pide más que esto, es una evasión.
+            
+            if abs(self.latest_ai_cmd.angular.z) > umbral_evasion_angular:
+                self.get_logger().warn("¡Evasión Activa! IA secuestrando motores.", throttle_duration_sec=1.0)
+                
+                # Secuestro (Override) de la rotación
+                twist.angular.z = self.latest_ai_cmd.angular.z
+                
+                # Regla de seguridad: Reducir velocidad lineal al evadir, tomando el mínimo
+                # entre lo que quería el GPS y lo que pide la IA.
+                twist.linear.x = min(twist.linear.x, self.latest_ai_cmd.linear.x)
+                
+                mode = "EVASION_IA"
+                
+        elif self.latest_ai_cmd is not None:
+             self.get_logger().error(f"Latencia neuronal alta ({time_since_ai:.2f}s). IA ignorada (Fail-safe activo).", throttle_duration_sec=2.0)
+
+        # =====================================================================
+
+        # 4. Enviar energía final a los actuadores
         self.cmd_pub.publish(twist)
 
         # Telemetría interna para Depuración
@@ -353,6 +405,12 @@ class GPSWaypointController(Node):
         out = String()
         out.data = status
         self.status_pub.publish(out)
+
+    def _ai_cmd_callback(self, msg: Twist):
+            """ Actualiza el último comando recibido de la red neuronal """
+            self.latest_ai_cmd = msg
+            self.last_ai_time = self.get_clock().now()
+
 
 def main(args=None):
     rclpy.init(args=args)
