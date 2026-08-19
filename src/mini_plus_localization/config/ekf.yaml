@@ -88,7 +88,7 @@ navsat_transform:
     
     # --- CORRECCIÓN REP-105 ---
     # Si tu IMU marca 0° en el Norte, debemos sumarle 90° (pi/2) para que coincida con el Este de ROS 2.
-    yaw_offset: 1.570796327
+    yaw_offset: 0.0
     
     zero_altitude: true
     broadcast_utm_transform: false

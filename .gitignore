@@ -2,3 +2,7 @@
 build/
 install/
 log/
+ai_venv/
+build/
+install/
+log/
