@@ -29,15 +29,12 @@ def conda_python_env():
 
 def generate_launch_description():
     er_navigation_dir = get_package_share_directory('er_navigation')
+    er_perception_dir = get_package_share_directory('er_perception')
     er_mission_dir = get_package_share_directory('er_mission')
     mpl_dir = get_package_share_directory('mini_plus_localization')
     
-    # 1. Gestión de Entornos (Conda + ROCm para AMD)
+    # 1. Gestión de Entornos (Conda)
     node_env = conda_python_env()
-    
-    # Preparamos un entorno específico para la IA que fuerza el uso de la RX 570
-    ai_env = {'HSA_OVERRIDE_GFX_VERSION': '8.0.3'}
-    ai_env.update(node_env)
 
     # 2. Inclusión del EKF
     ekf_launch = IncludeLaunchDescription(
@@ -77,10 +74,11 @@ def generate_launch_description():
     # NODO NUEVO: Cerebro Visual (SAM-TP)
     perception_node = Node(
         package='er_perception',
-        executable='sam_tp_perception_node',
-        name='sam_tp_perception_node',
+        executable='traversability_node',
+        name='traversability_node',
         output='screen',
-        additional_env=ai_env, # Inyectamos variables para la GPU AMD
+        parameters=[os.path.join(er_perception_dir, 'config', 'perception_params.yaml')],
+        additional_env=node_env,
     )
 
     navigation_node = Node(

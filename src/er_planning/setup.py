@@ -2,7 +2,7 @@ import os
 from glob import glob
 from setuptools import setup
 
-package_name = 'er_perception'
+package_name = 'er_planning'
 
 setup(
     name=package_name,
@@ -18,12 +18,12 @@ setup(
     zip_safe=True,
     maintainer='Earth Rover Team',
     maintainer_email='rover@frodobots.com',
-    description='Camera-based traversability perception (SAM-TP / GeNIE) for Earth Rover',
+    description='BEV Path Planning (GeNIE / SAM-TP) for Earth Rover',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'traversability_node = er_perception.traversability_node:main',
+            'bev_planner_node = er_planning.bev_planner_node:main',
         ],
     },
 )

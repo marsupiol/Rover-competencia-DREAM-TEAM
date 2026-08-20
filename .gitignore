@@ -1,8 +1,9 @@
 .venv/
-build/
-install/
-log/
 ai_venv/
 build/
 install/
 log/
+__pycache__/
+*.pyc
+*.pyo
+

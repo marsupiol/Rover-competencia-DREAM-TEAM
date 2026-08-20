@@ -20,3 +20,9 @@ gps_waypoint_controller:
     max_heading_jump_deg: 150.0      # antes 40.0 -> clamp max(150.0, raw) lo forzaba a 150.0
     heading_filter_alpha: 0.35
     reached_publish_period_s: 1.0
+    traversability_enabled: true
+    traversability_blocked_topic: "earth_rover/traversability_blocked"
+    traversability_bias_topic: "earth_rover/traversability_angular_bias"
+    traversability_bias_gain: 1.0
+    traversability_max_stale_s: 1.0
+    max_total_drive_angular: 0.8

@@ -35,6 +35,12 @@ class GPSWaypointController(Node):
         self.declare_parameter("max_heading_jump_deg", 150.0)
         self.declare_parameter("heading_filter_alpha", 0.35)
         self.declare_parameter("reached_publish_period_s", 1.0)
+        self.declare_parameter("traversability_enabled", True)
+        self.declare_parameter("traversability_blocked_topic", "earth_rover/traversability_blocked")
+        self.declare_parameter("traversability_bias_topic", "earth_rover/traversability_angular_bias")
+        self.declare_parameter("traversability_bias_gain", 1.0)
+        self.declare_parameter("traversability_max_stale_s", 1.0)
+        self.declare_parameter("max_total_drive_angular", 0.8)
 
         # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
 
@@ -58,6 +64,14 @@ class GPSWaypointController(Node):
         self.max_drive_angular = float(self.get_parameter("max_drive_angular").value)
         self.invert_angular = bool(self.get_parameter("invert_angular").value)
 
+        # --- Percepción y Evitación de Obstáculos (Traversability) ---
+        self.traversability_enabled = bool(self.get_parameter("traversability_enabled").value)
+        self.traversability_blocked_topic = str(self.get_parameter("traversability_blocked_topic").value)
+        self.traversability_bias_topic = str(self.get_parameter("traversability_bias_topic").value)
+        self.traversability_bias_gain = float(self.get_parameter("traversability_bias_gain").value)
+        self.traversability_max_stale_s = float(self.get_parameter("traversability_max_stale_s").value)
+        self.max_total_drive_angular = float(self.get_parameter("max_total_drive_angular").value)
+
         # --- Tiempos de Ráfaga y Filtros ---
         self.turn_burst_s = float(self.get_parameter("turn_burst_s").value)
         self.pause_after_turn_s = float(self.get_parameter("pause_after_turn_s").value)
@@ -66,31 +80,6 @@ class GPSWaypointController(Node):
         self.heading_filter_alpha = float(self.get_parameter("heading_filter_alpha").value)
         self.reached_publish_period_s = float(self.get_parameter("reached_publish_period_s").value)
         self.loop_hz = float(self.get_parameter("control_loop_hz").value)
-
-
-        # --- 2. NUEVA SUSCRIPCIÓN DE IA (FUSIÓN VISUAL) ---
-        # Se suscribe al tópico que escupe el nodo SAM-TP
-        self.ai_cmd_sub = self.create_subscription(
-            Twist,
-            '/perception/safe_velocity',
-            self._ai_cmd_callback,
-            10
-        )
-        
-        # Memoria de la Máquina de Estados
-        self.latest_ai_cmd = None
-        self.last_ai_time = self.get_clock().now()
-        
-        # Dead-Man Switch (Interruptor de Hombre Muerto): 0.5 segundos
-        self.ai_timeout_sec = 0.5 
-        
-        # Publicador a los motores del Rover
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        
-        # Loop de control unificado (ej. corriendo a 10 Hz / 0.1s)
-        self.control_timer = self.create_timer(0.1, self._control_loop)
-        
-        self.get_logger().info("Controlador Híbrido GPS+IA Inicializado.")
 
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
@@ -117,6 +106,18 @@ class GPSWaypointController(Node):
             self._on_heading,
             sensor_qos               # BEST_EFFORT
         )
+        self.create_subscription(
+            Bool,
+            self.traversability_blocked_topic,
+            self._on_traversability_blocked,
+            sensor_qos,              # BEST_EFFORT
+        )
+        self.create_subscription(
+            Float32,
+            self.traversability_bias_topic,
+            self._on_traversability_bias,
+            sensor_qos,              # BEST_EFFORT
+        )
         self.create_subscription(NavSatFix, "earth_rover/target_waypoint", self._on_target, reliable_qos)
         self.create_subscription(Bool, "earth_rover/navigation_pause", self._on_navigation_pause, reliable_qos)
         self.create_subscription(String, "earth_rover/waypoint_status", self._on_mission_status, reliable_qos)
@@ -131,6 +132,11 @@ class GPSWaypointController(Node):
         self._raw_heading = None
         self.target_lat = None
         self.target_lon = None
+
+        # Percepción / Traversability (Fail Open)
+        self._trav_blocked = False
+        self._trav_bias = 0.0
+        self._trav_last_update = None
         
         # Flags de Máquina de Estados
         self.active_goal = False
@@ -148,7 +154,7 @@ class GPSWaypointController(Node):
             f"Controlador Híbrido Iniciado | Loop: {self.loop_hz} Hz | Burst: {self.turn_burst_s}s | Filter Alpha: {self.heading_filter_alpha}"
         )
 
-    # --- CALLBACKS DE SENSORES ---
+    # --- CALLBACKS DE SENSORES Y PERCEPCIÓN ---
     def _on_gps(self, msg: NavSatFix):
         self.current_lat = msg.latitude
         self.current_lon = msg.longitude
@@ -169,6 +175,14 @@ class GPSWaypointController(Node):
 
         delta = self.angle_error_deg(raw, self.current_heading)
         self.current_heading = (self.current_heading + self.heading_filter_alpha * delta) % 360.0
+
+    def _on_traversability_blocked(self, msg: Bool):
+        self._trav_blocked = bool(msg.data)
+        self._trav_last_update = self.get_clock().now()
+
+    def _on_traversability_bias(self, msg: Float32):
+        self._trav_bias = float(msg.data)
+        self._trav_last_update = self.get_clock().now()
 
     # --- CALLBACKS DE MÁQUINA DE ESTADOS ---
     def _on_target(self, msg: NavSatFix):
@@ -265,6 +279,12 @@ class GPSWaypointController(Node):
         self._burst_turn_sign = 0
         self.cmd_pub.publish(Twist())
 
+    def _traversability_is_fresh(self) -> bool:
+        if not self.traversability_enabled or self._trav_last_update is None:
+            return False
+        age_s = (self.get_clock().now() - self._trav_last_update).nanoseconds / 1e9
+        return age_s <= self.traversability_max_stale_s
+
     # --- BUCLE CENTRAL DE CONTROL ---
     def _control_loop(self):
         now = self.get_clock().now()
@@ -310,6 +330,15 @@ class GPSWaypointController(Node):
 
         if self.current_heading is None:
             self._stop_robot()
+            return
+
+        # Guarda de seguridad 4: Bloqueo por percepción de transitabilidad
+        if self._traversability_is_fresh() and self._trav_blocked:
+            self.cmd_pub.publish(Twist())
+            self.get_logger().warn(
+                "Traversability: camino bloqueado, frenando.",
+                throttle_duration_sec=2.0,
+            )
             return
 
         bearing = self.calculate_bearing(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
@@ -366,33 +395,14 @@ class GPSWaypointController(Node):
                 max(-self.max_drive_angular, min(self.max_drive_angular, correction))
             )
 
-        # =====================================================================
-        # 3. FUSIÓN DE COMPORTAMIENTOS (Arquitectura de Subsunción)
-        # =====================================================================
-        time_since_ai = (now - self.last_ai_time).nanoseconds / 1e9
-        
-        # Validar si la IA está "viva" y el dato es fresco
-        if self.latest_ai_cmd is not None and time_since_ai < self.ai_timeout_sec:
-            umbral_evasion_angular = 0.1  # rad/s. Si la IA pide más que esto, es una evasión.
-            
-            if abs(self.latest_ai_cmd.angular.z) > umbral_evasion_angular:
-                self.get_logger().warn("¡Evasión Activa! IA secuestrando motores.", throttle_duration_sec=1.0)
-                
-                # Secuestro (Override) de la rotación
-                twist.angular.z = self.latest_ai_cmd.angular.z
-                
-                # Regla de seguridad: Reducir velocidad lineal al evadir, tomando el mínimo
-                # entre lo que quería el GPS y lo que pide la IA.
-                twist.linear.x = min(twist.linear.x, self.latest_ai_cmd.linear.x)
-                
-                mode = "EVASION_IA"
-                
-        elif self.latest_ai_cmd is not None:
-             self.get_logger().error(f"Latencia neuronal alta ({time_since_ai:.2f}s). IA ignorada (Fail-safe activo).", throttle_duration_sec=2.0)
+            # Blend del bias de percepción
+            if self._traversability_is_fresh():
+                twist.angular.z += self.traversability_bias_gain * self._trav_bias
+                twist.angular.z = max(
+                    -self.max_total_drive_angular,
+                    min(self.max_total_drive_angular, twist.angular.z),
+                )
 
-        # =====================================================================
-
-        # 4. Enviar energía final a los actuadores
         self.cmd_pub.publish(twist)
 
         # Telemetría interna para Depuración
@@ -405,11 +415,6 @@ class GPSWaypointController(Node):
         out = String()
         out.data = status
         self.status_pub.publish(out)
-
-    def _ai_cmd_callback(self, msg: Twist):
-            """ Actualiza el último comando recibido de la red neuronal """
-            self.latest_ai_cmd = msg
-            self.last_ai_time = self.get_clock().now()
 
 
 def main(args=None):
