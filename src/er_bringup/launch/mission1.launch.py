@@ -29,7 +29,7 @@ def conda_python_env():
 
 def generate_launch_description():
     er_navigation_dir = get_package_share_directory('er_navigation')
-    er_perception_dir = get_package_share_directory('er_perception')
+    er_planning_dir = get_package_share_directory('er_planning')
     er_mission_dir = get_package_share_directory('er_mission')
     mpl_dir = get_package_share_directory('mini_plus_localization')
     
@@ -71,13 +71,13 @@ def generate_launch_description():
         additional_env=node_env,
     )
 
-    # NODO NUEVO: Cerebro Visual (SAM-TP)
-    perception_node = Node(
-        package='er_perception',
-        executable='traversability_node',
-        name='traversability_node',
+    # NODO: Cerebro Visual y Planificador BEV (SAM-TP + GeNIE)
+    planner_node = Node(
+        package='er_planning',
+        executable='bev_planner_node',
+        name='bev_planner_node',
         output='screen',
-        parameters=[os.path.join(er_perception_dir, 'config', 'perception_params.yaml')],
+        parameters=[os.path.join(er_planning_dir, 'config', 'planner_params.yaml')],
         additional_env=node_env,
     )
 
@@ -104,12 +104,12 @@ def generate_launch_description():
     # GRAFO DE EJECUCIÓN ORQUESTADO (Fases)
     # ==========================================================
     return LaunchDescription([
-        LogInfo(msg="[FASE 1] Inicializando Hardware SDK, Filtros EKF y Cerebro Visual (PyTorch)..."),
+        LogInfo(msg="[FASE 1] Inicializando Hardware SDK, Filtros EKF y Planificador BEV (PyTorch/GeNIE)..."),
         
         # Arrancan de inmediato:
         bridge_node,
         ekf_launch,
-        perception_node,
+        planner_node,
 
         # Arrancan con retraso de 5 segundos para evitar la saturación de CPU de PyTorch:
         TimerAction(
