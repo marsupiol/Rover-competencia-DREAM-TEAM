@@ -10,6 +10,7 @@ bev_planner_node:
     planned_path_topic: "earth_rover/planned_path"
     visualization_topic: "earth_rover/planner_visualization"
     valid_topic: "earth_rover/planner_valid"
+    local_bev_grid_topic: "earth_rover/local_bev_grid"
     publish_visualization: true
 
     # Throttle del hilo de planificación (segundos mínimos entre iteraciones)

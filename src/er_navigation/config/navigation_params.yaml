@@ -9,8 +9,8 @@ gps_waypoint_controller:
     align_threshold_deg: 18.0
     coarse_align_threshold_deg: 25.0
     approach_align_distance_m: 8.0
-    forward_speed: 0.4
-    turn_speed: 0.7
+    forward_speed: 0.08
+    turn_speed: 0.15
     drive_correction_gain: 0.01      # antes 0.0 -> clamp max(0.03, raw) lo forzaba a 0.03
     max_drive_angular: 0.15           # antes 0.14 -> clamp max(0.4, raw) lo forzaba a 0.4
     invert_angular: true
@@ -23,7 +23,7 @@ gps_waypoint_controller:
     gps_max_stale_s: 2.0
     path_topic: "earth_rover/planned_path"
     path_valid_topic: "earth_rover/planner_valid"
-    path_max_stale_s: 1.0
+    path_max_stale_s: 8.0
     lookahead_distance_m: 1.0
     path_following_enabled: true
     recovery_turn_speed: 0.3

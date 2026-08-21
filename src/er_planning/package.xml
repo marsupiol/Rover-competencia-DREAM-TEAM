@@ -13,6 +13,9 @@
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>cv_bridge</depend>
+  <depend>tf2_ros</depend>
+  <depend>geographic_msgs</depend>
+  <depend>robot_localization</depend>
 
   <test_depend>pytest</test_depend>
 

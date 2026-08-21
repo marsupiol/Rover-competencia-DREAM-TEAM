@@ -23,7 +23,7 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
+from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image, NavSatFix
@@ -70,6 +70,7 @@ class BEVPlannerNode(Node):
         self.declare_parameter("planned_path_topic", "earth_rover/planned_path")
         self.declare_parameter("visualization_topic", "earth_rover/planner_visualization")
         self.declare_parameter("valid_topic", "earth_rover/planner_valid")
+        self.declare_parameter("local_bev_grid_topic", "earth_rover/local_bev_grid")
         self.declare_parameter("publish_visualization", True)
 
         self.declare_parameter("planning_min_period_s", 0.1)
@@ -115,6 +116,7 @@ class BEVPlannerNode(Node):
         planned_path_topic = str(self.get_parameter("planned_path_topic").value)
         visualization_topic = str(self.get_parameter("visualization_topic").value)
         valid_topic = str(self.get_parameter("valid_topic").value)
+        local_bev_grid_topic = str(self.get_parameter("local_bev_grid_topic").value)
         self.publish_visualization = bool(self.get_parameter("publish_visualization").value)
 
         self.planning_min_period_s = float(self.get_parameter("planning_min_period_s").value)
@@ -229,6 +231,7 @@ class BEVPlannerNode(Node):
 
         self.path_pub = self.create_publisher(Path, planned_path_topic, reliable_qos)
         self.valid_pub = self.create_publisher(Bool, valid_topic, sensor_qos)
+        self.local_grid_pub = self.create_publisher(OccupancyGrid, local_bev_grid_topic, sensor_qos)
         self.vis_pub = (
             self.create_publisher(Image, visualization_topic, sensor_qos)
             if self.publish_visualization
@@ -387,6 +390,58 @@ class BEVPlannerNode(Node):
             bev_side_range_m=self.side_range,
             max_ray_distance_m=self.max_ray_distance,
         )
+
+        # 2b. Publicación de la grilla BEV local cruda en nav_msgs/OccupancyGrid (marco 'base_link')
+        #
+        # Convención geométrica y derivación de info.origin / info.width / info.height:
+        # - bev_flat tiene dimensiones (bev_h, bev_w) donde:
+        #     bev_h = ceil(forward_range_m / resolution_m_per_px) (filas, eje longitudinal +X)
+        #     bev_w = ceil(2 * side_range_m / resolution_m_per_px) (columnas, eje lateral +Y)
+        # - En ROS OccupancyGrid (REP-103 base_link: +X adelante, +Y izquierda):
+        #     info.width  = bev_h (longitud a lo largo de +X, número de celdas hacia adelante)
+        #     info.height = bev_w (longitud a lo largo de +Y, número de celdas de derecha a izquierda)
+        #     info.origin = pose de la celda (ix=0, iy=0) relativa a base_link:
+        #       - ix=0 corresponde al frente del rover: x_origin = 0.0 m
+        #       - iy=0 corresponde al extremo derecho: y_origin = -(bev_w // 2) * resolution_m_per_px
+        #
+        # Ejemplo numérico de verificación:
+        #   forward_range_m = 4.0m, side_range_m = 2.0m, resolution = 0.03 m/px
+        #   -> bev_h = 134 celdas, bev_w = 134 celdas, bev_w // 2 = 67 celdas
+        #   -> info.width = 134, info.height = 134
+        #   -> origin.position.x = 0.0 m
+        #   -> origin.position.y = -67 * 0.03 m = -2.01 m
+        #   Para celda (ix=0, iy=0): x = 0.0m (frente), y = -2.01m (extremo derecho).
+        #   Para celda (ix=133, iy=133): x = 133*0.03 = 3.99m (horizonte adelante),
+        #                                y = -2.01 + 133*0.03 = +1.98m (extremo izquierdo).
+        #
+        # Mapeo matricial a data (1D row-major de tamaño height * width = bev_w * bev_h):
+        #   bev_flat contiene transitabilidad en [0.0, 1.0] (1.0 libre, 0.0 obstáculo).
+        #   Costo ROS OccupancyGrid: 0=libre, 100=intransitable, -1=no observado (observed==0).
+        #   cost_bev[row, col]: row 0 = lejos adelante, row bev_h-1 = cerca del rover;
+        #                       col 0 = extremo izquierdo, col bev_w-1 = extremo derecho.
+        #   Al invertir filas (row) y columnas (col) y transponer:
+        #     grid_2d = cost_bev[::-1, ::-1].T  -> shape (bev_w, bev_h) = (height, width)
+        #     grid_2d[iy, ix] corresponde exactamente a data[iy * width + ix].
+        bev_h, bev_w = bev_flat.shape
+        cost_bev = np.where(
+            observed > 0,
+            np.clip(np.round((1.0 - bev_flat) * 100.0), 0, 100).astype(np.int8),
+            -1,
+        )
+        grid_2d = cost_bev[::-1, ::-1].T
+
+        local_grid_msg = OccupancyGrid()
+        local_grid_msg.header.stamp = self.get_clock().now().to_msg()
+        local_grid_msg.header.frame_id = "base_link"
+        local_grid_msg.info.resolution = float(self.bev_resolution)
+        local_grid_msg.info.width = int(bev_h)
+        local_grid_msg.info.height = int(bev_w)
+        local_grid_msg.info.origin.position.x = 0.0
+        local_grid_msg.info.origin.position.y = -float(bev_w // 2) * float(self.bev_resolution)
+        local_grid_msg.info.origin.position.z = 0.0
+        local_grid_msg.info.origin.orientation.w = 1.0
+        local_grid_msg.data = grid_2d.flatten().tolist()
+        self.local_grid_pub.publish(local_grid_msg)
 
         # 3. Cálculo de la meta relativa (x_right, y_forward)
         goal_x_m, goal_y_m = self._compute_relative_goal()

@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""
+Global Path Planner Node (D* Lite) for Earth Rover (IROS 2026 / FrodoBots).
+
+Implementa el algoritmo de búsqueda incremental D* Lite (Koenig & Likhachev, 2002/2005)
+sobre el mapa persistente global ('earth_rover/persistent_map'), reparando eficientemente
+el camino ante cambios dinámicos del entorno y movimiento del rover hacia el checkpoint objetivo.
+"""
+
+from __future__ import annotations
+
+import heapq
+import math
+import threading
+import time
+from typing import Any
+
+import numpy as np
+import rclpy
+from geographic_msgs.msg import GeoPoint
+from geometry_msgs.msg import Point, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Path
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from robot_localization.srv import FromLL
+from sensor_msgs.msg import NavSatFix
+from std_msgs.msg import Bool
+import tf2_ros
+
+
+class GlobalPlannerNode(Node):
+    def __init__(self):
+        super().__init__("global_planner_node")
+
+        # ----------------------------------------------------------------------
+        # 1. Declaración y Extracción de Parámetros
+        # ----------------------------------------------------------------------
+        self.declare_parameter("map_topic", "earth_rover/persistent_map")
+        self.declare_parameter("target_topic", "earth_rover/target_waypoint")
+        self.declare_parameter("global_path_topic", "earth_rover/global_path")
+        self.declare_parameter("global_planner_valid_topic", "earth_rover/global_planner_valid")
+        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("from_ll_service", "/fromLL")
+        self.declare_parameter("replan_min_period_s", 2.0)
+        self.declare_parameter("occupied_cost_threshold", 55.0)
+        self.declare_parameter("unknown_cell_cost", 20.0)
+        self.declare_parameter("connectivity", 8)
+        self.declare_parameter("tf_lookup_timeout_s", 0.2)
+
+        map_topic = str(self.get_parameter("map_topic").value)
+        target_topic = str(self.get_parameter("target_topic").value)
+        global_path_topic = str(self.get_parameter("global_path_topic").value)
+        global_planner_valid_topic = str(self.get_parameter("global_planner_valid_topic").value)
+        self.map_frame = str(self.get_parameter("map_frame").value)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+        from_ll_service = str(self.get_parameter("from_ll_service").value)
+
+        self.replan_min_period_s = float(self.get_parameter("replan_min_period_s").value)
+        self.occupied_cost_threshold = float(self.get_parameter("occupied_cost_threshold").value)
+        self.unknown_cell_cost = float(self.get_parameter("unknown_cell_cost").value)
+        self.connectivity = int(self.get_parameter("connectivity").value)
+        self.tf_lookup_timeout_s = float(self.get_parameter("tf_lookup_timeout_s").value)
+
+        # ----------------------------------------------------------------------
+        # 2. Clientes de Servicio, TF y Perfiles QoS
+        # ----------------------------------------------------------------------
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.from_ll_client = self.create_client(FromLL, from_ll_service)
+
+        reliable_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        sensor_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+
+        self.create_subscription(OccupancyGrid, map_topic, self._on_map, reliable_qos)
+        self.create_subscription(NavSatFix, target_topic, self._on_target, reliable_qos)
+
+        self.path_pub = self.create_publisher(Path, global_path_topic, reliable_qos)
+        self.valid_pub = self.create_publisher(Bool, global_planner_valid_topic, reliable_qos)
+
+        # ----------------------------------------------------------------------
+        # 3. Estado del Mapa Persistente y Metadatos Geométricos
+        # ----------------------------------------------------------------------
+        self._lock = threading.Lock()
+        self._map_data: np.ndarray | None = None
+        self._map_res: float = 0.20
+        self._map_w: int = 0
+        self._map_h: int = 0
+        self._map_orig_x: float = 0.0
+        self._map_orig_y: float = 0.0
+        self._cell_costs: np.ndarray | None = None  # Matriz 2D de costos discretos
+
+        # Meta geodésica y cartesiana en marco 'map'
+        self._current_target_lat: float | None = None
+        self._current_target_lon: float | None = None
+        self._goal_map_xy: tuple[float, float] | None = None
+        self._from_ll_pending: bool = False
+
+        # ----------------------------------------------------------------------
+        # 4. Estructuras de Datos de D* Lite (Koenig & Likhachev)
+        # ----------------------------------------------------------------------
+        # Estados: u = (row, col)
+        self._s_start: tuple[int, int] | None = None
+        self._s_goal: tuple[int, int] | None = None
+        self._s_last: tuple[int, int] | None = None
+        self._km: float = 0.0
+
+        # Costos g(u) y rhs(u) almacenados en diccionarios dispersos (default = inf)
+        self._g: dict[tuple[int, int], float] = {}
+        self._rhs: dict[tuple[int, int], float] = {}
+
+        # Cola de prioridad U con clave [k1, k2] y versioning para borrado O(1) perezoso
+        self._pq_heap: list[tuple[float, float, tuple[int, int], int]] = []
+        self._pq_dict: dict[tuple[int, int], tuple[float, float, int]] = {}
+        self._pq_entry_id: int = 0
+
+        # Control de Re-planificación periódica
+        self._last_plan_time: float = 0.0
+        self._replan_timer = self.create_timer(self.replan_min_period_s, self._replan_timer_cb)
+
+        self.get_logger().info(
+            f"GlobalPlannerNode (D* Lite) inicializado | map={map_topic} | "
+            f"target={target_topic} | path={global_path_topic} | replan_period={self.replan_min_period_s}s"
+        )
+
+    # --------------------------------------------------------------------------
+    # Callbacks de Sensores y Servicios
+    # --------------------------------------------------------------------------
+    def _on_target(self, msg: NavSatFix):
+        """
+        Gestiona la meta geodésica. Si cambia el waypoint, solicita la proyección
+        a coordenadas cartesianas 'map' vía el servicio /fromLL de robot_localization.
+        """
+        lat = float(msg.latitude)
+        lon = float(msg.longitude)
+
+        # Evitar peticiones duplicadas si la meta no ha cambiado
+        if (
+            self._current_target_lat is not None
+            and self._current_target_lon is not None
+            and math.isclose(lat, self._current_target_lat, abs_tol=1e-7)
+            and math.isclose(lon, self._current_target_lon, abs_tol=1e-7)
+        ):
+            return
+
+        self._current_target_lat = lat
+        self._current_target_lon = lon
+
+        if not self.from_ll_client.service_is_ready():
+            self.get_logger().warn(
+                f"Servicio {self.from_ll_client.srv_name} no disponible aún. Esperando...",
+                throttle_duration_sec=3.0,
+            )
+            return
+
+        req = FromLL.Request()
+        req.ll_point = GeoPoint(latitude=lat, longitude=lon, altitude=0.0)
+
+        self._from_ll_pending = True
+        future = self.from_ll_client.call_async(req)
+        future.add_done_callback(self._on_from_ll_response)
+
+    def _on_from_ll_response(self, future):
+        self._from_ll_pending = False
+        try:
+            res = future.result()
+            target_x = float(res.map_point.x)
+            target_y = float(res.map_point.y)
+            with self._lock:
+                self._goal_map_xy = (target_x, target_y)
+                self.get_logger().info(
+                    f"Nueva meta global recibida en coordenadas map: ({target_x:.2f}m, {target_y:.2f}m)"
+                )
+                # Reinicio completo de D* Lite al cambiar la meta
+                self._reset_dstar_lite()
+        except Exception as exc:
+            self.get_logger().error(f"Fallo en llamada al servicio /fromLL: {exc}")
+
+    def _on_map(self, msg: OccupancyGrid):
+        """
+        Recibe el mapa persistente acumulado. Detecta celdas cuyo costo cambió
+        (por nuevas observaciones o por decaimiento de confianza) y ejecuta
+        UpdateVertex sobre ellas para reparar incrementalmente el grafo.
+        """
+        w = int(msg.info.width)
+        h = int(msg.info.height)
+        res = float(msg.info.resolution)
+        orig_x = float(msg.info.origin.position.x)
+        orig_y = float(msg.info.origin.position.y)
+
+        raw_data = np.asarray(msg.data, dtype=np.int16).reshape((h, w))
+
+        # Asignación de costos de celda:
+        # - Ocupada (cost >= threshold): float('inf')
+        # - Desconocida (cost == -1): self.unknown_cell_cost
+        # - Libre (cost == 0): 1.0
+        new_costs = np.full((h, w), float("inf"), dtype=np.float32)
+        new_costs[raw_data == 0] = 1.0
+        new_costs[raw_data == -1] = float(self.unknown_cell_cost)
+        # Valores entre 0 y occupied_cost_threshold escalan linealmente
+        mid_mask = (raw_data > 0) & (raw_data < self.occupied_cost_threshold)
+        new_costs[mid_mask] = 1.0 + raw_data[mid_mask].astype(np.float32)
+
+        with self._lock:
+            old_costs = self._cell_costs
+            self._map_data = raw_data
+            self._map_w = w
+            self._map_h = h
+            self._map_res = res
+            self._map_orig_x = orig_x
+            self._map_orig_y = orig_y
+            self._cell_costs = new_costs
+
+            # Si D* Lite está activo y hubo un mapa previo, reparar los vértices modificados
+            if (
+                self._s_goal is not None
+                and old_costs is not None
+                and old_costs.shape == new_costs.shape
+            ):
+                diff_mask = old_costs != new_costs
+                diff_rows, diff_cols = np.where(diff_mask)
+                if diff_rows.size > 0:
+                    # Decisión de Diseño C4 (Documentada):
+                    # Cualquier celda cuyo costo cambie (ya sea por decaimiento de obstáculo a desconocido,
+                    # o por confirmación de terreno libre) genera una actualización de vértice en D* Lite.
+                    # Esto permite reparar de inmediato caminos antes bloqueados cuando los obstáculos transitorios
+                    # desaparecen por decaimiento temporal.
+                    for r, c in zip(diff_rows, diff_cols):
+                        u = (int(r), int(c))
+                        self._update_vertex(u)
+                        for s in self._get_neighbors(u):
+                            self._update_vertex(s)
+
+    # --------------------------------------------------------------------------
+    # Motor Algorítmico D* Lite (Koenig & Likhachev)
+    # --------------------------------------------------------------------------
+    def _reset_dstar_lite(self):
+        """Reinicializa el estado completo de D* Lite hacia la meta actual."""
+        if self._goal_map_xy is None or self._map_data is None:
+            return
+
+        gx, gy = self._goal_map_xy
+        c_goal = int(math.floor((gx - self._map_orig_x) / self._map_res))
+        r_goal = int(math.floor((gy - self._map_orig_y) / self._map_res))
+
+        if not (0 <= c_goal < self._map_w and 0 <= r_goal < self._map_h):
+            self.get_logger().error(
+                f"La meta ({gx:.1f}m, {gy:.1f}m) cae fuera de la grilla del mapa ({c_goal}, {r_goal})"
+            )
+            return
+
+        self._s_goal = (r_goal, c_goal)
+        self._km = 0.0
+        self._g.clear()
+        self._rhs.clear()
+        self._pq_heap.clear()
+        self._pq_dict.clear()
+        self._pq_entry_id = 0
+
+        # Inicialización fundamental: rhs(s_goal) = 0, resto = inf
+        self._set_rhs(self._s_goal, 0.0)
+
+        rover_cell = self._get_rover_cell()
+        if rover_cell is not None:
+            self._s_start = rover_cell
+            self._s_last = rover_cell
+            self._pq_insert(self._s_goal, self._calculate_key(self._s_goal))
+        else:
+            self._s_start = None
+            self._s_last = None
+
+    def _get_rover_cell(self) -> tuple[int, int] | None:
+        """Obtiene la posición actual del rover en coordenadas discretas de la grilla vía TF."""
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                Time(),
+                timeout=Duration(seconds=self.tf_lookup_timeout_s),
+            )
+            rx = float(tf_msg.transform.translation.x)
+            ry = float(tf_msg.transform.translation.y)
+            c_rover = int(math.floor((rx - self._map_orig_x) / self._map_res))
+            r_rover = int(math.floor((ry - self._map_orig_y) / self._map_res))
+            if 0 <= c_rover < self._map_w and 0 <= r_rover < self._map_h:
+                return (r_rover, c_rover)
+            return None
+        except Exception:
+            return None
+
+    def _get_g(self, u: tuple[int, int]) -> float:
+        return self._g.get(u, float("inf"))
+
+    def _set_g(self, u: tuple[int, int], val: float):
+        if math.isinf(val):
+            self._g.pop(u, None)
+        else:
+            self._g[u] = float(val)
+
+    def _get_rhs(self, u: tuple[int, int]) -> float:
+        return self._rhs.get(u, float("inf"))
+
+    def _set_rhs(self, u: tuple[int, int], val: float):
+        if math.isinf(val):
+            self._rhs.pop(u, None)
+        else:
+            self._rhs[u] = float(val)
+
+    def _heuristic(self, u: tuple[int, int], v: tuple[int, int]) -> float:
+        """Distancia euclídea admisible y consistente en el espacio de la grilla métrica."""
+        dr = (u[0] - v[0]) * self._map_res
+        dc = (u[1] - v[1]) * self._map_res
+        return math.hypot(dr, dc)
+
+    def _calculate_key(self, u: tuple[int, int]) -> tuple[float, float]:
+        """Calcula la clave de prioridad k(u) = [k1, k2]."""
+        g_val = self._get_g(u)
+        rhs_val = self._get_rhs(u)
+        min_val = min(g_val, rhs_val)
+        if self._s_start is not None:
+            h_val = self._heuristic(self._s_start, u)
+        else:
+            h_val = 0.0
+        k1 = min_val + h_val + self._km
+        k2 = min_val
+        return (k1, k2)
+
+    def _transition_cost(self, u: tuple[int, int], v: tuple[int, int]) -> float:
+        """
+        Costo de transición c(u, v) entre celdas vecinas adyacentes.
+        Diagonal = sqrt(2) * res, Ortogonal = res.
+        """
+        if self._cell_costs is None:
+            return float("inf")
+
+        cost_u = float(self._cell_costs[u[0], u[1]])
+        cost_v = float(self._cell_costs[v[0], v[1]])
+
+        if math.isinf(cost_u) or math.isinf(cost_v):
+            return float("inf")
+
+        dr = abs(u[0] - v[0])
+        dc = abs(u[1] - v[1])
+        base_dist = math.sqrt(2.0) * self._map_res if (dr == 1 and dc == 1) else self._map_res
+
+        # Costo ponderado promedio por transitabilidad de ambas celdas
+        return base_dist * ((cost_u + cost_v) * 0.5)
+
+    def _get_neighbors(self, u: tuple[int, int]) -> list[tuple[int, int]]:
+        """Retorna los vecinos válidos según la conectividad (4 u 8)."""
+        r, c = u
+        neighbors = []
+        if self.connectivity == 8:
+            offsets = [
+                (-1, 0), (1, 0), (0, -1), (0, 1),
+                (-1, -1), (-1, 1), (1, -1), (1, 1),
+            ]
+        else:
+            offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        for dr, dc in offsets:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < self._map_h and 0 <= nc < self._map_w:
+                neighbors.append((nr, nc))
+        return neighbors
+
+    # --------------------------------------------------------------------------
+    # Operaciones de Cola de Prioridad U (Min-Heap con Lazy Deletion)
+    # --------------------------------------------------------------------------
+    def _pq_insert(self, u: tuple[int, int], key: tuple[float, float]):
+        self._pq_entry_id += 1
+        self._pq_dict[u] = (key[0], key[1], self._pq_entry_id)
+        heapq.heappush(self._pq_heap, (key[0], key[1], u, self._pq_entry_id))
+
+    def _pq_remove(self, u: tuple[int, int]):
+        self._pq_dict.pop(u, None)
+
+    def _pq_contains(self, u: tuple[int, int]) -> bool:
+        return u in self._pq_dict
+
+    def _pq_top_key(self) -> tuple[float, float]:
+        while self._pq_heap:
+            k1, k2, u, entry_id = self._pq_heap[0]
+            val = self._pq_dict.get(u)
+            if val is not None and val[2] == entry_id:
+                return (k1, k2)
+            heapq.heappop(self._pq_heap)
+        return (float("inf"), float("inf"))
+
+    def _pq_pop(self) -> tuple[int, int] | None:
+        while self._pq_heap:
+            k1, k2, u, entry_id = heapq.heappop(self._pq_heap)
+            val = self._pq_dict.get(u)
+            if val is not None and val[2] == entry_id:
+                del self._pq_dict[u]
+                return u
+        return None
+
+    # --------------------------------------------------------------------------
+    # Reparación Incremental de Vértices y Búsqueda del Camino Más Corto
+    # --------------------------------------------------------------------------
+    def _update_vertex(self, u: tuple[int, int]):
+        if u != self._s_goal:
+            min_rhs = float("inf")
+            for sprime in self._get_neighbors(u):
+                c_val = self._transition_cost(u, sprime)
+                if not math.isinf(c_val):
+                    cost_candidate = c_val + self._get_g(sprime)
+                    if cost_candidate < min_rhs:
+                        min_rhs = cost_candidate
+            self._set_rhs(u, min_rhs)
+
+        if self._pq_contains(u):
+            self._pq_remove(u)
+
+        if not math.isclose(self._get_g(u), self._get_rhs(u), abs_tol=1e-5):
+            self._pq_insert(u, self._calculate_key(u))
+
+    def _compute_shortest_path(self, max_expansions: int = 40000) -> bool:
+        """
+        Bucle central de D* Lite. Expande vértices inconsistentes hasta satisfacer
+        la condición de optimalidad en s_start.
+        """
+        if self._s_start is None or self._s_goal is None:
+            return False
+
+        expansions = 0
+        while True:
+            top_k = self._pq_top_key()
+            start_k = self._calculate_key(self._s_start)
+            g_start = self._get_g(self._s_start)
+            rhs_start = self._get_rhs(self._s_start)
+
+            # Condición de parada de D* Lite: la cima de la cola es peor que la clave del inicio
+            # y el vértice de inicio es consistente
+            if not (top_k < start_k or not math.isclose(rhs_start, g_start, abs_tol=1e-5)):
+                break
+
+            expansions += 1
+            if expansions > max_expansions:
+                self.get_logger().warn(
+                    f"D* Lite alcanzó el límite de expansiones ({max_expansions}). Grafo complejo o no conexo."
+                )
+                return False
+
+            u = self._pq_pop()
+            if u is None:
+                break
+
+            k_old = top_k
+            k_new = self._calculate_key(u)
+
+            if k_old < k_new:
+                self._pq_insert(u, k_new)
+            elif self._get_g(u) > self._get_rhs(u):
+                self._set_g(u, self._get_rhs(u))
+                for s in self._get_neighbors(u):
+                    self._update_vertex(s)
+            else:
+                self._set_g(u, float("inf"))
+                self._update_vertex(u)
+                for s in self._get_neighbors(u):
+                    self._update_vertex(s)
+
+        return not math.isinf(self._get_g(self._s_start))
+
+    def _extract_path(self) -> list[tuple[float, float]] | None:
+        """
+        Extrae el camino óptimo descendiendo por el gradiente de g desde la pose
+        actual del rover (s_start) hasta la meta (s_goal).
+        """
+        if self._s_start is None or self._s_goal is None:
+            return None
+
+        if math.isinf(self._get_g(self._s_start)):
+            return None
+
+        path_cells = [self._s_start]
+        curr = self._s_start
+        visited = {curr}
+        max_steps = 10000
+
+        while curr != self._s_goal and len(path_cells) < max_steps:
+            best_next = None
+            min_cost = float("inf")
+
+            for sprime in self._get_neighbors(curr):
+                c_val = self._transition_cost(curr, sprime)
+                if not math.isinf(c_val):
+                    candidate_g = c_val + self._get_g(sprime)
+                    if candidate_g < min_cost:
+                        min_cost = candidate_g
+                        best_next = sprime
+
+            if best_next is None or math.isinf(min_cost) or best_next in visited:
+                break
+
+            curr = best_next
+            visited.add(curr)
+            path_cells.append(curr)
+
+        if curr != self._s_goal:
+            return None
+
+        # Conversión a coordenadas continuas métricas en el marco 'map'
+        path_xy = []
+        for r, c in path_cells:
+            mx = self._map_orig_x + (float(c) + 0.5) * self._map_res
+            my = self._map_orig_y + (float(r) + 0.5) * self._map_res
+            path_xy.append((mx, my))
+
+        return path_xy
+
+    # --------------------------------------------------------------------------
+    # Temporizador de Re-planificación Global
+    # --------------------------------------------------------------------------
+    def _replan_timer_cb(self):
+        with self._lock:
+            if self._map_data is None or self._goal_map_xy is None:
+                return
+
+            rover_cell = self._get_rover_cell()
+            if rover_cell is None:
+                self.get_logger().warn(
+                    "No se pudo determinar la pose actual del rover en frame 'map' vía TF.",
+                    throttle_duration_sec=3.0,
+                )
+                return
+
+            # Si el rover se movió desde la última iteración, actualizar km
+            if self._s_start is None:
+                self._s_start = rover_cell
+                self._s_last = rover_cell
+                if self._s_goal is not None and not self._pq_contains(self._s_goal):
+                    self._pq_insert(self._s_goal, self._calculate_key(self._s_goal))
+            elif rover_cell != self._s_start:
+                if self._s_last is not None:
+                    self._km += self._heuristic(self._s_last, rover_cell)
+                self._s_start = rover_cell
+                self._s_last = rover_cell
+
+            # Ejecutar búsqueda incremental D* Lite
+            success = self._compute_shortest_path()
+            path_points = self._extract_path() if success else None
+
+        # Publicación del resultado
+        now = self.get_clock().now()
+        is_valid = path_points is not None and len(path_points) > 0
+
+        valid_msg = Bool()
+        valid_msg.data = bool(is_valid)
+        self.valid_pub.publish(valid_msg)
+
+        path_msg = Path()
+        path_msg.header.stamp = now.to_msg()
+        path_msg.header.frame_id = self.map_frame
+
+        if is_valid and path_points is not None:
+            for mx, my in path_points:
+                pose_stamped = PoseStamped()
+                pose_stamped.header = path_msg.header
+                pose_stamped.pose.position.x = float(mx)
+                pose_stamped.pose.position.y = float(my)
+                pose_stamped.pose.position.z = 0.0
+                pose_stamped.pose.orientation.w = 1.0
+                path_msg.poses.append(pose_stamped)
+
+        self.path_pub.publish(path_msg)
+        self.get_logger().debug(
+            f"D* Lite Plan: valid={is_valid} points={len(path_msg.poses)} km={self._km:.2f}"
+        )
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = GlobalPlannerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
