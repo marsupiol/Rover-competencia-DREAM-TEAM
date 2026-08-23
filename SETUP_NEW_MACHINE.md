@@ -43,9 +43,12 @@ docker run --rm --gpus all osrf/ros:jazzy-ros-base nvidia-smi
 
 ---
 
-## 4. Construcción y Ejecución con Docker Compose
+## 4. Construcción y Ejecución con Docker Compose (GPU Target)
 
-> [!TIP]
+> [!IMPORTANT]
+> **Uso obligatorio de `-f docker-compose.gpu.yml`:**  
+> En todos los comandos de Docker Compose debes incluir explícitamente `-f docker-compose.gpu.yml`. Sin este flag, Docker Compose tomará `docker-compose.yml` por defecto (que es la variante CPU sin asignación de dispositivos GPU), perdiendo la aceleración de hardware NVIDIA en el modelo SAM-TP.
+>
 > Los archivos [`requirements-ai.txt`](requirements-ai.txt), [`requirements-ros.txt`](requirements-ros.txt) y [`apt-packages.txt`](apt-packages.txt) documentan las dependencias exactas que el Dockerfile resuelve e instala de forma automática. Al utilizar Docker, **NO** es necesario instalar nada a mano en tu máquina host.
 
 ### 4.1. Configuración de Credenciales
@@ -55,17 +58,20 @@ cp src/sdk_server/.env.sample src/sdk_server/.env
 # Editar src/sdk_server/.env con las credenciales reales de FrodoBots si aplica
 ```
 
-### 4.2. Construir la Imagen
+### 4.2. Construir la Imagen con Soporte GPU
 ```bash
-docker compose build
+docker compose -f docker-compose.gpu.yml build
 ```
 
-### 4.3. Iniciar el Stack
+### 4.3. Iniciar el Stack con Aceleración GPU
 ```bash
-docker compose up -d
+docker compose -f docker-compose.gpu.yml up -d
 ```
 
-*(Para ver los logs en tiempo real: `docker compose logs -f`)*
+### 4.4. Monitoreo de Logs en Tiempo Real
+```bash
+docker compose -f docker-compose.gpu.yml logs -f
+```
 
 ---
 

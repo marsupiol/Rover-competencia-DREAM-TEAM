@@ -1,15 +1,18 @@
 # ==============================================================================
-# Earth Rover Mini+ — AI & Deep Learning Stack Requirements
+# Earth Rover Mini+ — AI & Deep Learning Stack Requirements (GPU Target)
 # ==============================================================================
-# Environment Information:
-# - GPU / Driver: nvidia-smi: command not found (CPU container / host passthrough target)
+# CUDA / PyTorch Target:
+# - No se encontró una versión de CUDA objetivo hardcodeada en el repo.
+# - Para entornos NVIDIA (WSL2 / Linux), instalar la build CUDA oficial de PyTorch:
+#     pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu124
+#   (o cu121 según el driver instalado en el host).
 # - Python Version: Python 3.12.3
 # - Base OS: Ubuntu 24.04.4 LTS (Noble Numbat)
 # ==============================================================================
 
-# Core Deep Learning Framework
-torch==2.13.0+cpu
-torchvision==0.28.0+cpu
+# Core Deep Learning Framework (GPU / CUDA)
+torch==2.13.0
+torchvision==0.28.0
 
 # SAM-TP & GeNIE Path Planner (Vendored submodules)
 -e src/third_party/sana-earth-rover-policy/genie
@@ -34,3 +37,8 @@ huggingface_hub==1.28.0
 iopath==0.1.10
 portalocker==4.1.0
 tqdm==4.70.0
+
+# ------------------------------------------------------------------------------
+# Nota para instalación alternativa en CPU (sin GPU NVIDIA):
+# pip install torch==2.13.0+cpu torchvision==0.28.0+cpu --index-url https://download.pytorch.org/whl/cpu
+# ------------------------------------------------------------------------------

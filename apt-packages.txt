@@ -4,6 +4,12 @@
 # Base Image: osrf/ros:jazzy-ros-base
 # Base OS: Ubuntu 24.04.4 LTS (Noble Numbat)
 # 
+# Nota sobre resolución de dependencias:
+# El Dockerfile oficial utiliza `rosdep install --from-paths src --ignore-src -r -y`
+# para resolver dinámicamente las dependencias de los paquetes ROS 2 en src/.
+# Este archivo consolida tanto las herramientas base del sistema como los paquetes
+# del ecosistema ROS 2 Jazzy requeridos para ejecución nativa/standalone.
+# 
 # Usage:
 #   sudo apt-get update && grep -v '^#' apt-packages.txt | grep -v '^$' | xargs sudo apt-get install -y --no-install-recommends
 # ==============================================================================
@@ -18,3 +24,9 @@ libopencv-dev
 python3-opencv
 ros-jazzy-robot-localization
 ros-jazzy-cv-bridge
+ros-jazzy-tf2-ros
+ros-jazzy-geographic-msgs
+ros-jazzy-nav-msgs
+ros-jazzy-sensor-msgs
+ros-jazzy-geometry-msgs
+ros-jazzy-std-msgs

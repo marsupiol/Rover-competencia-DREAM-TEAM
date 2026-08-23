@@ -28,6 +28,9 @@ websockets==15.0.1
 aiohttp==3.9.3
 httpx==0.28.1
 
-# Auxiliary SDK Server Capabilities (TTS & Generative SDK interfaces)
+# Voice Synthesis & AI Interfaces (src/sdk_server/tts_service.py)
+# Utilizados activamente para síntesis de voz del rover (/tts endpoint):
+# - edge-tts: síntesis de voz gratuita con voces neuronales de Edge.
+# - google-genai: síntesis de voz multimodal con Gemini (gemini-2.5-flash-preview-tts).
 edge-tts==7.2.8
 google-genai==1.46.0
