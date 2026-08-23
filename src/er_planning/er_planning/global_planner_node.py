@@ -13,12 +13,12 @@ import heapq
 import math
 import threading
 import time
-from typing import Any
 
 import numpy as np
 import rclpy
+import scipy.ndimage
 from geographic_msgs.msg import GeoPoint
-from geometry_msgs.msg import Point, PoseStamped
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -45,8 +45,14 @@ class GlobalPlannerNode(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("from_ll_service", "/fromLL")
         self.declare_parameter("replan_min_period_s", 2.0)
-        self.declare_parameter("occupied_cost_threshold", 55.0)
-        self.declare_parameter("unknown_cell_cost", 20.0)
+        self.declare_parameter("occupied_ref_value", 78)
+        self.declare_parameter("free_ref_value", 40)
+        self.declare_parameter("unknown_cell_cost", 2.5)
+        self.declare_parameter("max_finite_cost", 15.0)
+        self.declare_parameter("cost_change_epsilon", 0.75)
+        self.declare_parameter("max_vertex_updates_per_cycle", 20000)
+        self.declare_parameter("footprint_inflation_radius_m", 0.15)
+        self.declare_parameter("goal_search_radius_m", 13.0)
         self.declare_parameter("connectivity", 8)
         self.declare_parameter("tf_lookup_timeout_s", 0.2)
 
@@ -59,8 +65,14 @@ class GlobalPlannerNode(Node):
         from_ll_service = str(self.get_parameter("from_ll_service").value)
 
         self.replan_min_period_s = float(self.get_parameter("replan_min_period_s").value)
-        self.occupied_cost_threshold = float(self.get_parameter("occupied_cost_threshold").value)
+        self.occupied_ref_value = int(self.get_parameter("occupied_ref_value").value)
+        self.free_ref_value = int(self.get_parameter("free_ref_value").value)
         self.unknown_cell_cost = float(self.get_parameter("unknown_cell_cost").value)
+        self.max_finite_cost = float(self.get_parameter("max_finite_cost").value)
+        self.cost_change_epsilon = float(self.get_parameter("cost_change_epsilon").value)
+        self.max_vertex_updates_per_cycle = int(self.get_parameter("max_vertex_updates_per_cycle").value)
+        self.footprint_inflation_radius_m = float(self.get_parameter("footprint_inflation_radius_m").value)
+        self.goal_search_radius_m = float(self.get_parameter("goal_search_radius_m").value)
         self.connectivity = int(self.get_parameter("connectivity").value)
         self.tf_lookup_timeout_s = float(self.get_parameter("tf_lookup_timeout_s").value)
 
@@ -76,11 +88,6 @@ class GlobalPlannerNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
-        )
-        sensor_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
         )
 
         self.create_subscription(OccupancyGrid, map_topic, self._on_map, reliable_qos)
@@ -125,9 +132,10 @@ class GlobalPlannerNode(Node):
         self._pq_dict: dict[tuple[int, int], tuple[float, float, int]] = {}
         self._pq_entry_id: int = 0
 
-        # Control de Re-planificación periódica
+        # Control de Re-planificación periódica (Heartbeat a 0.5s para movimiento del rover)
         self._last_plan_time: float = 0.0
-        self._replan_timer = self.create_timer(self.replan_min_period_s, self._replan_timer_cb)
+        heartbeat_period_s = min(0.5, self.replan_min_period_s)
+        self._replan_timer = self.create_timer(heartbeat_period_s, self._replan_timer_cb)
 
         self.get_logger().info(
             f"GlobalPlannerNode (D* Lite) inicializado | map={map_topic} | "
@@ -192,7 +200,15 @@ class GlobalPlannerNode(Node):
         Recibe el mapa persistente acumulado. Detecta celdas cuyo costo cambió
         (por nuevas observaciones o por decaimiento de confianza) y ejecuta
         UpdateVertex sobre ellas para reparar incrementalmente el grafo.
+
+        Mapeo de costos graduado (Fase 2):
+          - Desconocido (-1): cost = unknown_cell_cost (2.5)
+          - Confirmado libre (<= free_ref_value = 40): cost = 1.0
+          - Evidencia parcial (40 < raw < 78): interpolación lineal de 1.0 a max_finite_cost (15.0)
+          - Confirmado ocupado (>= occupied_ref_value = 78): cost = inf
+          - Inflación de huella (footprint): dilata celdas inf por radio footprint_inflation_radius_m (0.15m).
         """
+        t_map_start = time.perf_counter()
         w = int(msg.info.width)
         h = int(msg.info.height)
         res = float(msg.info.resolution)
@@ -201,17 +217,37 @@ class GlobalPlannerNode(Node):
 
         raw_data = np.asarray(msg.data, dtype=np.int16).reshape((h, w))
 
-        # Asignación de costos de celda:
-        # - Ocupada (cost >= threshold): float('inf')
-        # - Desconocida (cost == -1): self.unknown_cell_cost
-        # - Libre (cost == 0): 1.0
+        # 1. Asignación de costos referenciada a la escala graduada (C2)
         new_costs = np.full((h, w), float("inf"), dtype=np.float32)
-        new_costs[raw_data == 0] = 1.0
-        new_costs[raw_data == -1] = float(self.unknown_cell_cost)
-        # Valores entre 0 y occupied_cost_threshold escalan linealmente
-        mid_mask = (raw_data > 0) & (raw_data < self.occupied_cost_threshold)
-        new_costs[mid_mask] = 1.0 + raw_data[mid_mask].astype(np.float32)
+        known = raw_data != -1
+        occupied = known & (raw_data >= self.occupied_ref_value)
+        free_ish = known & ~occupied
 
+        new_costs[~known] = float(self.unknown_cell_cost)
+
+        span = max(1.0, float(self.occupied_ref_value - self.free_ref_value))
+        norm = np.clip(
+            (raw_data[free_ish].astype(np.float32) - self.free_ref_value) / span,
+            0.0,
+            1.0,
+        )
+        new_costs[free_ish] = 1.0 + norm * (self.max_finite_cost - 1.0)
+        # 'occupied' queda en float("inf") por inicialización
+
+        # 2. Inflación por footprint del rover (Fase 2.C)
+        # Radio de inflación del Mini+ (ancho 250mm -> semiancho 0.125m ~ 0.15m con margen)
+        inflation_cells = max(1, int(math.ceil(self.footprint_inflation_radius_m / res)))
+        occupied_binary = np.isinf(new_costs)
+        if np.any(occupied_binary):
+            y_grid, x_grid = np.ogrid[
+                -inflation_cells : inflation_cells + 1,
+                -inflation_cells : inflation_cells + 1,
+            ]
+            structure = (x_grid * x_grid + y_grid * y_grid) <= (inflation_cells * inflation_cells)
+            inflated_binary = scipy.ndimage.binary_dilation(occupied_binary, structure=structure)
+            new_costs[inflated_binary] = float("inf")
+
+        num_diff = 0
         with self._lock:
             old_costs = self._cell_costs
             self._map_data = raw_data
@@ -223,31 +259,55 @@ class GlobalPlannerNode(Node):
             self._cell_costs = new_costs
 
             # Si D* Lite está activo y hubo un mapa previo, reparar los vértices modificados
+            # NOTA CRÍTICA: El diff se compara DESPUÉS de la inflación (Fase 2.C).
             if (
                 self._s_goal is not None
                 and old_costs is not None
                 and old_costs.shape == new_costs.shape
             ):
-                diff_mask = old_costs != new_costs
+                inf_changed = np.isinf(old_costs) != np.isinf(new_costs)
+                finite_changed = (
+                    ~np.isinf(old_costs)
+                    & ~np.isinf(new_costs)
+                    & (np.abs(old_costs - new_costs) > self.cost_change_epsilon)
+                )
+                diff_mask = inf_changed | finite_changed
                 diff_rows, diff_cols = np.where(diff_mask)
-                if diff_rows.size > 0:
-                    # Decisión de Diseño C4 (Documentada):
-                    # Cualquier celda cuyo costo cambie (ya sea por decaimiento de obstáculo a desconocido,
-                    # o por confirmación de terreno libre) genera una actualización de vértice en D* Lite.
-                    # Esto permite reparar de inmediato caminos antes bloqueados cuando los obstáculos transitorios
-                    # desaparecen por decaimiento temporal.
+                num_diff = int(diff_rows.size)
+
+                if num_diff > 0:
+                    if num_diff > self.max_vertex_updates_per_cycle:
+                        self.get_logger().warn(
+                            f"Diff de mapa superó límite ({num_diff} > {self.max_vertex_updates_per_cycle}). "
+                            "Truncando actualizaciones; grafo temporalmente sub-reparado (degradación controlada).",
+                            throttle_duration_sec=5.0,
+                        )
+                        diff_rows = diff_rows[: self.max_vertex_updates_per_cycle]
+                        diff_cols = diff_cols[: self.max_vertex_updates_per_cycle]
+
                     for r, c in zip(diff_rows, diff_cols):
                         u = (int(r), int(c))
                         self._update_vertex(u)
                         for s in self._get_neighbors(u):
                             self._update_vertex(s)
 
+        elapsed_map_ms = (time.perf_counter() - t_map_start) * 1000.0
+        self.get_logger().debug(
+            f"_on_map procesado en {elapsed_map_ms:.1f}ms | celdas modificadas: {num_diff}",
+            throttle_duration_sec=2.0,
+        )
+
+        # 3. Throttle real de replanificación (2.H)
+        now_mono = time.monotonic()
+        if (now_mono - self._last_plan_time) >= self.replan_min_period_s:
+            self._plan_and_publish()
+
     # --------------------------------------------------------------------------
     # Motor Algorítmico D* Lite (Koenig & Likhachev)
     # --------------------------------------------------------------------------
     def _reset_dstar_lite(self):
         """Reinicializa el estado completo de D* Lite hacia la meta actual."""
-        if self._goal_map_xy is None or self._map_data is None:
+        if self._goal_map_xy is None or self._map_data is None or self._cell_costs is None:
             return
 
         gx, gy = self._goal_map_xy
@@ -259,6 +319,36 @@ class GlobalPlannerNode(Node):
                 f"La meta ({gx:.1f}m, {gy:.1f}m) cae fuera de la grilla del mapa ({c_goal}, {r_goal})"
             )
             return
+
+        # 2.E Meta bloqueada: buscar celda libre más cercana dentro de goal_search_radius_m
+        if math.isinf(float(self._cell_costs[r_goal, c_goal])):
+            r_search = int(math.ceil(self.goal_search_radius_m / self._map_res))
+            r_min = max(0, r_goal - r_search)
+            r_max = min(self._map_h, r_goal + r_search + 1)
+            c_min = max(0, c_goal - r_search)
+            c_max = min(self._map_w, c_goal + r_search + 1)
+
+            sub_costs = self._cell_costs[r_min:r_max, c_min:c_max]
+            sub_r, sub_c = np.ogrid[r_min:r_max, c_min:c_max]
+            dist_sq = ((sub_r - r_goal) ** 2 + (sub_c - c_goal) ** 2) * (self._map_res ** 2)
+            valid_mask = (~np.isinf(sub_costs)) & (dist_sq <= self.goal_search_radius_m ** 2)
+
+            if np.any(valid_mask):
+                dist_masked = np.where(valid_mask, dist_sq, float("inf"))
+                min_idx = np.argmin(dist_masked)
+                local_r, local_c = np.unravel_index(min_idx, sub_costs.shape)
+                best_r = r_min + int(local_r)
+                best_c = c_min + int(local_c)
+                shift_dist = math.sqrt(float(dist_sq[local_r, local_c]))
+                self.get_logger().info(
+                    f"Meta original bloqueada, usando celda libre más cercana a {shift_dist:.1f}m"
+                )
+                r_goal, c_goal = best_r, best_c
+            else:
+                self.get_logger().warn("Meta inalcanzable: sin celda libre cerca de la meta")
+                self._s_goal = None
+                self._publish_path_msg(None, is_valid=False)
+                return
 
         self._s_goal = (r_goal, c_goal)
         self._km = 0.0
@@ -511,6 +601,11 @@ class GlobalPlannerNode(Node):
             path_cells.append(curr)
 
         if curr != self._s_goal:
+            # Fase 2.G: Distinguir fallo de extracción interno de ausencia de camino
+            if not math.isinf(self._get_g(self._s_start)):
+                self.get_logger().error(
+                    "g(s_start) finito pero extracción de camino falló — posible inconsistencia del grafo"
+                )
             return None
 
         # Conversión a coordenadas continuas métricas en el marco 'map'
@@ -523,11 +618,27 @@ class GlobalPlannerNode(Node):
         return path_xy
 
     # --------------------------------------------------------------------------
-    # Temporizador de Re-planificación Global
+    # Ejecución y Publicación del Plan Global
     # --------------------------------------------------------------------------
-    def _replan_timer_cb(self):
+    def _plan_and_publish(self):
+        """
+        Ejecuta la búsqueda D* Lite y publica el camino global si transcurrió el período mínimo.
+
+        Comportamiento del Throttle (Fase 2.H):
+        - El timer de heartbeat corre cada 0.5s como mecanismo de sondeo periódico, pero sólo ejecuta
+          la búsqueda D* Lite si transcurrieron al menos `replan_min_period_s` (ej. 2.0s) desde el último plan.
+          En estado estacionario (mapa estable, rover quieto), si el último plan ocurrió en t=0.0s, los ticks
+          de t=0.5s, 1.0s y 1.5s retornan sin computar, y el plan se ejecuta en t=2.0s (tasa máxima: 0.5 Hz).
+        - Disparo reactivo por mapa: si el último plan fue en t=0.0s y a t=2.1s (una vez cumplidos los 2.0s mínimos)
+          llega una actualización relevante en `_on_map`, se dispara el replan de forma inmediata en t=2.1s sin
+          tener que esperar al siguiente tick del heartbeat en t=2.5s (ahorro de hasta 0.5s en tiempo de reacción).
+        """
+        now_mono = time.monotonic()
+        if (now_mono - self._last_plan_time) < self.replan_min_period_s:
+            return
+
         with self._lock:
-            if self._map_data is None or self._goal_map_xy is None:
+            if self._map_data is None or self._goal_map_xy is None or self._s_goal is None:
                 return
 
             rover_cell = self._get_rover_cell()
@@ -536,6 +647,15 @@ class GlobalPlannerNode(Node):
                     "No se pudo determinar la pose actual del rover en frame 'map' vía TF.",
                     throttle_duration_sec=3.0,
                 )
+                return
+
+            # Fase 2.F Rover bloqueado:
+            if self._cell_costs is not None and math.isinf(float(self._cell_costs[rover_cell[0], rover_cell[1]])):
+                self.get_logger().warn(
+                    "Rover sobre celda ocupada/inflada — posible error de localización",
+                    throttle_duration_sec=2.0,
+                )
+                self._publish_path_msg(None, is_valid=False)
                 return
 
             # Si el rover se movió desde la última iteración, actualizar km
@@ -553,10 +673,13 @@ class GlobalPlannerNode(Node):
             # Ejecutar búsqueda incremental D* Lite
             success = self._compute_shortest_path()
             path_points = self._extract_path() if success else None
+            self._last_plan_time = time.monotonic()
 
-        # Publicación del resultado
-        now = self.get_clock().now()
         is_valid = path_points is not None and len(path_points) > 0
+        self._publish_path_msg(path_points, is_valid=is_valid)
+
+    def _publish_path_msg(self, path_points: list[tuple[float, float]] | None, is_valid: bool):
+        now = self.get_clock().now()
 
         valid_msg = Bool()
         valid_msg.data = bool(is_valid)
@@ -580,6 +703,9 @@ class GlobalPlannerNode(Node):
         self.get_logger().debug(
             f"D* Lite Plan: valid={is_valid} points={len(path_msg.poses)} km={self._km:.2f}"
         )
+
+    def _replan_timer_cb(self):
+        self._plan_and_publish()
 
 
 def main(args=None):

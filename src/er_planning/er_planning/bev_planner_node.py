@@ -24,10 +24,13 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Path
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Bool, Float32
+import tf2_ros
 
 
 def genie_xy_to_ros_base_link(x_right_m: float, y_forward_m: float) -> tuple[float, float]:
@@ -72,6 +75,16 @@ class BEVPlannerNode(Node):
         self.declare_parameter("valid_topic", "earth_rover/planner_valid")
         self.declare_parameter("local_bev_grid_topic", "earth_rover/local_bev_grid")
         self.declare_parameter("publish_visualization", True)
+
+        # Integración con Planificador Global (Fase 4)
+        self.declare_parameter("global_path_topic", "earth_rover/global_path")
+        self.declare_parameter("global_planner_valid_topic", "earth_rover/global_planner_valid")
+        self.declare_parameter("use_global_path_guidance", True)
+        self.declare_parameter("global_path_max_stale_s", 3.0)
+        self.declare_parameter("global_lookahead_distance_m", 3.5)
+        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("base_frame", "base_link")
+        self.declare_parameter("tf_lookup_timeout_s", 0.2)
 
         self.declare_parameter("planning_min_period_s", 0.1)
         self.declare_parameter("checkpoint_path", "")
@@ -118,6 +131,15 @@ class BEVPlannerNode(Node):
         valid_topic = str(self.get_parameter("valid_topic").value)
         local_bev_grid_topic = str(self.get_parameter("local_bev_grid_topic").value)
         self.publish_visualization = bool(self.get_parameter("publish_visualization").value)
+
+        global_path_topic = str(self.get_parameter("global_path_topic").value)
+        global_planner_valid_topic = str(self.get_parameter("global_planner_valid_topic").value)
+        self.use_global_path_guidance = bool(self.get_parameter("use_global_path_guidance").value)
+        self.global_path_max_stale_s = float(self.get_parameter("global_path_max_stale_s").value)
+        self.global_lookahead_distance_m = float(self.get_parameter("global_lookahead_distance_m").value)
+        self.map_frame = str(self.get_parameter("map_frame").value)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+        self.tf_lookup_timeout_s = float(self.get_parameter("tf_lookup_timeout_s").value)
 
         self.planning_min_period_s = float(self.get_parameter("planning_min_period_s").value)
         checkpoint_path = str(self.get_parameter("checkpoint_path").value) or None
@@ -224,10 +246,17 @@ class BEVPlannerNode(Node):
         )
 
         self.bridge = CvBridge()
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
         self.create_subscription(Image, image_topic, self._on_image, sensor_qos)
         self.create_subscription(NavSatFix, gps_topic, self._on_gps, sensor_qos)
         self.create_subscription(Float32, heading_topic, self._on_heading, sensor_qos)
         self.create_subscription(NavSatFix, target_topic, self._on_target, reliable_qos)
+
+        # Suscripción al camino global D* Lite (marco 'map')
+        self.create_subscription(Path, global_path_topic, self._on_global_path, sensor_qos)
+        self.create_subscription(Bool, global_planner_valid_topic, self._on_global_valid, sensor_qos)
 
         self.path_pub = self.create_publisher(Path, planned_path_topic, reliable_qos)
         self.valid_pub = self.create_publisher(Bool, valid_topic, sensor_qos)
@@ -247,6 +276,12 @@ class BEVPlannerNode(Node):
         self._target_lat: float | None = None
         self._target_lon: float | None = None
 
+        # Estado del Plan Global (D* Lite)
+        self._global_lock = threading.Lock()
+        self._global_path_poses: list[tuple[float, float]] = []
+        self._global_path_valid: bool = False
+        self._global_path_last_update: Time | None = None
+
         self._frame_lock = threading.Lock()
         self._latest_rgb: np.ndarray | None = None
         self._stop_event = threading.Event()
@@ -258,7 +293,7 @@ class BEVPlannerNode(Node):
         )
 
     # --------------------------------------------------------------------------
-    # Callbacks de Sensores
+    # Callbacks de Sensores y Guía Global
     # --------------------------------------------------------------------------
     def _on_image(self, msg: Image):
         try:
@@ -281,6 +316,26 @@ class BEVPlannerNode(Node):
     def _on_target(self, msg: NavSatFix):
         self._target_lat = float(msg.latitude)
         self._target_lon = float(msg.longitude)
+
+    def _on_global_path(self, msg: Path):
+        poses = []
+        for p in msg.poses:
+            poses.append((float(p.pose.position.x), float(p.pose.position.y)))
+        with self._global_lock:
+            self._global_path_poses = poses
+            self._global_path_last_update = self.get_clock().now()
+
+    def _on_global_valid(self, msg: Bool):
+        with self._global_lock:
+            self._global_path_valid = bool(msg.data)
+            self._global_path_last_update = self.get_clock().now()
+
+    def _global_path_is_fresh(self) -> bool:
+        with self._global_lock:
+            if not self.use_global_path_guidance or self._global_path_last_update is None:
+                return False
+            age_s = (self.get_clock().now() - self._global_path_last_update).nanoseconds / 1e9
+            return age_s <= self.global_path_max_stale_s
 
     # --------------------------------------------------------------------------
     # Motor Matemático Geodésico (Idéntico a gps_waypoint_controller)
@@ -374,6 +429,117 @@ class BEVPlannerNode(Node):
         goal_y_m = dist * math.cos(theta)
         return float(goal_x_m), float(goal_y_m)
 
+    def _compute_global_subgoal_base_link(self) -> tuple[float, float] | None:
+        """
+        Calcula la sub-meta proyectada desde el path global en coordenadas relativas de GeNIE (x_right, y_forward) en metros.
+
+        Transformación geométrica y convención de signos:
+        1. Lookup TF map -> base_link: pose actual del robot (tx, ty) con yaw theta (ENU).
+        2. Búsqueda del punto del path más cercano a (tx, ty).
+        3. Acumulación de distancia métrica hacia adelante a lo largo del path hasta global_lookahead_distance_m.
+        4. Transformación inversa map -> base_link (REP-103: +X adelante, +Y izquierda):
+             dx = p_x - tx
+             dy = p_y - ty
+             x_base_link (adelante)   =  dx * cos(theta) + dy * sin(theta)
+             y_base_link (izquierda)  = -dx * sin(theta) + dy * cos(theta)
+        5. Conversión a marco GeNIE (+X derecha, +Y adelante):
+             goal_x_genie = -y_base_link =  dx * sin(theta) - dy * cos(theta)
+             goal_y_genie =  x_base_link =  dx * cos(theta) + dy * sin(theta)
+
+        Ejemplo numérico de verificación con theta = 45 deg (cos=sin=sqrt(2)/2 ≈ 0.7071):
+          Robot en (tx=0, ty=0) orientado a 45 deg en map.
+          - Punto 2.0m adelante (en map a 45 deg: dx=+1.4142, dy=+1.4142):
+              x_base_link = 1.4142*0.7071 + 1.4142*0.7071 = +2.0m
+              y_base_link = -1.4142*0.7071 + 1.4142*0.7071 = 0.0m
+              -> goal_x_genie = 0.0m, goal_y_genie = +2.0m (adelante)
+          - Punto 2.0m a la izquierda (en map a 135 deg: dx=-1.4142, dy=+1.4142):
+              x_base_link = -1.4142*0.7071 + 1.4142*0.7071 = 0.0m
+              y_base_link = -(-1.4142)*0.7071 + 1.4142*0.7071 = +2.0m
+              -> goal_x_genie = -2.0m (izquierda), goal_y_genie = 0.0m
+        """
+        with self._global_lock:
+            poses = list(self._global_path_poses)
+
+        if len(poses) < 2:
+            return None
+
+        try:
+            # Nota de threading: tf2_ros.Buffer es thread-safe y soporta lookup_transform concurrente desde este hilo
+            tf_msg = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                Time(),
+                timeout=Duration(seconds=self.tf_lookup_timeout_s),
+            )
+        except Exception as exc:
+            self.get_logger().warn(
+                f"No se pudo obtener TF {self.map_frame} -> {self.base_frame} para sub-meta global: {exc}",
+                throttle_duration_sec=3.0,
+            )
+            return None
+
+        tx = float(tf_msg.transform.translation.x)
+        ty = float(tf_msg.transform.translation.y)
+        qx = float(tf_msg.transform.rotation.x)
+        qy = float(tf_msg.transform.rotation.y)
+        qz = float(tf_msg.transform.rotation.z)
+        qw = float(tf_msg.transform.rotation.w)
+
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+
+        # 1. Encontrar el punto más cercano en el path global
+        dists_sq = [(px - tx) ** 2 + (py - ty) ** 2 for px, py in poses]
+        closest_idx = int(np.argmin(dists_sq))
+
+        # 2. Acumular distancia métrica hacia adelante a lo largo del path
+        accum_dist = 0.0
+        target_px, target_py = poses[-1]
+        prev_x, prev_y = poses[closest_idx]
+
+        for i in range(closest_idx, len(poses)):
+            px, py = poses[i]
+            accum_dist += math.hypot(px - prev_x, py - prev_y)
+            prev_x, prev_y = px, py
+            if accum_dist >= self.global_lookahead_distance_m:
+                target_px, target_py = px, py
+                break
+
+        # 3. Transformación inversa map -> base_link
+        dx = target_px - tx
+        dy = target_py - ty
+
+        x_base_link = dx * cos_yaw + dy * sin_yaw
+        y_base_link = -dx * sin_yaw + dy * cos_yaw
+
+        # 4. Mapeo a convención GeNIE (+X derecha, +Y adelante)
+        goal_x_genie = -y_base_link
+        goal_y_genie = x_base_link
+
+        # 5. Monitoreo de coherencia entre fuentes de localización (Fase 4.B)
+        if (
+            self._current_lat is not None
+            and self._current_lon is not None
+            and self._current_heading is not None
+            and self._target_lat is not None
+            and self._target_lon is not None
+        ):
+            bearing_gps = self.calculate_bearing(
+                self._current_lat, self._current_lon, self._target_lat, self._target_lon
+            )
+            err_gps = self.angle_error_deg(bearing_gps, self._current_heading)
+            angle_subgoal = math.degrees(math.atan2(goal_x_genie, goal_y_genie))
+            diff_sources = abs(self.angle_error_deg(err_gps, angle_subgoal))
+            self.get_logger().debug(
+                f"Comparación de rumbo a meta: GPS crudo={err_gps:+.1f}° vs Sub-meta Global={angle_subgoal:+.1f}° | Diff={diff_sources:.1f}°",
+                throttle_duration_sec=3.0,
+            )
+
+        return float(goal_x_genie), float(goal_y_genie)
+
     def _run_planning(self, rgb: np.ndarray):
         # 1. Inferencia neuronal de transitabilidad sobre la imagen frontal
         predict_res = self._predictor.predict(rgb)
@@ -444,7 +610,19 @@ class BEVPlannerNode(Node):
         self.local_grid_pub.publish(local_grid_msg)
 
         # 3. Cálculo de la meta relativa (x_right, y_forward)
-        goal_x_m, goal_y_m = self._compute_relative_goal()
+        # Integración Global -> Local (Fase 4): usar sub-meta del path global si está disponible y fresco;
+        # de lo contrario, recurrir al cálculo geodésico directo (Fail Open).
+        if (
+            self._global_path_is_fresh()
+            and self._global_path_valid
+            and len(self._global_path_poses) >= 2
+        ):
+            sub_goal = self._compute_global_subgoal_base_link()
+            goal_x_m, goal_y_m = (
+                sub_goal if sub_goal is not None else self._compute_relative_goal()
+            )
+        else:
+            goal_x_m, goal_y_m = self._compute_relative_goal()
 
         # 4. Planificación del camino sobre la grilla de costos BEV
         planned = self._plan_on_bev(

@@ -29,7 +29,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import BatteryState, Image, Imu, NavSatFix, NavSatStatus
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 
 CONTROL_RATE_HZ = 10.0
 CMD_VEL_TIMEOUT_S = 0.5
@@ -132,6 +132,12 @@ class EarthRoverBridge(Node):
             Float32, "earth_rover/heading", image_qos
         )
 
+        self.declare_parameter("publish_bridge_debug", True)
+        self.publish_bridge_debug = bool(self.get_parameter("publish_bridge_debug").value)
+        self.bridge_debug_pub = self.create_publisher(
+            String, "earth_rover/bridge_debug", image_qos
+        )
+
         self.declare_parameter("odom_pose_covariance", ODOM_POSE_COVARIANCE)
         self.declare_parameter("odom_twist_covariance", ODOM_TWIST_COVARIANCE)
         self.declare_parameter(
@@ -174,6 +180,7 @@ class EarthRoverBridge(Node):
 
         self._latest_cmd = None
         self._last_cmd_at = 0.0
+        self._last_cmd_rx_ros_sec = None
         self._stopped = True
         self._cmd_lock = threading.Lock()
 
@@ -200,6 +207,7 @@ class EarthRoverBridge(Node):
                 "angular": max(-1.0, min(1.0, msg.angular.z)),
             }
             self._last_cmd_at = time.monotonic()
+            self._last_cmd_rx_ros_sec = self.get_clock().now().nanoseconds / 1e9
             self._stopped = False
 
     def _control_tick(self):
@@ -209,13 +217,22 @@ class EarthRoverBridge(Node):
                 return
             command = {"linear": 0, "angular": 0} if quiet else dict(self._latest_cmd)
             last_cmd_at = self._last_cmd_at
+            last_rx_ros_sec = self._last_cmd_rx_ros_sec
+
+        send_mono = time.monotonic()
+        send_ros_sec = self.get_clock().now().nanoseconds / 1e9
+        status_code = None
+        error_str = None
+
         try:
             response = self._session.post(
                 f"{self.sdk_url}/control",
                 json={"command": command},
                 timeout=CONTROL_HTTP_TIMEOUT_S,
             )
+            status_code = response.status_code
             response.raise_for_status()
+
             if quiet:
                 with self._cmd_lock:
                     if (
@@ -224,7 +241,29 @@ class EarthRoverBridge(Node):
                     ):
                         self._stopped = True
         except requests.RequestException as e:
+            error_str = str(e)
+            if hasattr(e, "response") and e.response is not None:
+                status_code = getattr(e.response, "status_code", status_code)
             self.get_logger().warning(f"/control failed: {e}", throttle_duration_sec=5)
+        finally:
+            resp_mono = time.monotonic()
+            resp_ros_sec = self.get_clock().now().nanoseconds / 1e9
+            roundtrip_ms = (resp_mono - send_mono) * 1000.0
+
+            if self.publish_bridge_debug:
+                dbg_payload = {
+                    "type": "control_actuation",
+                    "cmd_rx_ros_sec": last_rx_ros_sec,
+                    "http_send_ros_sec": send_ros_sec,
+                    "http_resp_ros_sec": resp_ros_sec,
+                    "roundtrip_ms": roundtrip_ms,
+                    "status_code": status_code,
+                    "command": command,
+                    "error": error_str,
+                }
+                dbg_msg = String()
+                dbg_msg.data = json.dumps(dbg_payload)
+                self.bridge_debug_pub.publish(dbg_msg)
 
     def _control_loop(self):
         interval = 1.0 / CONTROL_RATE_HZ

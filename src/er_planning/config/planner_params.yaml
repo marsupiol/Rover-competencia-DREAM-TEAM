@@ -13,6 +13,16 @@ bev_planner_node:
     local_bev_grid_topic: "earth_rover/local_bev_grid"
     publish_visualization: true
 
+    # Integración y Guía por Planificador Global (Fase 4)
+    global_path_topic: "earth_rover/global_path"
+    global_planner_valid_topic: "earth_rover/global_planner_valid"
+    use_global_path_guidance: true
+    global_path_max_stale_s: 3.0
+    global_lookahead_distance_m: 3.5
+    map_frame: "map"
+    base_frame: "base_link"
+    tf_lookup_timeout_s: 0.2
+
     # Throttle del hilo de planificación (segundos mínimos entre iteraciones)
     planning_min_period_s: 0.1
 

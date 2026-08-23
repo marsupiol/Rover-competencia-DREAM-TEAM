@@ -399,6 +399,15 @@ ros2 topic echo /earth_rover/planned_path
 ros2 topic echo /earth_rover/planner_valid
 ```
 
+### 6.4. Grabación de Datos para Identificación de Sistema (System ID)
+```bash
+ros2 bag record \
+  earth_rover/control_debug earth_rover/bridge_debug \
+  earth_rover/heading gps/filtered /imu/data cmd_vel \
+  earth_rover/waypoint_status \
+  -o system_id_run_$(date +%Y%m%d_%H%M%S)
+```
+
 ---
 
 ## 7. Setup del Modelo de Inteligencia Artificial (SAM-TP & GeNIE)
@@ -431,10 +440,11 @@ pip install hydra-core "scikit-learn<1.5" "scipy<1.15" huggingface-hub
 
 1. **Rendimiento de Inferencia en CPU:** En procesadores x86 estándar sin GPU dedicada, el ciclo completo de inferencia SAM-TP toma entre $4.0\text{ s}$ y $5.5\text{ s}$ por frame (medido en tests reales). Gracias a la arquitectura desacoplada en hilos independientes y al fallback de frescura (`path_max_stale_s`), el bucle de control no se congela, pero la navegación en tiempo real a alta velocidad requiere aceleración GPU.
 2. **Dimensiones de la Huella (`footprint_px`):** El parámetro `footprint_px` en `planner_params.yaml` está configurado por defecto en 10 píxeles ($\approx 30\text{ cm}$). Se encuentra pendiente la confirmación milimétrica en banco de pruebas del chasis real del Earth Rover Mini+.
-3. **Mapeo Persistente y Planificador Global D\* Lite:** Implementados en `er_planning` (`persistent_map_node` y `global_planner_node`) con launch standalone `global_map_test.launch.py`. Se encuentran activos para inspección y validación visual; su integración con `gps_waypoint_controller` y la fusión con el planificador local BEV está planificada para la siguiente etapa de desarrollo.
-4. **Reemplazo en Vivo de Traversability:** `traversability_node` (percepción 2D basada en franjas de imagen) ha sido desacoplado del pipeline en vivo a favor de `bev_planner_node` (que provee proyección métrica BEV y trayectorias continuas).
-5. **Jitter de Red 4G/LTE:** La latencia variable en la transmisión de comandos y telemetría del rover es mitigada mediante la máquina de estados *Burst & Wait* y los filtros EKF duales.
-6. **Límite de Escala del Mapa Persistente (grilla densa):** `persistent_map_node` usa hoy una grilla densa de tamaño fijo (400m x 400m @ 0.20m/px = 4 millones de celdas, ~1.6GB en RAM como float32). El decaimiento (`_decay_timer_cb`) y el diff de costos (`_on_map`) procesan la grilla COMPLETA en cada ciclo, sin importar cuánto del mapa esté realmente cerca del rover en ese momento. Esto es adecuado para el área de una competencia (cientos de metros), pero NO escala a trayectos largos (por ejemplo, 80km entre dos puntos): a esa distancia, incluso un corredor angosto de 200m de ancho ya requiere del orden de 400 millones de celdas (~1.6GB adicionales), y el costo de procesamiento por ciclo crece con el tamaño TOTAL del mapa acumulado durante todo el viaje, no con la distancia restante al checkpoint. D* Lite en sí mismo no es el cuello de botella (sus estructuras `g`/`rhs` son diccionarios dispersos que escalan con el camino buscado, no con el mapa completo) — el límite está en la infraestructura de `persistent_map_node` alrededor de él. Ver sección 9 (Roadmap) para el diseño propuesto que resuelve esto.
+3. **Mapeo Persistente y Planificador Global D\* Lite:** Implementados en `er_planning` (`persistent_map_node` y `global_planner_node`) con escala graduada Bayesiana y dilación de footprint.
+4. **Comportamiento Asesor del Planificador Global:** El planificador global es puramente ASESOR. Si D* Lite determina que la única ruta es un rodeo hacia atrás, la sub-meta apuntará hacia atrás, pero el planificador local BEV — que sólo ve 4m hacia adelante y prioriza avanzar — puede ignorarla sistemáticamente y quedar oscilando si no hay caminos viables en esa dirección. No hay mecanismo para que el planificador global "insista" o fuerce una maniobra de retroceso en el planificador local.
+5. **Reemplazo en Vivo de Traversability:** `traversability_node` (percepción 2D basada en franjas de imagen) ha sido desacoplado del pipeline en vivo a favor de `bev_planner_node` (que provee proyección métrica BEV y trayectorias continuas).
+6. **Jitter de Red 4G/LTE:** La latencia variable en la transmisión de comandos y telemetría del rover es mitigada mediante la máquina de estados *Burst & Wait* y los filtros EKF duales.
+7. **Límite de Escala del Mapa Persistente (grilla densa):** `persistent_map_node` usa hoy una grilla densa de tamaño fijo (400m x 400m @ 0.20m/px = 4 millones de celdas, ~1.6GB en RAM como float32). El decaimiento (`_decay_timer_cb`) y el diff de costos (`_on_map`) procesan la grilla COMPLETA en cada ciclo, sin importar cuánto del mapa esté realmente cerca del rover en ese momento. Esto es adecuado para el área de una competencia (cientos de metros), pero NO escala a trayectos largos (por ejemplo, 80km entre dos puntos): a esa distancia, incluso un corredor angosto de 200m de ancho ya requiere del orden de 400 millones de celdas (~1.6GB adicionales), y el costo de procesamiento por ciclo crece con el tamaño TOTAL del mapa acumulado durante todo el viaje, no con la distancia restante al checkpoint. D* Lite en sí mismo no es el cuello de botella (sus estructuras `g`/`rhs` son diccionarios dispersos que escalan con el camino buscado, no con el mapa completo) — el límite está en la infraestructura de `persistent_map_node` alrededor de él. Ver sección 9 (Roadmap) para el diseño propuesto que resuelve esto.
 
 ---
 

@@ -5,6 +5,7 @@ Arquitectura Híbrida: Máquina de estados reactiva con mitigación de latencia 
 y filtrado pasa-bajos para brújula ruidosa.
 """
 
+import json
 import math
 import rclpy
 from rclpy.node import Node
@@ -44,6 +45,7 @@ class GPSWaypointController(Node):
         self.declare_parameter("path_following_enabled", True)
         self.declare_parameter("recovery_turn_speed", 0.3)
         self.declare_parameter("max_total_drive_angular", 0.8)
+        self.declare_parameter("publish_control_debug", True)
 
         # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
 
@@ -85,6 +87,7 @@ class GPSWaypointController(Node):
         self.heading_filter_alpha = float(self.get_parameter("heading_filter_alpha").value)
         self.reached_publish_period_s = float(self.get_parameter("reached_publish_period_s").value)
         self.loop_hz = float(self.get_parameter("control_loop_hz").value)
+        self.publish_control_debug = bool(self.get_parameter("publish_control_debug").value)
 
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
@@ -129,6 +132,7 @@ class GPSWaypointController(Node):
 
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", reliable_qos)
         self.status_pub = self.create_publisher(String, "earth_rover/waypoint_status", reliable_qos)
+        self.control_debug_pub = self.create_publisher(String, "earth_rover/control_debug", sensor_qos)
 
         # 5. Inicialización de Vectores de Estado
         self.current_lat = None
@@ -136,6 +140,7 @@ class GPSWaypointController(Node):
         self._gps_last_update = None
         self.current_heading = None
         self._raw_heading = None
+        self._heading_last_rx = None
         self.target_lat = None
         self.target_lon = None
 
@@ -167,6 +172,7 @@ class GPSWaypointController(Node):
         self._gps_last_update = self.get_clock().now()
 
     def _on_heading(self, msg: Float32):
+        self._heading_last_rx = self.get_clock().now()
         raw = float(msg.data) % 360.0
         self._raw_heading = raw
 
@@ -409,9 +415,11 @@ class GPSWaypointController(Node):
 
         # 2. SELECCIÓN DE FUENTE DE HEADING ERROR (Path BEV con Fallback a GPS)
         heading_error = None
+        heading_source = "none"
         if self._path_is_fresh():
             if self._path_valid and len(self._path_poses) >= 2:
                 heading_error = self._compute_path_heading_error_deg()
+                heading_source = "bev_path"
             elif not self._path_valid:
                 # Modo RECOVERY: el planner no encontró camino válido
                 twist = Twist()
@@ -426,12 +434,48 @@ class GPSWaypointController(Node):
                 out = String()
                 out.data = status
                 self.status_pub.publish(out)
+
+                if self.publish_control_debug:
+                    now_sec = now.nanoseconds / 1e9
+                    heading_rx_sec = (
+                        (self._heading_last_rx.nanoseconds / 1e9)
+                        if self._heading_last_rx is not None
+                        else None
+                    )
+                    gps_age = (
+                        ((now - self._gps_last_update).nanoseconds / 1e9)
+                        if self._gps_last_update is not None
+                        else None
+                    )
+                    path_age = (
+                        ((now - self._path_last_update).nanoseconds / 1e9)
+                        if self._path_last_update is not None
+                        else None
+                    )
+                    debug_payload = {
+                        "timestamp_sec": now_sec,
+                        "mode": "RECOVERY",
+                        "heading_error": None,
+                        "heading_source": "none",
+                        "current_heading": float(self.current_heading) if self.current_heading is not None else None,
+                        "heading_rx_sec": heading_rx_sec,
+                        "cmd_linear_x": 0.0,
+                        "cmd_angular_z": float(twist.angular.z),
+                        "align_phase": self._align_phase,
+                        "gps_age_s": gps_age,
+                        "path_age_s": path_age,
+                        "distance_m": float(distance),
+                    }
+                    dbg_msg = String()
+                    dbg_msg.data = json.dumps(debug_payload)
+                    self.control_debug_pub.publish(dbg_msg)
                 return
 
         if heading_error is None:
             # Fallback: cálculo GPS puro de bearing
             bearing = self.calculate_bearing(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
             heading_error = self.angle_error_deg(bearing, self.current_heading)
+            heading_source = "gps"
 
         # Umbral dinámico de alineación (más estricto al acercarse)
         align_threshold = (
@@ -467,7 +511,7 @@ class GPSWaypointController(Node):
                 else:
                     dynamic_burst = 0.22  # Micro-toque de francotirador para no pasarse del umbral
                 
-                # Evaluamos el corte contra nuestro burst dinámico, no el estático
+                # Evaluamos el corte contra nuestro burst dynamic, no el estático
                 if elapsed >= dynamic_burst:
                     self._begin_align_phase("PAUSE", now)
                     twist.angular.z = 0.0
@@ -497,6 +541,42 @@ class GPSWaypointController(Node):
         out = String()
         out.data = status
         self.status_pub.publish(out)
+
+        # Publicación de Telemetría para Identificación de Sistema (Fase 5.B)
+        if self.publish_control_debug:
+            now_sec = now.nanoseconds / 1e9
+            heading_rx_sec = (
+                (self._heading_last_rx.nanoseconds / 1e9)
+                if self._heading_last_rx is not None
+                else None
+            )
+            gps_age = (
+                ((now - self._gps_last_update).nanoseconds / 1e9)
+                if self._gps_last_update is not None
+                else None
+            )
+            path_age = (
+                ((now - self._path_last_update).nanoseconds / 1e9)
+                if self._path_last_update is not None
+                else None
+            )
+            debug_payload = {
+                "timestamp_sec": now_sec,
+                "mode": mode,
+                "heading_error": float(heading_error) if heading_error is not None else None,
+                "heading_source": heading_source,
+                "current_heading": float(self.current_heading) if self.current_heading is not None else None,
+                "heading_rx_sec": heading_rx_sec,
+                "cmd_linear_x": float(twist.linear.x),
+                "cmd_angular_z": float(twist.angular.z),
+                "align_phase": self._align_phase,
+                "gps_age_s": gps_age,
+                "path_age_s": path_age,
+                "distance_m": float(distance),
+            }
+            dbg_msg = String()
+            dbg_msg.data = json.dumps(debug_payload)
+            self.control_debug_pub.publish(dbg_msg)
 
 
 def main(args=None):

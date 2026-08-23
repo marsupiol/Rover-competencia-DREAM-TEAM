@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 import threading
-from typing import Any
 
 import numpy as np
 import rclpy
@@ -27,9 +26,6 @@ class PersistentMapNode(Node):
     def __init__(self):
         super().__init__("persistent_map_node")
 
-        # ----------------------------------------------------------------------
-        # 1. Declaración y Extracción de Parámetros
-        # ----------------------------------------------------------------------
         self.declare_parameter("local_grid_topic", "earth_rover/local_bev_grid")
         self.declare_parameter("map_topic", "earth_rover/persistent_map")
         self.declare_parameter("map_frame", "map")
@@ -41,11 +37,14 @@ class PersistentMapNode(Node):
         self.declare_parameter("hit_gain", 15.0)
         self.declare_parameter("miss_gain", 10.0)
         self.declare_parameter("confidence_max", 100.0)
+        self.declare_parameter("hit_vote_threshold", 0.15)
+        self.declare_parameter("unknown_evidence_band", 5.0)
+        self.declare_parameter("publish_quantization_step", 5)
         self.declare_parameter("occupied_threshold", 55.0)
         self.declare_parameter("free_threshold", -20.0)
         self.declare_parameter("occupied_cost_cutoff", 50.0)
-        self.declare_parameter("decay_period_s", 1.0)
-        self.declare_parameter("decay_factor", 0.95)
+        self.declare_parameter("decay_period_s", 5.0)
+        self.declare_parameter("decay_factor", 0.7738)
         self.declare_parameter("map_publish_period_s", 1.0)
         self.declare_parameter("tf_lookup_timeout_s", 0.2)
 
@@ -62,6 +61,9 @@ class PersistentMapNode(Node):
         self.hit_gain = float(self.get_parameter("hit_gain").value)
         self.miss_gain = float(self.get_parameter("miss_gain").value)
         self.confidence_max = float(self.get_parameter("confidence_max").value)
+        self.hit_vote_threshold = float(self.get_parameter("hit_vote_threshold").value)
+        self.unknown_evidence_band = float(self.get_parameter("unknown_evidence_band").value)
+        self.publish_quantization_step = int(self.get_parameter("publish_quantization_step").value)
         self.occupied_threshold = float(self.get_parameter("occupied_threshold").value)
         self.free_threshold = float(self.get_parameter("free_threshold").value)
         self.occupied_cost_cutoff = float(self.get_parameter("occupied_cost_cutoff").value)
@@ -233,13 +235,35 @@ class PersistentMapNode(Node):
         valid_rows = map_rows[in_bounds]
         valid_costs = raw_data[obs_rows[in_bounds], obs_cols[in_bounds]]
 
-        # 7. Actualización de confianza (Hit vs Miss)
+        if valid_rows.size == 0:
+            return
+
+        # 7. Agrupamiento y Voto Agregado por Celda Persistente (Mitigación de Saturación por Resolución)
+        # Ratio de resolución (0.20m persistente / 0.03m local)^2 ≈ 44 celdas locales por píxel persistente.
+        # Agrupamos las celdas locales que caen sobre la misma celda persistente y emitimos UN SOLO voto por frame.
+        stacked = np.stack((valid_rows, valid_cols), axis=1)
+        unique_cells, inverse_indices = np.unique(stacked, axis=0, return_inverse=True)
+        uniq_rows = unique_cells[:, 0]
+        uniq_cols = unique_cells[:, 1]
+        num_unique = len(unique_cells)
+
         is_hit = valid_costs >= self.occupied_cost_cutoff
-        deltas = np.where(is_hit, self.hit_gain, -self.miss_gain).astype(np.float32)
+        count_total = np.bincount(inverse_indices, minlength=num_unique)
+        count_hit = np.bincount(inverse_indices, weights=is_hit.astype(np.int32), minlength=num_unique)
+        hit_fraction = count_hit / np.maximum(1, count_total)
+
+        # Regla de decisión de voto:
+        # hit_vote_threshold = 0.15 (15% de evidencia de obstáculo en las observaciones locales).
+        # En el borde exacto hit_fraction == hit_vote_threshold se decide a favor de HIT (conservador por seguridad).
+        # Justificación: con un rover de 250mm de ancho, un obstáculo fino (ej. poste) que ocupe 3-4 de 44 celdas
+        # locales (~7-9%) o ligeramente más (>=15%) debe registrarse como obstáculo para evitar colisiones,
+        # en concordancia con el threshold_points_ratio: 0.05 del planificador local.
+        is_hit_unique = hit_fraction >= self.hit_vote_threshold
+        deltas_unique = np.where(is_hit_unique, self.hit_gain, -self.miss_gain).astype(np.float32)
 
         with self._lock:
-            # np.add.at acumula de forma segura cuando múltiples puntos locales mapean al mismo píxel global
-            np.add.at(self._confidence, (valid_rows, valid_cols), deltas)
+            # Los índices son únicos por construcción mediante np.unique, fancy indexing directo es seguro
+            self._confidence[uniq_rows, uniq_cols] += deltas_unique
             np.clip(self._confidence, -self.confidence_max, self.confidence_max, out=self._confidence)
 
     # --------------------------------------------------------------------------
@@ -253,16 +277,19 @@ class PersistentMapNode(Node):
           confidence[t] = confidence[t - 1] * decay_factor
 
         Ejemplo Numérico y Cálculo de Tiempo de Olvido:
-          Con decay_factor = 0.95 y decay_period_s = 1.0s:
-          - Caso 1: Celda recién clasificada como obstáculo en el umbral (confidence = 55.0).
-              t=1s: 55.0 * 0.95 = 52.25 < 55.0 -> Pasa a DESCONOCIDA tras solo 1 segundo.
+          Con decay_factor = 0.7738 y decay_period_s = 5.0s (equivalente a 0.95^5 cada 5s):
+          - Caso 1: Celda en umbral ocupado (confidence = 55.0).
+              t=5s: 55.0 * 0.7738 = 42.56 < 55.0 -> Deja de considerarse obstáculo en 1 período (5s).
           - Caso 2: Obstáculo persistente saturado al máximo (confidence = 100.0).
-              Buscamos k períodos para que 100.0 * (0.95)^k < 55.0:
-                (0.95)^k < 0.55
-                k * ln(0.95) < ln(0.55)
-                k > ln(0.55) / ln(0.95) = (-0.5978) / (-0.05129) = 11.65 períodos.
-              -> Tras ~12 segundos sin re-observación, un obstáculo totalmente saturado (ej. auto parado)
-                 decae por debajo del umbral ocupado y vuelve a desconocido, permitiendo el paso del rover.
+              Buscamos k períodos para que 100.0 * (0.7738)^k < 55.0:
+                (0.7738)^k < 0.55
+                k * ln(0.7738) < ln(0.55)
+                k > ln(0.55) / ln(0.7738) = (-0.597837) / (-0.256441) = 2.331 períodos.
+                Tiempo efectivo = 2.331 * 5.0s = 11.66 segundos (~12s).
+              -> Comparación con esquema anterior (1.0s / 0.95):
+                 k > ln(0.55) / ln(0.95) = (-0.597837) / (-0.051293) = 11.655 períodos = 11.66s.
+                 Ambos esquemas poseen exactamente la misma constante de tiempo efectiva (tau ≈ 19.5s)
+                 y el mismo tiempo de olvido (~12s), pero reducen el churn de diffs en D* Lite por un factor de 5x.
         """
         with self._lock:
             self._confidence *= np.float32(self.decay_factor)
@@ -272,20 +299,59 @@ class PersistentMapNode(Node):
     # --------------------------------------------------------------------------
     def _publish_timer_cb(self):
         """
-        Publica la grilla persistente como nav_msgs/OccupancyGrid en el marco 'map'.
+        Publica la grilla persistente como nav_msgs/OccupancyGrid graduado en el marco 'map'.
 
-        Esquema de estados en el mensaje publicado:
-          - -1 (Desconocido): free_threshold (-20.0) < confidence < occupied_threshold (55.0)
-          -  0 (Confirmado Libre): confidence <= free_threshold (-20.0)
-          - 100 (Confirmado Ocupado): confidence >= occupied_threshold (55.0)
+        Esquema de gradación lineal:
+          - confidence_max = 100.0
+          - unknown_evidence_band = 5.0 (|confidence| < 5.0 -> -1 desconocido)
+          - scaled = ((confidence + confidence_max) / (2.0 * confidence_max)) * 100.0
+          - Cuantización por publish_quantization_step = 5:
+              step = 5
+              occ_grid = round(scaled / 5) * 5
+              occ_grid[|confidence| < 5.0] = -1
+
+        Ejemplos numéricos:
+          - confidence = +60.0 -> scaled = ((60 + 100) / 200) * 100 = 80.0 -> publica 80.
+          - confidence = -60.0 -> scaled = ((-60 + 100) / 200) * 100 = 20.0 -> publica 20.
+          - confidence = +2.0  -> |2.0| < 5.0 (dentro de banda desconocida) -> publica -1.
+          - confidence = 0.0   -> |0.0| < 5.0 -> publica -1.
+          - confidence = +55.0 -> scaled = ((55 + 100) / 200) * 100 = 77.5 -> publica 80 (o 78 sin cuantizar).
+          - confidence = -20.0 -> scaled = ((-20 + 100) / 200) * 100 = 40.0 -> publica 40.
+
+        NOTA CRÍTICA DE DISEÑO (C2):
+          El punto neutro de esta escala graduada es 50 (evidencia nula/desconocida), NO 0.
+          Una celda confirmada libre (confidence <= -20) publica valores en el rango [0, 40].
+          Una celda confirmada ocupada (confidence >= +55) publica valores en el rango [78, 100].
         """
         with self._lock:
             grid_copy = self._confidence.copy()
 
-        # Vectorización rápida de los tres estados
-        occ_grid = np.full(grid_copy.shape, -1, dtype=np.int8)
-        occ_grid[grid_copy <= self.free_threshold] = 0
-        occ_grid[grid_copy >= self.occupied_threshold] = 100
+        abs_conf = np.abs(grid_copy)
+        unknown_mask = abs_conf < self.unknown_evidence_band
+
+        scaled = np.clip(
+            ((grid_copy + self.confidence_max) / (2.0 * self.confidence_max)) * 100.0,
+            0.0,
+            100.0,
+        )
+        step = max(1, int(self.publish_quantization_step))
+        occ_grid = (np.round(scaled / step) * step).astype(np.int8)
+        occ_grid[unknown_mask] = -1
+
+        # Diagnóstico estadístico informativo throttled
+        n_occupied = int(np.count_nonzero(grid_copy >= self.occupied_threshold))
+        n_free = int(np.count_nonzero(grid_copy <= self.free_threshold))
+        n_partial = int(
+            np.count_nonzero(
+                (grid_copy > self.free_threshold)
+                & (grid_copy < self.occupied_threshold)
+                & ~unknown_mask
+            )
+        )
+        self.get_logger().debug(
+            f"PersistentMap stats: ocupadas={n_occupied}, libres={n_free}, evidencia_parcial={n_partial}",
+            throttle_duration_sec=self.map_publish_period_s * 5.0,
+        )
 
         msg = OccupancyGrid()
         msg.header.stamp = self.get_clock().now().to_msg()

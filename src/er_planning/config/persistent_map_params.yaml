@@ -16,9 +16,13 @@ persistent_map_node:
     hit_gain: 15.0
     miss_gain: 10.0
     confidence_max: 100.0
+    hit_vote_threshold: 0.15
+    unknown_evidence_band: 5.0
+    publish_quantization_step: 5
+    # Diagnóstico interno (ya no definen los valores de publicación en el OccupancyGrid)
     occupied_threshold: 55.0
     free_threshold: -20.0
-    decay_period_s: 1.0
-    decay_factor: 0.95
+    decay_period_s: 5.0
+    decay_factor: 0.7738   # = 0.95^5, preserva la misma constante de tiempo efectiva (~12s de olvido)
     map_publish_period_s: 1.0
     tf_lookup_timeout_s: 0.2
