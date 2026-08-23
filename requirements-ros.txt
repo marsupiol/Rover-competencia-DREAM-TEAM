@@ -1,0 +1,33 @@
+# ==============================================================================
+# Earth Rover Mini+ — ROS 2 Bridge & SDK Server Additional Python Requirements
+# ==============================================================================
+# These dependencies are REQUIRED by packages in this workspace:
+# - src/sdk_server (FastAPI / Hypercorn / Playwright WebRTC session server)
+# - src/earth_rovers_sdk (earth_rover_bridge HTTP / WebSocket client)
+# - src/er_mission (mission_manager_node HTTP checkpoint verification)
+# 
+# Note: These packages are NOT included in the base ROS 2 Jazzy install
+# (osrf/ros:jazzy-ros-base) and must be installed via pip.
+# ==============================================================================
+
+# ASGI Web Framework & Server (src/sdk_server)
+fastapi==0.111.1
+Hypercorn==0.17.3
+pydantic==2.8.2
+starlette==0.37.2
+wsproto==1.2.0
+python-dotenv==1.0.1
+
+# Headless Browser Automation for WebRTC Session (src/sdk_server)
+playwright==1.60.0
+
+# HTTP & WebSocket Communications (src/earth_rovers_sdk, src/er_mission, src/sdk_server)
+requests==2.32.3
+websocket-client==1.9.0
+websockets==15.0.1
+aiohttp==3.9.3
+httpx==0.28.1
+
+# Auxiliary SDK Server Capabilities (TTS & Generative SDK interfaces)
+edge-tts==7.2.8
+google-genai==1.46.0
