@@ -3,9 +3,7 @@
 # ==============================================================================
 # CUDA / PyTorch Target:
 # - No se encontró una versión de CUDA objetivo hardcodeada en el repo.
-# - Para entornos NVIDIA (WSL2 / Linux), instalar la build CUDA oficial de PyTorch:
-#     pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu124
-#   (o cu121 según el driver instalado en el host).
+# - el índice de CUDA correcto cambia con cada release de PyTorch — antes de instalar, confirmá la combinación válida para torch==2.13.0 en https://pytorch.org/get-started/locally/ (seleccionar Linux + Pip + tu versión de CUDA) y usá el --index-url que esa página indique en ese momento, no lo copies de acá.
 # - Python Version: Python 3.12.3
 # - Base OS: Ubuntu 24.04.4 LTS (Noble Numbat)
 # ==============================================================================
