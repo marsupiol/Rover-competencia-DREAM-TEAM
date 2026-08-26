@@ -163,8 +163,9 @@ class BEVPlannerNode(Node):
             from rover_traversability.calibration import load_camera_K, load_T_base_camera
             from rover_traversability.predictor import TraversabilityPredictor
             from rover_traversability.weights import SamNotInstalledError
-            from genie_path_planner.planner import PlannerConfig, plan_on_bev
+            from genie_path_planner.planner import PlannerConfig, plan_on_bev, _resize_pixel
             from genie_path_planner.projection import project_score_to_bev
+            from genie_path_planner.path_sampling import sample_paths_polynomial
         except ImportError as exc:
             self.get_logger().error(
                 "No se pudo importar rover_traversability / genie_path_planner. Instalá las "
@@ -214,6 +215,31 @@ class BEVPlannerNode(Node):
             include_goal_in_path_bank=bool(self.get_parameter("include_goal_in_path_bank").value),
             include_random_goals=bool(self.get_parameter("include_random_goals").value),
         )
+
+        # Precomputar el banco de caminos fijos (GeNIE) si no depende de la meta dinámica
+        if not self._planner_cfg.include_goal_in_path_bank:
+            bev_h = max(1, int(np.ceil(float(self.forward_range) / float(self.bev_resolution))))
+            bev_w = max(1, int(np.ceil((2.0 * float(self.side_range)) / float(self.bev_resolution))))
+            start0 = (bev_h - 1, bev_w // 2)
+            planner_start = _resize_pixel(start0, (bev_h, bev_w), int(self._planner_cfg.grid_size))
+            self.get_logger().info(
+                f"Precomputando banco de trayectorias GeNIE en robot_start={planner_start}..."
+            )
+            self._candidate_path_bank = sample_paths_polynomial(
+                robot=planner_start,
+                num_goals=int(self._planner_cfg.num_goals),
+                num_mid_points_per_goal=int(self._planner_cfg.num_mid_points_per_goal),
+                num_samples=int(self._planner_cfg.path_num_samples),
+                grid_size=int(self._planner_cfg.grid_size),
+                goal=None,
+                include_random_goals=bool(self._planner_cfg.include_random_goals),
+                random_seed=self._planner_cfg.random_seed,
+            )
+            self.get_logger().info(
+                f"Banco GeNIE precomputado: {len(self._candidate_path_bank)} caminos válidos cargados en memoria."
+            )
+        else:
+            self._candidate_path_bank = None
 
         try:
             self._predictor = TraversabilityPredictor(
@@ -541,8 +567,11 @@ class BEVPlannerNode(Node):
         return float(goal_x_genie), float(goal_y_genie)
 
     def _run_planning(self, rgb: np.ndarray):
+        t_start = time.perf_counter()
+
         # 1. Inferencia neuronal de transitabilidad sobre la imagen frontal
         predict_res = self._predictor.predict(rgb)
+        t_after_infer = time.perf_counter()
         score_mask = predict_res.mask.astype(np.float32)
 
         # 2. Proyección de la máscara de transitabilidad a vista aérea (BEV)
@@ -556,38 +585,9 @@ class BEVPlannerNode(Node):
             bev_side_range_m=self.side_range,
             max_ray_distance_m=self.max_ray_distance,
         )
+        t_after_bev = time.perf_counter()
 
         # 2b. Publicación de la grilla BEV local cruda en nav_msgs/OccupancyGrid (marco 'base_link')
-        #
-        # Convención geométrica y derivación de info.origin / info.width / info.height:
-        # - bev_flat tiene dimensiones (bev_h, bev_w) donde:
-        #     bev_h = ceil(forward_range_m / resolution_m_per_px) (filas, eje longitudinal +X)
-        #     bev_w = ceil(2 * side_range_m / resolution_m_per_px) (columnas, eje lateral +Y)
-        # - En ROS OccupancyGrid (REP-103 base_link: +X adelante, +Y izquierda):
-        #     info.width  = bev_h (longitud a lo largo de +X, número de celdas hacia adelante)
-        #     info.height = bev_w (longitud a lo largo de +Y, número de celdas de derecha a izquierda)
-        #     info.origin = pose de la celda (ix=0, iy=0) relativa a base_link:
-        #       - ix=0 corresponde al frente del rover: x_origin = 0.0 m
-        #       - iy=0 corresponde al extremo derecho: y_origin = -(bev_w // 2) * resolution_m_per_px
-        #
-        # Ejemplo numérico de verificación:
-        #   forward_range_m = 4.0m, side_range_m = 2.0m, resolution = 0.03 m/px
-        #   -> bev_h = 134 celdas, bev_w = 134 celdas, bev_w // 2 = 67 celdas
-        #   -> info.width = 134, info.height = 134
-        #   -> origin.position.x = 0.0 m
-        #   -> origin.position.y = -67 * 0.03 m = -2.01 m
-        #   Para celda (ix=0, iy=0): x = 0.0m (frente), y = -2.01m (extremo derecho).
-        #   Para celda (ix=133, iy=133): x = 133*0.03 = 3.99m (horizonte adelante),
-        #                                y = -2.01 + 133*0.03 = +1.98m (extremo izquierdo).
-        #
-        # Mapeo matricial a data (1D row-major de tamaño height * width = bev_w * bev_h):
-        #   bev_flat contiene transitabilidad en [0.0, 1.0] (1.0 libre, 0.0 obstáculo).
-        #   Costo ROS OccupancyGrid: 0=libre, 100=intransitable, -1=no observado (observed==0).
-        #   cost_bev[row, col]: row 0 = lejos adelante, row bev_h-1 = cerca del rover;
-        #                       col 0 = extremo izquierdo, col bev_w-1 = extremo derecho.
-        #   Al invertir filas (row) y columnas (col) y transponer:
-        #     grid_2d = cost_bev[::-1, ::-1].T  -> shape (bev_w, bev_h) = (height, width)
-        #     grid_2d[iy, ix] corresponde exactamente a data[iy * width + ix].
         bev_h, bev_w = bev_flat.shape
         cost_bev = np.where(
             observed > 0,
@@ -610,8 +610,6 @@ class BEVPlannerNode(Node):
         self.local_grid_pub.publish(local_grid_msg)
 
         # 3. Cálculo de la meta relativa (x_right, y_forward)
-        # Integración Global -> Local (Fase 4): usar sub-meta del path global si está disponible y fresco;
-        # de lo contrario, recurrir al cálculo geodésico directo (Fail Open).
         if (
             self._global_path_is_fresh()
             and self._global_path_valid
@@ -632,7 +630,9 @@ class BEVPlannerNode(Node):
             goal_y_m=goal_y_m,
             bev_resolution_m=self.bev_resolution,
             config=self._planner_cfg,
+            candidate_path_bank=self._candidate_path_bank,
         )
+        t_after_plan = time.perf_counter()
 
         now = self.get_clock().now()
         is_valid = bool(
@@ -675,9 +675,16 @@ class BEVPlannerNode(Node):
             vis_msg.header.frame_id = "base_link"
             self.vis_pub.publish(vis_msg)
 
-        self.get_logger().debug(
-            f"BEV Plan: valid={is_valid} points={len(path_msg.poses)} "
-            f"goal_rel=({goal_x_m:+.2f}m, {goal_y_m:+.2f}m) infer={predict_res.inference_s*1000:.0f}ms"
+        t_end = time.perf_counter()
+        infer_ms = predict_res.inference_s * 1000.0
+        bev_ms = (t_after_bev - t_after_infer) * 1000.0
+        plan_ms = (t_after_plan - t_after_bev) * 1000.0
+        total_latency_ms = (t_end - t_start) * 1000.0
+
+        self.get_logger().info(
+            f"[LATENCY] frame_total={total_latency_ms:.1f}ms | "
+            f"infer_nn={infer_ms:.1f}ms | bev_proj={bev_ms:.1f}ms | plan_genie={plan_ms:.1f}ms | "
+            f"valid={is_valid} points={len(path_msg.poses)}"
         )
 
     def destroy_node(self):

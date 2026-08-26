@@ -12,9 +12,9 @@
 torch==2.13.0
 torchvision==0.28.0
 
-# SAM-TP & GeNIE Path Planner (Vendored submodules)
--e src/third_party/sana-earth-rover-policy/genie
--e src/third_party/sana-earth-rover-policy/traversability
+# SAM-TP & GeNIE Path Planner (Instalados de forma explícita en Dockerfile con --no-build-isolation)
+# -e src/third_party/sana-earth-rover-policy/genie
+# -e src/third_party/sana-earth-rover-policy/traversability[hf]
 
 # Configuration & Hydra Engine
 hydra-core==1.3.5

@@ -212,44 +212,51 @@ Nodo histórico de percepción reactiva 2D por corredores basada en SAM-TP.
 ### 4.1. Flujo de Datos Arquitectónico
 
 ```text
-+------------------------------------+
-|       Cámara Frontal (RGB)         |
-+------------------------------------+
-                  │ image_raw
-                  ▼
++----------------------------------------------------------------------------------------------------+
+|                                       Cámara Frontal (RGB)                                         |
++----------------------------------------------------------------------------------------------------+
+                                                   │ image_raw
+                                                   ▼
 +----------------------------------------------------------------------------------------------------+
 | bev_planner_node (er_planning)                                                                     |
-|   - Percepción de transitabilidad SAM-TP (Hiera-tiny)                                              |
-|   - Proyección a Bird's-Eye-View (BEV) local                                                       |
+|   - Inferencia de transitabilidad SAM-TP y proyección a Bird's-Eye-View (BEV) local                |
+|   - Planificador reactivo de trayectorias (GeNIE) guiado por sub-meta global o rumbo geodésico     |
 |   - Publica grilla local: earth_rover/local_bev_grid (nav_msgs/OccupancyGrid, frame 'base_link')   |
+|   - Publica camino local: earth_rover/planned_path (nav_msgs/Path, frame 'base_link')              |
 +----------------------------------------------------------------------------------------------------+
-                  │ local_bev_grid (base_link, 0.03 m/px)
-                  ▼
-+----------------------------------------------------------------------------------------------------+
-| persistent_map_node (er_planning)                                                                  |
-|   - Acumulación Bayesiana de evidencia en marco global 'map' (TF: map -> base_link)               |
-|   - Ganancias de acierto/fallo: hit_gain=+15.0, miss_gain=-10.0, clamp [-100.0, +100.0]            |
-|   - Decaimiento exponencial periódico (decay_factor=0.95 @ 1.0s) para olvidar obstáculos dinámicos |
-|   - Publica: earth_rover/persistent_map (nav_msgs/OccupancyGrid, frame 'map', 0.20 m/px)           |
-+----------------------------------------------------------------------------------------------------+
-                  │ persistent_map (map frame)
-                  ▼
-+----------------------------------------------------------------------------------------------------+
-| global_planner_node (er_planning)                                                                  |
-|   - Algoritmo D* Lite (Koenig & Likhachev, 2002/2005)                                              |
-|   - Proyección de meta geodésica vía servicio /fromLL de robot_localization                        |
-|   - Reparación incremental de vértices ante cambios de costo y movimiento del rover (km)           |
-|   - Publica: earth_rover/global_path (nav_msgs/Path, frame 'map')                                  |
-|   - Publica: earth_rover/global_planner_valid (std_msgs/Bool)                                      |
-+----------------------------------------------------------------------------------------------------+
-                  │
-                  ▼
-   [Solo para inspección / depuración en RViz — NO consumido por gps_waypoint_controller todavía]
+         │                                                            │
+         │ local_bev_grid (base_link, 0.03 m/px)                      │ planned_path (base_link)
+         ▼                                                            ▼
++-----------------------------------------------------------------+  +-------------------------------+
+| persistent_map_node (er_planning)                               |  | gps_waypoint_controller       |
+|   - Acumulación Bayesiana de evidencia en marco global 'map'    |  | (er_navigation)               |
+|   - Ganancias: hit_gain=+15.0, miss_gain=-10.0, [-100, +100]    |  |   - Seguimiento reactivo con  |
+|   - Decaimiento exponencial: decay_factor=0.7738 @ 5.0s         |  |     lookahead dinámico (1.0m) |
+|   - Publica: earth_rover/persistent_map (OccupancyGrid, frame   |  |   - Fallback a rumbo geodésico|
+|     'map', 0.20 m/px)                                           |  |     si planned_path expira    |
++-----------------------------------------------------------------+  |   - Publica: cmd_vel          |
+         │                                                            +-------------------------------+
+         │ persistent_map (map frame)
+         ▼
++-----------------------------------------------------------------+
+| global_planner_node (er_planning)                               |
+|   - Algoritmo D* Lite incremental (Koenig & Likhachev)          |
+|   - Proyección de meta geodésica vía servicio /fromLL           |
+|   - Reparación incremental de vértices ante cambios en el mapa  |
+|   - Publica: earth_rover/global_path (nav_msgs/Path, 'map')     |
+|   - Publica: earth_rover/global_planner_valid (std_msgs/Bool)   |
++-----------------------------------------------------------------+
+         │
+         │ earth_rover/global_path + global_planner_valid
+         └────────────────────────────────────────────────────────────► (retroalimenta como sub-meta
+                                                                        al bev_planner_node de arriba —
+                                                                        mismo nodo, no uno nuevo)
 ```
 
 > [!IMPORTANT]
-> **Nota de Integración y Alcance:**
-> Este mapa global persistente y su planificador D* Lite todavía **NO** están integrados con `gps_waypoint_controller`. El rover sigue navegando en producción exactamente igual que antes de este cambio (utilizando `bev_planner_node` local y el fallback a rumbo geodésico). La integración del camino global como fuente de guiado es un paso futuro separado.
+> **Integración en Producción y Flujo de Guiado Asesor:**
+> `persistent_map_node` y `global_planner_node` están integrados en el launch de producción [`mission1.launch.py`](src/er_bringup/launch/mission1.launch.py) detrás del flag de lanzamiento `enable_global_planning` (habilitado por default: `true`).
+> El camino global D* Lite no comanda directamente el chasis: alimenta una **sub-meta asesora** dentro de `bev_planner_node` (`_compute_global_subgoal_base_link()`), proyectada al marco `base_link` a una distancia métrica de anticipación (`global_lookahead_distance_m: 3.5m`). `bev_planner_node` sigue siendo el único nodo que evalúa colisiones visuales inmediatas y decide el movimiento local (`planned_path`), el cual es ejecutado por `gps_waypoint_controller` (el controlador no sufrió modificaciones). Si el planificador global se desactiva (`enable_global_planning:=false`) o el camino global pierde frescura, `bev_planner_node` realiza un fallback transparente e inmediato al rumbo geodésico directo (*Fail-Open*).
 
 ---
 
@@ -356,7 +363,12 @@ hypercorn main:app --bind 0.0.0.0:8000
 # 2. En otra terminal: Lanzar la misión completa en ROS 2
 source /opt/ros/jazzy/setup.bash
 source /root/ros2_ws/install/setup.bash
+
+# Lanzamiento estándar con planificador global activado (default):
 ros2 launch er_bringup mission1.launch.py
+
+# Lanzamiento con planificador global desactivado (modo fallback reactivo):
+ros2 launch er_bringup mission1.launch.py enable_global_planning:=false
 ```
 
 ### 5.3. Ejecución con Docker / Docker Compose
@@ -366,6 +378,62 @@ El workspace incluye soporte para despliegues contenerizados:
 ```bash
 docker compose up --build
 ```
+
+### 5.4. Precarga de Mapa Semilla (OpenStreetMap Prior) y Orquestador de Misión
+
+Para evitar que `persistent_map_node` y D* Lite arranquen a ciegas en zonas inexploradas, el sistema permite precargar un prior geográfico de baja/moderada confianza a partir de datos reales de OpenStreetMap (veredas y calles).
+
+#### 1. Verificación previa de cobertura OSM
+Antes de una competencia, verifique en [OpenStreetMap](https://www.openstreetmap.org) la zona geográfica de la misión:
+- **Veredas y sendas peatonales** (tags `highway=footway`, `path`, `pedestrian`, `sidewalk`, `steps`): se clasificarán como prioritarias/transitables (`-80.0`).
+- **Calles vehiculares** (tags `highway=residential`, `service`, `tertiary`, `secondary`, `primary`, `unclassified`): se clasificarán como vías a evitar pero transitables en caso necesario (`+60.0`), sin penalizar veredas paralelas.
+- Si una zona no cuenta con veredas mapeadas en OSM, el generador asignará confianza neutra (`0.0`) y el rover navegará descubriendo el terreno con la cámara frontal y SAM-TP.
+
+#### 2. Requisito de Datum Dinámico
+La conversión de coordenadas requiere que el frame `map` esté anclado a un datum determinista resuelto desde el Checkpoint #1 de la misión SDK (mediante `tools/mission_prep/resolve_datum.py`), con rumbo fijo `yaw = 0.0` (alineado al Norte verdadero según REP-105 ENU).
+
+#### 3. Flujo Integrado con el Wrapper Único (`run_mission.sh`)
+El script orquestador realiza todos los pasos preparatorios de forma automatizada:
+```bash
+# Ejecución completa (resolución de datum + generación OSM con caché + launch de misión):
+./tools/mission_prep/run_mission.sh --mission-slug <slug_de_la_mision>
+
+# Ejecución salteando la generación del mapa semilla OSM:
+./tools/mission_prep/run_mission.sh --mission-slug <slug_de_la_mision> --skip-seed-map
+
+# Ejecución forzando la re-descarga de datos OSM (ignorando caché local):
+./tools/mission_prep/run_mission.sh --mission-slug <slug_de_la_mision> --force-download
+```
+
+#### 4. Ejecución Modular de Pasos (Debug / Desarrollo)
+```bash
+# Paso 1: Resolver datum dinámico desde el servidor SDK
+python3 tools/mission_prep/resolve_datum.py --sdk-url http://localhost:8000 --output src/mini_plus_localization/config/datum_resolved.yaml
+
+# Paso 2: Levantar navsat_transform_node temporalmente
+ros2 run robot_localization navsat_transform_node \
+  --ros-args \
+  --params-file src/mini_plus_localization/config/ekf.yaml \
+  --params-file src/mini_plus_localization/config/datum_resolved.yaml \
+  -r imu:=/imu/data -r gps/fix:=/gps/fix -r odometry/filtered:=/odometry/global &
+
+# Paso 3: Generar mapa semilla .npy (usa servicio /fromLL y guarda en tools/osm_seed/cache/)
+python3 tools/osm_seed/generate_seed_map.py \
+  --datum-file src/mini_plus_localization/config/datum_resolved.yaml \
+  --config src/er_planning/config/persistent_map_params.yaml \
+  --output tools/osm_seed/seed_map.npy
+
+# Paso 4: Detener navsat_transform_node temporal (pkill o kill <PID>)
+
+# Paso 5: Lanzar la misión cargando el mapa semilla generado
+ros2 launch er_bringup mission1.launch.py seed_map_path:=$(pwd)/tools/osm_seed/seed_map.npy
+```
+
+#### 5. Confianza Parcial / Moderada y Fail-Open
+El mapa semilla se escala intencionalmente con `seed_confidence_scale: 0.3`. Una celda de vereda (`-80.0`) arranca en `-24.0` (por debajo de `free_threshold = -20.0` para iniciar con costo óptimo 1.0 en D* Lite), pero tan sólo 2 observaciones reales de obstáculo desde la cámara (`+15.0` cada una: `-24 + 15 + 15 = +6 > 0`) revierten la evidencia si la vereda está bloqueada por obras o vallas. Si el servidor OSM no está disponible y no hay caché, el wrapper continúa sin mapa semilla (`seed_map_path=""`, grilla en cero) sin abortar la misión.
+
+#### 6. Atribución de Datos de OpenStreetMap
+Los datos geográficos utilizados para el mapa semilla provienen de OpenStreetMap y están licenciados bajo la [Open Database License (ODbL)](https://opendatacommons.org/licenses/odbl/). Si la visualización del mapa o sus derivados se presentan públicamente, debe incluirse la atribución: *"© OpenStreetMap contributors"*.
 
 ---
 
@@ -440,17 +508,62 @@ pip install hydra-core "scikit-learn<1.5" "scipy<1.15" huggingface-hub
 
 1. **Rendimiento de Inferencia en CPU:** En procesadores x86 estándar sin GPU dedicada, el ciclo completo de inferencia SAM-TP toma entre $4.0\text{ s}$ y $5.5\text{ s}$ por frame (medido en tests reales). Gracias a la arquitectura desacoplada en hilos independientes y al fallback de frescura (`path_max_stale_s`), el bucle de control no se congela, pero la navegación en tiempo real a alta velocidad requiere aceleración GPU.
 2. **Dimensiones de la Huella (`footprint_px`):** El parámetro `footprint_px` en `planner_params.yaml` está configurado por defecto en 10 píxeles ($\approx 30\text{ cm}$). Se encuentra pendiente la confirmación milimétrica en banco de pruebas del chasis real del Earth Rover Mini+.
-3. **Mapeo Persistente y Planificador Global D\* Lite:** Implementados en `er_planning` (`persistent_map_node` y `global_planner_node`) con escala graduada Bayesiana y dilación de footprint.
+3. **Mapeo Persistente y Planificador Global D\* Lite:** Integrados en el launch de producción `mission1.launch.py` detrás del flag de activación `enable_global_planning` (default: `true`), con acumulación Bayesiana, escala graduada de costos, decaimiento temporal y dilación de footprint.
 4. **Comportamiento Asesor del Planificador Global:** El planificador global es puramente ASESOR. Si D* Lite determina que la única ruta es un rodeo hacia atrás, la sub-meta apuntará hacia atrás, pero el planificador local BEV — que sólo ve 4m hacia adelante y prioriza avanzar — puede ignorarla sistemáticamente y quedar oscilando si no hay caminos viables en esa dirección. No hay mecanismo para que el planificador global "insista" o fuerce una maniobra de retroceso en el planificador local.
 5. **Reemplazo en Vivo de Traversability:** `traversability_node` (percepción 2D basada en franjas de imagen) ha sido desacoplado del pipeline en vivo a favor de `bev_planner_node` (que provee proyección métrica BEV y trayectorias continuas).
 6. **Jitter de Red 4G/LTE:** La latencia variable en la transmisión de comandos y telemetría del rover es mitigada mediante la máquina de estados *Burst & Wait* y los filtros EKF duales.
-7. **Límite de Escala del Mapa Persistente (grilla densa):** `persistent_map_node` usa hoy una grilla densa de tamaño fijo (400m x 400m @ 0.20m/px = 4 millones de celdas, ~1.6GB en RAM como float32). El decaimiento (`_decay_timer_cb`) y el diff de costos (`_on_map`) procesan la grilla COMPLETA en cada ciclo, sin importar cuánto del mapa esté realmente cerca del rover en ese momento. Esto es adecuado para el área de una competencia (cientos de metros), pero NO escala a trayectos largos (por ejemplo, 80km entre dos puntos): a esa distancia, incluso un corredor angosto de 200m de ancho ya requiere del orden de 400 millones de celdas (~1.6GB adicionales), y el costo de procesamiento por ciclo crece con el tamaño TOTAL del mapa acumulado durante todo el viaje, no con la distancia restante al checkpoint. D* Lite en sí mismo no es el cuello de botella (sus estructuras `g`/`rhs` son diccionarios dispersos que escalan con el camino buscado, no con el mapa completo) — el límite está en la infraestructura de `persistent_map_node` alrededor de él. Ver sección 9 (Roadmap) para el diseño propuesto que resuelve esto.
+7. **Límite de Escala del Mapa Persistente (grilla densa):** `persistent_map_node` usa hoy una grilla densa de tamaño fijo (400m x 400m @ 0.20m/px = 4 millones de celdas, ~1.6GB en RAM como float32). El decaimiento (`_decay_timer_cb`) y el diff de costos (`_on_map`) procesan la grilla COMPLETA en cada ciclo, sin importar cuánto del mapa esté realmente cerca del rover en ese momento. Esto es adecuado para el área de una competencia (cientos de metros), pero NO escala a trayectos largos (por ejemplo, 80km entre dos puntos): a esa distancia, incluso un corredor angosto de 200m de ancho ya requiere del orden de 400 millones de celdas (~1.6GB adicionales), y el costo de procesamiento por ciclo crece con el tamaño TOTAL del mapa acumulado durante todo el viaje, no con la distancia restante al checkpoint. D* Lite en sí mismo no es el cuello de botella (sus estructuras `g`/`rhs` son diccionarios dispersos que escalan con el camino buscado, no con el mapa completo) — el límite está en la infraestructura de `persistent_map_node` alrededor de él. Ver sección 10 (Roadmap) para el diseño propuesto que resuelve esto.
 
 ---
 
-## 9. Próximos Módulos y Roadmap
+## 9. Estado de Integración y Validación
 
-- [ ] **Integración de `earth_rover/global_path` en el Controlador de Navegación:** Conectar la trayectoria global generada por D* Lite con el bucle de control de `gps_waypoint_controller` para guiar la búsqueda de trayectorias locales hacia sub-metas intermedias en lugar de únicamente la meta geodésica directa.
+### 9.1. Integrado a la Misión de Producción
+Al ejecutar `ros2 launch er_bringup mission1.launch.py` con `enable_global_planning:=true` (valor por defecto), los siguientes componentes corren de forma orquestada:
+- **`earth_rover_bridge`**: Ingesta de video MJPEG ($1024 \times 576$), telemetría GNSS cruda, IMU MPU-6050, odometría de ruedas, rumbo magnético y envío de `cmd_vel` al servidor SDK.
+- **`mini_plus_localization`**: EKF dual (`odometry/local`, `odometry/global`), proyección geodésica `/fromLL` y bridge de rumbo REP-105.
+- **`bev_planner_node`**: Inferencia de transitabilidad SAM-TP, proyección BEV local ($0.03\text{ m/px}$), banco de caminos GeNIE y cálculo de sub-meta global con fallback automático a rumbo geodésico.
+- **`persistent_map_node`** *(activado por `enable_global_planning:=true`)*: Acumulación Bayesiana de evidencia en marco `map` ($400\text{ m} \times 400\text{ m}$ @ $0.20\text{ m/px}$) con decaimiento temporal periódico ($0.7738$ cada $5\text{ s}$).
+- **`global_planner_node`** *(activado por `enable_global_planning:=true`)*: Planificación global incremental D* Lite sobre el mapa persistente, publicando `earth_rover/global_path` y estado de validez.
+- **`gps_waypoint_controller`**: Seguimiento de trayectorias locales (`earth_rover/planned_path`), guard de frescura GNSS, control de avance/giro con máquina de estados *Burst & Wait* y detección de llegada a checkpoint.
+- **`mission_manager_node`**: Orquestador de checkpoints y sincronización de protocolo HTTP asíncrono con el backend de la competencia.
+
+*(Si se pasa `enable_global_planning:=false`, los nodos `persistent_map_node` y `global_planner_node` no se ejecutan y `bev_planner_node` opera de forma puramente local con rumbo geodésico directo).*
+
+### 9.2. Estado de Validación por Nivel de Confianza
+
+Para no mezclar niveles de certeza técnica, el estado de cada componente se divide estrictamente según el tipo de evidencia existente:
+
+#### A) Revisión de Código y Derivación Analítica (Matemática Verificada)
+- **Orientación geométrica de `local_bev_grid`:** Derivación formal de la transformación matricial $90^\circ$ e inversión de ejes hacia la convención REP-103 en `base_link` ($+X$ adelante, $+Y$ izquierda).
+- **Transformación de sub-meta global a local en `bev_planner_node`:** Verificada analíticamente con ejemplos numéricos de cálculo trigonométrico (ángulos a $45^\circ$, $135^\circ$ y distancias métricas hacia adelante/lateral).
+- **Lógica de fallback *Fail-Open* en `bev_planner_node`:** Revisión exhaustiva de código que garantiza que si el path global no está disponible o expira, el planificador local calcula automáticamente el rumbo geodésico directo sin bloquear el hilo.
+
+#### B) Verificado con Pruebas Unitarias / Escenarios Sintéticos (Sin Hardware Real)
+- **Test de obstáculo asimétrico:** Validación programática de la matriz de `local_bev_grid` confirmando que un obstáculo a la izquierda no se proyecta a la derecha.
+- **Rendimiento de `persistent_map_node`:** Tiempo de procesamiento de `_on_map` medido en ~17–74 ms sobre una grilla densa sintética ($400\text{ m} \times 400\text{ m}$). Decaimiento Bayesiano verificado con pruebas de expiración de evidencia.
+- **Algoritmo D\* Lite (`global_planner_node`):** Verificado en grillas sintéticas con obstáculos simulados dinámicamente; tiempo de ciclo incremental acotado por `max_vertex_updates_per_cycle`.
+- **Comportamiento en `global_map_test.launch.py`:** En esta prueba aislada, al no haber cámara física ni stream de video real conectado, `bev_planner_node` solo instanció sus suscriptores/publicadores pero no ejecutó su bucle interno de inferencia visual.
+
+#### C) Validado con Datos Reales del Hardware
+- **Bridge SDK (`earth_rover_bridge`):** Conexión HTTP REST, WebSockets y recepción de streams MJPEG reales ($1024 \times 576$) y telemetría de sensores desde el servidor SDK.
+- **Inferencia SAM-TP en CPU:** Latencia real medida de $4.0\text{ s}$ a $5.5\text{ s}$ por frame sobre procesador x86 sin GPU.
+
+#### D) ⚠️ LO QUE NUNCA SE CORRIÓ CON DATOS REALES (Declaración Explícita)
+- **Misión de punta a punta con cámara real:** El pipeline integrado completo (cámara en vivo + SAM-TP + mapa persistente + D* Lite + sub-meta + controlador motriz) **NUNCA se corrió en una misión real de punta a punta con el rover en movimiento**.
+- **Dinámicas y latencias del controlador:** Los números de inercia del chasis, constantes de tiempo de giro y latencia de red 4G del controlador son sintéticos y basados en emulación, no en una corrida real en terreno.
+
+### 9.3. Pendiente Antes de Confiar en Competencia Real
+Orden de prioridad técnica estricto:
+1. **Corrida real de punta a punta:** Ejecutar una misión completa con el rover físico y cámara real conectando todo el stack con `enable_global_planning:=true` para verificar estabilidad de memoria RAM, carga de CPU/GPU y respuesta ante obstáculos del mundo real.
+2. **Identificación de sistema (System ID) con datos reales del rover:** Registrar y procesar un rosbag de telemetría real (`earth_rover/control_debug`, `earth_rover/bridge_debug`, `/imu/data`, `/wheel_odom`, `gps/filtered`) para calibrar tiempos de respuesta motriz, latencia real del enlace 4G/WebSockets y parámetros de *Burst & Wait* (`turn_burst_s`, `pause_after_turn_s`).
+3. **Confirmar estado de aceleración GPU:** Confirmar si el entorno de ejecución cuenta con GPU dedicada operativa (NVIDIA Passthrough / CUDA); de lo contrario, en CPU persiste la latencia de 4.0–5.5 s por frame en SAM-TP.
+
+---
+
+## 10. Próximos Módulos y Roadmap
+
+- [x] **Integración de `earth_rover/global_path` como sub-meta en `bev_planner_node` y `mission1.launch.py`:** Conectado mediante proyección de sub-meta local (`global_lookahead_distance_m`), fallback geodésico (*Fail-Open*) y flag configurable `enable_global_planning`.
 - [ ] **Arquitectura de Tres Niveles Jerárquicos para Trayectos Largos (ej. 80km entre dos ciudades/universidades):** reemplazar la grilla densa de tamaño fijo de `persistent_map_node` por una ventana local rodante ("rolling window") de tamaño constante (cientos de metros) que se re-centra alrededor de la posición actual del rover, descartando lo que queda muy atrás — acota memoria y cómputo a un tamaño constante sin importar la distancia total del viaje (mismo patrón que el "rolling_window" del costmap global de Nav2). Para la decisión de "por qué calles ir" a lo largo de todo el trayecto, se necesita además un nivel superior de ruteo vial basado en un grafo de calles (tipo OSRM/OpenStreetMap) que entregue una secuencia de waypoints/tramos intermedios — una grilla de celdas no es la representación adecuada para decisiones a escala de kilómetros. Con esto, el sistema queda en tres niveles: (1) ruteo vial por grafo (kilómetros), (2) mapa persistente + D* Lite en ventana rodante (cientos de metros, entre waypoints intermedios) — lo que existe hoy —, y (3) planificador local reactivo BEV (4m, ya implementado en `bev_planner_node`). Fuera de alcance de la competencia actual; queda documentado para una fase posterior.
 - [ ] **Validación End-to-End con Servidor GPU Remoto:** Despliegue del nodo de inferencia en estación base remota y transmisión de trayectorias planificadas comprimidas vía DDS/ZeroMQ.
 - [ ] **Evasión Reactiva Lateral Fina (Wall Following):** Integración de control de contorno lateral en pasillos estrechos cuando ambos lados presentan obstáculos cercanos.
