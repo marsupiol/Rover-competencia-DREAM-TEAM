@@ -10,6 +10,7 @@ lógica de confianza Bayesiana acumulativa y decaimiento exponencial periódico.
 from __future__ import annotations
 
 import math
+import os
 import threading
 
 import numpy as np
@@ -47,6 +48,8 @@ class PersistentMapNode(Node):
         self.declare_parameter("decay_factor", 0.7738)
         self.declare_parameter("map_publish_period_s", 1.0)
         self.declare_parameter("tf_lookup_timeout_s", 0.2)
+        self.declare_parameter("seed_map_path", "")
+        self.declare_parameter("seed_confidence_scale", 0.3)
 
         local_grid_topic = str(self.get_parameter("local_grid_topic").value)
         map_topic = str(self.get_parameter("map_topic").value)
@@ -72,6 +75,8 @@ class PersistentMapNode(Node):
         self.decay_factor = float(self.get_parameter("decay_factor").value)
         self.map_publish_period_s = float(self.get_parameter("map_publish_period_s").value)
         self.tf_lookup_timeout_s = float(self.get_parameter("tf_lookup_timeout_s").value)
+        self.seed_map_path = str(self.get_parameter("seed_map_path").value).strip()
+        self.seed_confidence_scale = float(self.get_parameter("seed_confidence_scale").value)
 
         # ----------------------------------------------------------------------
         # 2. Inicialización de la Grilla de Confianza Persistente
@@ -82,6 +87,10 @@ class PersistentMapNode(Node):
         # Grilla float32: >0 = evidencia ocupada, <0 = evidencia libre, 0 = desconocido
         self._lock = threading.Lock()
         self._confidence = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
+
+        # Precarga opcional de mapa semilla (OSM prior de baja/moderada confianza)
+        if self.seed_map_path:
+            self._load_seed_map(self.seed_map_path)
 
         # ----------------------------------------------------------------------
         # 3. Transform Buffer y QoS
@@ -112,6 +121,60 @@ class PersistentMapNode(Node):
         self.get_logger().info(
             f"PersistentMapNode inicializado | Mapa: {self.map_width_m}x{self.map_height_m}m "
             f"({self.grid_w}x{self.grid_h} px @ {self.map_resolution}m/px) | Frame: {self.map_frame}"
+        )
+
+    def _load_seed_map(self, path: str) -> None:
+        """
+        Carga un mapa semilla (.npy) como prior de confianza moderada en el mapa persistente.
+
+        Lógica de Carga y Validación (Parte B):
+          1. Fail Open: Si el archivo no existe o falla la lectura, se loggea WARNING y se continúa con grilla en 0.
+          2. Validación de Shape: Si las dimensiones no coinciden exactamente con (grid_h, grid_w),
+             se loggea ERROR y se descarta (se inicia en 0) para evitar desalineación espacial.
+          3. Escalado de Confianza: self._confidence = seed_array * self.seed_confidence_scale.
+
+        Ejemplo Numérico:
+          - Vereda generada en Parte A: raw_confidence = -80.0 (terreno libre/transitable).
+          - Con seed_confidence_scale = 0.3:
+              confianza_inicial = -80.0 * 0.3 = -24.0.
+          - Comparación con umbrales:
+              - free_threshold = -20.0 -> -24.0 <= -20.0 (transitable con costo óptimo 1.0 en D* Lite).
+              - Lejos de saturación (-100.0). Solo 2-3 observaciones de obstáculo de la cámara
+                (+15 cada una: -24 + 15 + 15 = +6 > 0) revierten la evidencia si la vereda está bloqueada.
+        """
+        if not os.path.isfile(path):
+            self.get_logger().warn(
+                f"Mapa semilla no encontrado en '{path}'. "
+                "Iniciando con grilla de confianza en cero (fail open)."
+            )
+            return
+
+        try:
+            seed_array = np.load(path)
+        except Exception as exc:
+            self.get_logger().warn(
+                f"Fallo al cargar archivo de mapa semilla '{path}': {exc}. "
+                "Iniciando con grilla en cero (fail open)."
+            )
+            return
+
+        expected_shape = (self.grid_h, self.grid_w)
+        if seed_array.shape != expected_shape:
+            self.get_logger().error(
+                f"Dimensiones del mapa semilla {seed_array.shape} no coinciden con la grilla "
+                f"esperada {expected_shape}. Mapa semilla descartado (iniciando en cero)."
+            )
+            return
+
+        scaled_seed = (seed_array * self.seed_confidence_scale).astype(np.float32)
+        np.clip(scaled_seed, -self.confidence_max, self.confidence_max, out=scaled_seed)
+        self._confidence = scaled_seed
+
+        n_loaded_free = int(np.count_nonzero(self._confidence <= self.free_threshold))
+        n_loaded_occ = int(np.count_nonzero(self._confidence >= self.occupied_threshold))
+        self.get_logger().info(
+            f"Mapa semilla precargado exitosamente desde '{path}' "
+            f"(escala={self.seed_confidence_scale:.2f}, celdas_libres={n_loaded_free}, celdas_ocupadas={n_loaded_occ})."
         )
 
     # --------------------------------------------------------------------------

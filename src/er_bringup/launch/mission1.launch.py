@@ -1,7 +1,9 @@
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, TimerAction, LogInfo
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, TimerAction
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import os
 import sys
@@ -36,7 +38,22 @@ def generate_launch_description():
     # 1. Gestión de Entornos (Conda)
     node_env = conda_python_env()
 
-    # 2. Inclusión del EKF
+    # 2. Argumentos de Lanzamiento
+    enable_global_planning = LaunchConfiguration('enable_global_planning')
+    declare_enable_global_planning = DeclareLaunchArgument(
+        'enable_global_planning',
+        default_value='true',
+        description='Lanza persistent_map_node y global_planner_node junto a la misión',
+    )
+
+    seed_map_path = LaunchConfiguration('seed_map_path')
+    declare_seed_map_path = DeclareLaunchArgument(
+        'seed_map_path',
+        default_value='',
+        description='Ruta absoluta al mapa semilla .npy (vacio = sin precarga)',
+    )
+
+    # 3. Inclusión del EKF
     ekf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(mpl_dir, 'launch', 'ekf.launch.py')
@@ -81,6 +98,31 @@ def generate_launch_description():
         additional_env=node_env,
     )
 
+    # NODO: Mapa Persistente Global (Acumulador con Confianza y Decaimiento)
+    persistent_map_node = Node(
+        package='er_planning',
+        executable='persistent_map_node',
+        name='persistent_map_node',
+        output='screen',
+        parameters=[
+            os.path.join(er_planning_dir, 'config', 'persistent_map_params.yaml'),
+            {'seed_map_path': seed_map_path},
+        ],
+        condition=IfCondition(enable_global_planning),
+        additional_env=node_env,
+    )
+
+    # NODO: Planificación Global Incremental D* Lite
+    global_planner_node = Node(
+        package='er_planning',
+        executable='global_planner_node',
+        name='global_planner_node',
+        output='screen',
+        parameters=[os.path.join(er_planning_dir, 'config', 'global_planner_params.yaml')],
+        condition=IfCondition(enable_global_planning),
+        additional_env=node_env,
+    )
+
     navigation_node = Node(
         package='er_navigation',
         executable='gps_waypoint_controller',
@@ -104,12 +146,16 @@ def generate_launch_description():
     # GRAFO DE EJECUCIÓN ORQUESTADO (Fases)
     # ==========================================================
     return LaunchDescription([
+        declare_enable_global_planning,
+        declare_seed_map_path,
         LogInfo(msg="[FASE 1] Inicializando Hardware SDK, Filtros EKF y Planificador BEV (PyTorch/GeNIE)..."),
         
         # Arrancan de inmediato:
         bridge_node,
         ekf_launch,
         planner_node,
+        persistent_map_node,
+        global_planner_node,
 
         # Arrancan con retraso de 5 segundos para evitar la saturación de CPU de PyTorch:
         TimerAction(

@@ -26,3 +26,7 @@ persistent_map_node:
     decay_factor: 0.7738   # = 0.95^5, preserva la misma constante de tiempo efectiva (~12s de olvido)
     map_publish_period_s: 1.0
     tf_lookup_timeout_s: 0.2
+
+    # --- PRECARGA DE PRIOR OSM (MAPA SEMILLA) ---
+    seed_map_path: ""              # Vacío = sin precarga, comportamiento original sin cambios
+    seed_confidence_scale: 0.3     # Fracción de confidence_max — confianza moderada, no máxima
