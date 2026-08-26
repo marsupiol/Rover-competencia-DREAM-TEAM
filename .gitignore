@@ -6,4 +6,8 @@ log/
 __pycache__/
 *.pyc
 *.pyo
+tools/osm_seed/cache/
+.env
+*.env
+src/sdk_server/.env
 
