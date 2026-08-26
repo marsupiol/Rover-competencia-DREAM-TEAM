@@ -13,4 +13,5 @@ services:
     volumes:
       # Montá tu .env real con credenciales (no se versiona ni se copia a la imagen).
       - ./src/sdk_server/.env:/root/ros2_ws/src/sdk_server/.env:ro
+      - ./src:/root/ros2_ws/src
     restart: unless-stopped

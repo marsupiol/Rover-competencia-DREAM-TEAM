@@ -11,3 +11,14 @@ tools/osm_seed/cache/
 *.env
 src/sdk_server/.env
 
+# Local memory and workspace files
+MEMORY.md
+AGENTS.md
+GEMINI.md
+SOUL.md
+IDENTITY.md
+USER.md
+TOOLS.md
+HEARTBEAT.md
+scratch/
+*.save

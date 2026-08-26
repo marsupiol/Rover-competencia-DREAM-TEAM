@@ -1,4 +1,4 @@
-FROM osrf/ros:jazzy-ros-base
+FROM ros:jazzy-ros-base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -21,19 +21,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc
 
 WORKDIR /root/ros2_ws
+ 
+# 1. Copiar manifiestos de dependencias Python (SDK e IA)
+COPY src/sdk_server/requirements.txt src/sdk_server/requirements.txt
+COPY requirements-ai.txt requirements-ai.txt
 
-# Copiar todo el workspace
+# 2. Copiar código fuente de submódulos requeridos para instalación editable (-e)
+COPY src/third_party/sana-earth-rover-policy/ src/third_party/sana-earth-rover-policy/
+
+# 3. Instalar dependencias Python del SDK y stack de IA
+RUN pip3 install --break-system-packages -r src/sdk_server/requirements.txt
+RUN pip3 install --break-system-packages -r requirements-ai.txt
+RUN pip3 install --break-system-packages --no-build-isolation \
+    -e src/third_party/sana-earth-rover-policy/genie
+RUN pip3 install --break-system-packages -e \
+    'src/third_party/sana-earth-rover-policy/traversability[hf]'
+
+# 4. Copiar todo el workspace de ROS 2
 COPY . /root/ros2_ws
 
-# Instalar dependencias Python del SDK
-RUN pip3 install --upgrade pip setuptools && \
-    pip3 install -r src/sdk_server/requirements.txt
-
-# Inicializar rosdep y resolver dependencias del workspace antes de compilar
+# 5. Inicializar rosdep y resolver dependencias del workspace antes de compilar
 RUN rosdep update || true
 RUN rosdep install --from-paths src --ignore-src -r -y || true
 
-# Construir el workspace
+# 6. Construir el workspace
 RUN /bin/bash -lc "source /opt/ros/jazzy/setup.bash && colcon build --symlink-install"
 
 # Exponer puerto del SDK (Hypercorn) y cualquier puerto ROS que quieras mapear

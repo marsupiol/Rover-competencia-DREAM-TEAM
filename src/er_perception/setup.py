@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'traversability_node = er_perception.traversability_node:main',
+            'test_image_publisher = er_perception.test_image_publisher:main',
         ],
     },
 )
