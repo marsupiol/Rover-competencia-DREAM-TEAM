@@ -3,15 +3,24 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: dream-team/mini-plus-rover:jazzy
+    image: dream-team/mini-plus-rover:jazzy-gpu
     container_name: mini_plus_rover
     environment:
       # full | ekf | bridge  (ver comentarios en entrypoint.sh)
       ROVER_MODE: "full"
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
     ports:
       - "8000:8000"
     volumes:
       # Montá tu .env real con credenciales (no se versiona ni se copia a la imagen).
       - ./src/sdk_server/.env:/root/ros2_ws/src/sdk_server/.env:ro
       - ./src:/root/ros2_ws/src
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
