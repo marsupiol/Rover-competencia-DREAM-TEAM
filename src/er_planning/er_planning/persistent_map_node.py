@@ -22,6 +22,8 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 import tf2_ros
 
+from er_planning.rolling_window import RollingWindowGrid
+
 
 class PersistentMapNode(Node):
     def __init__(self):
@@ -50,6 +52,10 @@ class PersistentMapNode(Node):
         self.declare_parameter("tf_lookup_timeout_s", 0.2)
         self.declare_parameter("seed_map_path", "")
         self.declare_parameter("seed_confidence_scale", 0.3)
+        self.declare_parameter("rolling_window_enabled", True)
+        self.declare_parameter("recenter_threshold_m", 100.0)
+        self.declare_parameter("recenter_check_period_s", 1.0)
+        self.declare_parameter("base_frame", "base_link")
 
         local_grid_topic = str(self.get_parameter("local_grid_topic").value)
         map_topic = str(self.get_parameter("map_topic").value)
@@ -77,16 +83,25 @@ class PersistentMapNode(Node):
         self.tf_lookup_timeout_s = float(self.get_parameter("tf_lookup_timeout_s").value)
         self.seed_map_path = str(self.get_parameter("seed_map_path").value).strip()
         self.seed_confidence_scale = float(self.get_parameter("seed_confidence_scale").value)
+        self.rolling_window_enabled = bool(self.get_parameter("rolling_window_enabled").value)
+        self.recenter_threshold_m = float(self.get_parameter("recenter_threshold_m").value)
+        self.recenter_check_period_s = float(self.get_parameter("recenter_check_period_s").value)
+        self.base_frame = str(self.get_parameter("base_frame").value)
 
         # ----------------------------------------------------------------------
-        # 2. Inicialización de la Grilla de Confianza Persistente
+        # 2. Inicialización de la Grilla de Confianza Persistente (ventana rodante)
         # ----------------------------------------------------------------------
-        self.grid_w = max(1, int(round(self.map_width_m / self.map_resolution)))
-        self.grid_h = max(1, int(round(self.map_height_m / self.map_resolution)))
-
-        # Grilla float32: >0 = evidencia ocupada, <0 = evidencia libre, 0 = desconocido
         self._lock = threading.Lock()
-        self._confidence = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
+        self._grid = RollingWindowGrid(
+            width_m=self.map_width_m,
+            height_m=self.map_height_m,
+            resolution_m_per_px=self.map_resolution,
+            origin_x=self.map_origin_x,
+            origin_y=self.map_origin_y,
+        )
+        self.grid_w = self._grid.grid_w
+        self.grid_h = self._grid.grid_h
+        self._window_initialized = False
 
         # Precarga opcional de mapa semilla (OSM prior de baja/moderada confianza)
         if self.seed_map_path:
@@ -117,10 +132,16 @@ class PersistentMapNode(Node):
         # ----------------------------------------------------------------------
         self.decay_timer = self.create_timer(self.decay_period_s, self._decay_timer_cb)
         self.publish_timer = self.create_timer(self.map_publish_period_s, self._publish_timer_cb)
+        if self.rolling_window_enabled:
+            self.recenter_timer = self.create_timer(
+                self.recenter_check_period_s, self._recenter_timer_cb
+            )
 
+        rolling_mode = "rolling_window" if self.rolling_window_enabled else "fixed_origin"
         self.get_logger().info(
             f"PersistentMapNode inicializado | Mapa: {self.map_width_m}x{self.map_height_m}m "
-            f"({self.grid_w}x{self.grid_h} px @ {self.map_resolution}m/px) | Frame: {self.map_frame}"
+            f"({self.grid_w}x{self.grid_h} px @ {self.map_resolution}m/px) | "
+            f"Frame: {self.map_frame} | Modo: {rolling_mode}"
         )
 
     def _load_seed_map(self, path: str) -> None:
@@ -168,10 +189,10 @@ class PersistentMapNode(Node):
 
         scaled_seed = (seed_array * self.seed_confidence_scale).astype(np.float32)
         np.clip(scaled_seed, -self.confidence_max, self.confidence_max, out=scaled_seed)
-        self._confidence = scaled_seed
+        self._grid.confidence = scaled_seed
 
-        n_loaded_free = int(np.count_nonzero(self._confidence <= self.free_threshold))
-        n_loaded_occ = int(np.count_nonzero(self._confidence >= self.occupied_threshold))
+        n_loaded_free = int(np.count_nonzero(self._grid.confidence <= self.free_threshold))
+        n_loaded_occ = int(np.count_nonzero(self._grid.confidence >= self.occupied_threshold))
         self.get_logger().info(
             f"Mapa semilla precargado exitosamente desde '{path}' "
             f"(escala={self.seed_confidence_scale:.2f}, celdas_libres={n_loaded_free}, celdas_ocupadas={n_loaded_occ})."
@@ -276,9 +297,13 @@ class PersistentMapNode(Node):
         x_map = tx + x_local * cos_yaw - y_local * sin_yaw
         y_map = ty + x_local * sin_yaw + y_local * cos_yaw
 
+        with self._lock:
+            origin_x = self._grid.origin_x
+            origin_y = self._grid.origin_y
+
         # 5. Mapeo a índices discretos de la grilla persistente
-        map_cols = np.floor((x_map - self.map_origin_x) / self.map_resolution).astype(np.int32)
-        map_rows = np.floor((y_map - self.map_origin_y) / self.map_resolution).astype(np.int32)
+        map_cols = np.floor((x_map - origin_x) / self.map_resolution).astype(np.int32)
+        map_rows = np.floor((y_map - origin_y) / self.map_resolution).astype(np.int32)
 
         # 6. Filtrado de límites del mapa
         in_bounds = (
@@ -325,9 +350,68 @@ class PersistentMapNode(Node):
         deltas_unique = np.where(is_hit_unique, self.hit_gain, -self.miss_gain).astype(np.float32)
 
         with self._lock:
-            # Los índices son únicos por construcción mediante np.unique, fancy indexing directo es seguro
-            self._confidence[uniq_rows, uniq_cols] += deltas_unique
-            np.clip(self._confidence, -self.confidence_max, self.confidence_max, out=self._confidence)
+            confidence = self._grid.confidence
+            confidence[uniq_rows, uniq_cols] += deltas_unique
+            np.clip(confidence, -self.confidence_max, self.confidence_max, out=confidence)
+
+        if self.rolling_window_enabled and not self._window_initialized:
+            self._initialize_window_center(tx, ty)
+
+    def _lookup_rover_map_xy(self) -> tuple[float, float] | None:
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                Time(),
+                timeout=Duration(seconds=self.tf_lookup_timeout_s),
+            )
+            return (
+                float(tf_msg.transform.translation.x),
+                float(tf_msg.transform.translation.y),
+            )
+        except Exception:
+            return None
+
+    def _initialize_window_center(self, rover_x: float, rover_y: float) -> None:
+        with self._lock:
+            if self._window_initialized:
+                return
+            self._grid.set_center(rover_x, rover_y)
+            self.map_origin_x = self._grid.origin_x
+            self.map_origin_y = self._grid.origin_y
+            self._window_initialized = True
+        self.get_logger().info(
+            f"Ventana rodante inicializada en ({rover_x:.1f}m, {rover_y:.1f}m) | "
+            f"origen=({self.map_origin_x:.1f}, {self.map_origin_y:.1f})"
+        )
+
+    def _recenter_timer_cb(self):
+        if not self.rolling_window_enabled:
+            return
+
+        pose = self._lookup_rover_map_xy()
+        if pose is None:
+            return
+
+        rover_x, rover_y = pose
+        shifted = False
+        with self._lock:
+            if not self._window_initialized:
+                self._grid.set_center(rover_x, rover_y)
+                self._window_initialized = True
+            else:
+                shifted = self._grid.maybe_recenter(
+                    rover_x, rover_y, self.recenter_threshold_m
+                )
+            self.map_origin_x = self._grid.origin_x
+            self.map_origin_y = self._grid.origin_y
+            shift_count = self._grid.shift_count
+
+        if shifted:
+            self.get_logger().info(
+                f"Ventana rodante re-centrada #{shift_count} en ({rover_x:.1f}m, {rover_y:.1f}m) | "
+                f"nuevo origen=({self.map_origin_x:.1f}, {self.map_origin_y:.1f})"
+            )
 
     # --------------------------------------------------------------------------
     # Temporizador de Decaimiento Exponencial
@@ -355,7 +439,7 @@ class PersistentMapNode(Node):
                  y el mismo tiempo de olvido (~12s), pero reducen el churn de diffs en D* Lite por un factor de 5x.
         """
         with self._lock:
-            self._confidence *= np.float32(self.decay_factor)
+            self._grid.confidence *= np.float32(self.decay_factor)
 
     # --------------------------------------------------------------------------
     # Temporizador de Publicación del Mapa Persistente
@@ -387,7 +471,9 @@ class PersistentMapNode(Node):
           Una celda confirmada ocupada (confidence >= +55) publica valores en el rango [78, 100].
         """
         with self._lock:
-            grid_copy = self._confidence.copy()
+            self.map_origin_x = self._grid.origin_x
+            self.map_origin_y = self._grid.origin_y
+            grid_copy = self._grid.confidence.copy()
 
         abs_conf = np.abs(grid_copy)
         unknown_mask = abs_conf < self.unknown_evidence_band

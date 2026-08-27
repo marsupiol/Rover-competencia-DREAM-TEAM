@@ -9,7 +9,8 @@
 # todavía el comportamiento de navegación respecto a la Opción A.
 set -e
 
-ROOT_DIR="/root/ros2_ws"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${ROOT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PID_DIR="$ROOT_DIR/.mission1_pids"
 mkdir -p "$PID_DIR"
 
@@ -33,7 +34,9 @@ if ! grep -qE "^MISSION_SLUG=" "$ROOT_DIR/src/sdk_server/.env"; then
 fi
 
 echo "=== 2. Iniciando SDK ==="
-source "$ROOT_DIR/.venv/bin/activate"
+if [ -f "$ROOT_DIR/.venv/bin/activate" ]; then
+    source "$ROOT_DIR/.venv/bin/activate"
+fi
 cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR/src/sdk_server:$PYTHONPATH"
 python3 "$ROOT_DIR/run_sdk.py" &

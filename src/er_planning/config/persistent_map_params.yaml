@@ -27,6 +27,12 @@ persistent_map_node:
     map_publish_period_s: 1.0
     tf_lookup_timeout_s: 0.2
 
+    # --- VENTANA RODANTE (ROLLING WINDOW) ---
+    rolling_window_enabled: true
+    recenter_threshold_m: 100.0   # Re-centra cuando el rover se aleja >100m del centro
+    recenter_check_period_s: 1.0
+    base_frame: "base_link"
+
     # --- PRECARGA DE PRIOR OSM (MAPA SEMILLA) ---
     seed_map_path: ""              # Vacío = sin precarga, comportamiento original sin cambios
     seed_confidence_scale: 0.3     # Fracción de confidence_max — confianza moderada, no máxima

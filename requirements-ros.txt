@@ -10,9 +10,15 @@
 # (osrf/ros:jazzy-ros-base) and must be installed via pip.
 # ==============================================================================
 
+# ROS 2 Build Tooling (Required by ament_cmake when built within Conda/Virtual Environments)
+catkin_pkg>=1.0.0
+empy>=3.3.4
+lark>=1.1.9
+
 # ASGI Web Framework & Server (src/sdk_server)
 fastapi==0.111.1
 Hypercorn==0.17.3
+uvicorn==0.30.1
 pydantic==2.8.2
 starlette==0.37.2
 wsproto==1.2.0

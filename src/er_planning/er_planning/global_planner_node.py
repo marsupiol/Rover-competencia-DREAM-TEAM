@@ -248,8 +248,24 @@ class GlobalPlannerNode(Node):
             new_costs[inflated_binary] = float("inf")
 
         num_diff = 0
+        origin_changed = False
         with self._lock:
             old_costs = self._cell_costs
+            old_orig_x = self._map_orig_x
+            old_orig_y = self._map_orig_y
+            old_w = self._map_w
+            old_h = self._map_h
+
+            origin_changed = (
+                old_costs is not None
+                and (
+                    abs(orig_x - old_orig_x) > 1e-3
+                    or abs(orig_y - old_orig_y) > 1e-3
+                    or w != old_w
+                    or h != old_h
+                )
+            )
+
             self._map_data = raw_data
             self._map_w = w
             self._map_h = h
@@ -258,9 +274,14 @@ class GlobalPlannerNode(Node):
             self._map_orig_y = orig_y
             self._cell_costs = new_costs
 
-            # Si D* Lite está activo y hubo un mapa previo, reparar los vértices modificados
-            # NOTA CRÍTICA: El diff se compara DESPUÉS de la inflación (Fase 2.C).
-            if (
+            if origin_changed:
+                self.get_logger().info(
+                    f"Mapa persistente desplazado (origen {old_orig_x:.1f},{old_orig_y:.1f} -> "
+                    f"{orig_x:.1f},{orig_y:.1f}) — reiniciando D* Lite",
+                    throttle_duration_sec=2.0,
+                )
+                self._reset_dstar_lite()
+            elif (
                 self._s_goal is not None
                 and old_costs is not None
                 and old_costs.shape == new_costs.shape

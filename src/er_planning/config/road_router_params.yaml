@@ -1,0 +1,13 @@
+road_router_node:
+  ros__parameters:
+    mission_target_topic: "earth_rover/target_waypoint"
+    routing_waypoint_topic: "earth_rover/routing_waypoint"
+    routing_active_topic: "earth_rover/routing_active"
+    gps_topic: "gps/filtered"
+    osrm_base_url: "https://router.project-osrm.org"
+    osrm_profile: "foot"
+    long_route_threshold_m: 500.0
+    segment_spacing_m: 150.0
+    advance_radius_m: 40.0
+    route_refresh_period_s: 2.0
+    http_timeout_s: 15.0

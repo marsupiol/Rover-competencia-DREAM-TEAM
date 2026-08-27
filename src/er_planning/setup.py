@@ -27,6 +27,7 @@ setup(
             'bev_planner_node = er_planning.bev_planner_node:main',
             'persistent_map_node = er_planning.persistent_map_node:main',
             'global_planner_node = er_planning.global_planner_node:main',
+            'road_router_node = er_planning.road_router_node:main',
         ],
     },
 )

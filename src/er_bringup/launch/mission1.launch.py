@@ -1,9 +1,9 @@
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, TimerAction
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 import os
 import sys
@@ -44,6 +44,13 @@ def generate_launch_description():
         'enable_global_planning',
         default_value='true',
         description='Lanza persistent_map_node y global_planner_node junto a la misión',
+    )
+
+    enable_road_routing = LaunchConfiguration('enable_road_routing')
+    declare_enable_road_routing = DeclareLaunchArgument(
+        'enable_road_routing',
+        default_value='false',
+        description='Lanza road_router_node (ruteo vial OSRM nivel 1) y usa routing_waypoint en planificadores',
     )
 
     seed_map_path = LaunchConfiguration('seed_map_path')
@@ -95,6 +102,7 @@ def generate_launch_description():
         name='bev_planner_node',
         output='screen',
         parameters=[os.path.join(er_planning_dir, 'config', 'planner_params.yaml')],
+        condition=UnlessCondition(enable_road_routing),
         additional_env=node_env,
     )
 
@@ -119,7 +127,49 @@ def generate_launch_description():
         name='global_planner_node',
         output='screen',
         parameters=[os.path.join(er_planning_dir, 'config', 'global_planner_params.yaml')],
-        condition=IfCondition(enable_global_planning),
+        condition=IfCondition(PythonExpression([
+            "'", enable_global_planning, "' == 'true' and '", enable_road_routing, "' != 'true'"
+        ])),
+        additional_env=node_env,
+    )
+
+    # NODO: Ruteo Vial por Grafo OSM/OSRM (Nivel 1 — trayectos largos)
+    road_router_node = Node(
+        package='er_planning',
+        executable='road_router_node',
+        name='road_router_node',
+        output='screen',
+        parameters=[os.path.join(er_planning_dir, 'config', 'road_router_params.yaml')],
+        condition=IfCondition(enable_road_routing),
+        additional_env=node_env,
+    )
+
+    # Cuando road routing está activo, los planificadores usan routing_waypoint
+    planner_with_routing = Node(
+        package='er_planning',
+        executable='bev_planner_node',
+        name='bev_planner_node',
+        output='screen',
+        parameters=[
+            os.path.join(er_planning_dir, 'config', 'planner_params.yaml'),
+            {'target_topic': 'earth_rover/routing_waypoint'},
+        ],
+        condition=IfCondition(enable_road_routing),
+        additional_env=node_env,
+    )
+
+    global_planner_with_routing = Node(
+        package='er_planning',
+        executable='global_planner_node',
+        name='global_planner_node',
+        output='screen',
+        parameters=[
+            os.path.join(er_planning_dir, 'config', 'global_planner_params.yaml'),
+            {'target_topic': 'earth_rover/routing_waypoint'},
+        ],
+        condition=IfCondition(PythonExpression([
+            "'", enable_global_planning, "' == 'true' and '", enable_road_routing, "' == 'true'"
+        ])),
         additional_env=node_env,
     )
 
@@ -147,6 +197,7 @@ def generate_launch_description():
     # ==========================================================
     return LaunchDescription([
         declare_enable_global_planning,
+        declare_enable_road_routing,
         declare_seed_map_path,
         LogInfo(msg="[FASE 1] Inicializando Hardware SDK, Filtros EKF y Planificador BEV (PyTorch/GeNIE)..."),
         
@@ -154,8 +205,11 @@ def generate_launch_description():
         bridge_node,
         ekf_launch,
         planner_node,
+        planner_with_routing,
         persistent_map_node,
         global_planner_node,
+        global_planner_with_routing,
+        road_router_node,
 
         # Arrancan con retraso de 5 segundos para evitar la saturación de CPU de PyTorch:
         TimerAction(

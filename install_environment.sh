@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Earth Rover Mini+ — Script de Instalación y Configuración del Entorno
+# ==============================================================================
+# Este script está dividido estrictamente en dos partes:
+# 1. Dependencias del Sistema General y ROS 2 Jazzy (Sistema / APT - usa sudo).
+# 2. Dependencias de Python, IA y Servidor SDK (Conda / pip).
+# ==============================================================================
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "$SCRIPT_DIR" && pwd)"
+
+echo "========================================================================"
+echo "  1. DEPENDENCIAS DEL SISTEMA GENERAL Y ROS 2 JAZZY (APT / SYSTEM)"
+echo "========================================================================"
+echo "Ejecutá los siguientes comandos en tu terminal de sistema para instalar"
+echo "las librerías base de C++, CMake y paquetes oficiales de ROS 2 Jazzy:"
+echo ""
+echo "------------------------------------------------------------------------"
+echo "sudo apt-get update && sudo apt-get install -y \\"
+echo "    python3-colcon-common-extensions \\"
+echo "    python3-rosdep \\"
+echo "    python3-catkin-pkg \\"
+echo "    python3-empy \\"
+echo "    build-essential \\"
+echo "    cmake \\"
+echo "    git \\"
+echo "    pkg-config \\"
+echo "    libopencv-dev \\"
+echo "    ros-jazzy-robot-localization \\"
+echo "    ros-jazzy-cv-bridge \\"
+echo "    ros-jazzy-tf2-ros \\"
+echo "    ros-jazzy-geographic-msgs \\"
+echo "    ros-jazzy-nav-msgs \\"
+echo "    ros-jazzy-sensor-msgs \\"
+echo "    ros-jazzy-geometry-msgs \\"
+echo "    ros-jazzy-std-msgs"
+echo "------------------------------------------------------------------------"
+echo ""
+
+echo "========================================================================"
+echo "  2. DEPENDENCIAS DE PYTHON E IA (CONDA / PIP)"
+echo "========================================================================"
+echo "Asegurate de estar dentro de tu entorno Conda activo (ej: conda activate rover)"
+echo "y ejecutá la siguiente secuencia de comandos:"
+echo ""
+echo "------------------------------------------------------------------------"
+echo "# A. Instalar PyTorch (Elegí según si tenés GPU NVIDIA o solo CPU):"
+echo "# Para GPU con CUDA 12.1+:"
+echo "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121"
+echo ""
+echo "# O para CPU:"
+echo "# pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu"
+echo ""
+echo "# B. Instalar librerías de Python para ROS, SDK Server e IA:"
+echo "pip install -r requirements-ros.txt -r requirements-ai.txt"
+echo ""
+echo "# C. Inicializar submódulos git e instalar políticas de IA en modo editable:"
+echo "git submodule update --init --recursive"
+echo "pip install -e ./src/third_party/sana-earth-rover-policy/genie \\"
+echo "            -e './src/third_party/sana-earth-rover-policy/traversability[hf]'"
+echo ""
+echo "# D. Instalar binarios de navegador para Playwright (WebRTC SDK Server):"
+echo "playwright install chromium"
+echo "------------------------------------------------------------------------"
+echo ""
+
+echo "========================================================================"
+echo "  3. COMPILACIÓN DEL WORKSPACE ROS 2"
+echo "========================================================================"
+echo "Una vez instaladas las dependencias de APT y Conda:"
+echo ""
+echo "source /opt/ros/jazzy/setup.bash"
+echo "colcon build"
+echo "source install/setup.bash"
+echo "========================================================================"
