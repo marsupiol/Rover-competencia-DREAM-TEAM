@@ -33,11 +33,27 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("http_logger")
 
 
+def get_bot_slug() -> Optional[str]:
+    raw = os.getenv("BOT_SLUG")
+    if not raw:
+        return None
+    cleaned = raw.strip().lower()
+    return cleaned if cleaned else None
+
+
+def get_mission_slug() -> Optional[str]:
+    raw = os.getenv("MISSION_SLUG")
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    return cleaned if cleaned else None
+
+
 async def warmup_browser_when_ready():
     # Hold off while mission gating applies: launching the headless browser
     # renders /sdk, which requires auth, and auth must not run before the
     # user calls /start-mission.
-    while os.getenv("MISSION_SLUG") and not auth_response_data:
+    while get_mission_slug() and not auth_response_data:
         await asyncio.sleep(2)
     await browser_service.warmup()
 
@@ -287,7 +303,7 @@ async def get_status():
             "browser_ready": browser_service.is_ready,
             "browser_error": browser_service.last_error,
             "mission_started": bool(auth_response_data)
-            or not os.getenv("MISSION_SLUG"),
+            or not get_mission_slug(),
             "rtm": await browser_service.rtm_health(),
             "video": video,
             **telemetry_hub.status(),
@@ -317,8 +333,8 @@ async def auth_common():
             return auth_response_data
 
         auth_header = os.getenv("SDK_API_TOKEN")
-        bot_slug = os.getenv("BOT_SLUG")
-        mission_slug = os.getenv("MISSION_SLUG")
+        bot_slug = get_bot_slug()
+        mission_slug = get_mission_slug()
 
         if not auth_header:
             raise HTTPException(
@@ -413,7 +429,7 @@ async def retrieve_tokens(headers, bot_slug):
 
 
 async def need_start_mission():
-    if not os.getenv("MISSION_SLUG"):
+    if not get_mission_slug():
         return
     if auth_response_data:
         return
@@ -433,8 +449,8 @@ async def checkpoints():
 async def get_checkpoints_list():
     global checkpoints_list_data
     auth_header = os.getenv("SDK_API_TOKEN")
-    bot_slug = os.getenv("BOT_SLUG")
-    mission_slug = os.getenv("MISSION_SLUG")
+    bot_slug = get_bot_slug()
+    mission_slug = get_mission_slug()
 
     if not mission_slug:
         return
@@ -482,13 +498,17 @@ async def auth():
 
 @app.post("/start-mission")
 async def start_mission():
-    required_env_vars = ["SDK_API_TOKEN", "BOT_SLUG", "MISSION_SLUG"]
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-
-    if missing_vars:
+    if not os.getenv("SDK_API_TOKEN") or not get_bot_slug() or not get_mission_slug():
+        missing = []
+        if not os.getenv("SDK_API_TOKEN"):
+            missing.append("SDK_API_TOKEN")
+        if not get_bot_slug():
+            missing.append("BOT_SLUG")
+        if not get_mission_slug():
+            missing.append("MISSION_SLUG")
         raise HTTPException(
             status_code=400,
-            detail=f"Missing required environment variables: {', '.join(missing_vars)}",
+            detail=f"Missing required environment variables: {', '.join(missing)}",
         )
 
     if not auth_response_data:
@@ -506,18 +526,22 @@ async def start_mission():
 
 @app.post("/end-mission")
 async def end_mission():
-    required_env_vars = ["SDK_API_TOKEN", "BOT_SLUG", "MISSION_SLUG"]
-    missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-
-    if missing_vars:
+    if not os.getenv("SDK_API_TOKEN") or not get_bot_slug() or not get_mission_slug():
+        missing = []
+        if not os.getenv("SDK_API_TOKEN"):
+            missing.append("SDK_API_TOKEN")
+        if not get_bot_slug():
+            missing.append("BOT_SLUG")
+        if not get_mission_slug():
+            missing.append("MISSION_SLUG")
         raise HTTPException(
             status_code=400,
-            detail=f"Missing required environment variables: {', '.join(missing_vars)}",
+            detail=f"Missing required environment variables: {', '.join(missing)}",
         )
 
     auth_header = os.getenv("SDK_API_TOKEN")
-    bot_slug = os.getenv("BOT_SLUG")
-    mission_slug = os.getenv("MISSION_SLUG")
+    bot_slug = get_bot_slug()
+    mission_slug = get_mission_slug()
 
     headers = {
         "Content-Type": "application/json",
@@ -613,9 +637,9 @@ async def get_index(request: Request):
         "botUid": tokens.get("BOT_UID") or "",
         "checkpointsList": checkpoints_list_data.get("checkpoints_list", []),
         "mapZoomLevel": int(os.getenv("MAP_ZOOM_LEVEL", "18")),
-        "botSlug": os.getenv("BOT_SLUG", ""),
-        "missionSlug": os.getenv("MISSION_SLUG", ""),
-        "missionStarted": bool(auth_response_data) or not os.getenv("MISSION_SLUG"),
+        "botSlug": get_bot_slug() or "",
+        "missionSlug": get_mission_slug() or "",
+        "missionStarted": bool(auth_response_data) or not get_mission_slug(),
         "bootNotice": str(boot_notice).replace("\n", " "),
     }
     template_vars = {
@@ -964,8 +988,8 @@ async def checkpoint_reached(request: Request):
     global auth_response_data, checkpoints_list_data
     await need_start_mission()
 
-    bot_slug = os.getenv("BOT_SLUG")
-    mission_slug = os.getenv("MISSION_SLUG")
+    bot_slug = get_bot_slug()
+    mission_slug = get_mission_slug()
     auth_header = os.getenv("SDK_API_TOKEN")
 
     if not all([bot_slug, mission_slug, auth_header]):
@@ -1061,7 +1085,7 @@ async def checkpoint_reached(request: Request):
 @app.get("/missions-history")
 async def missions_history():
     auth_header = os.getenv("SDK_API_TOKEN")
-    bot_slug = os.getenv("BOT_SLUG")
+    bot_slug = get_bot_slug()
 
     if not auth_header:
         raise HTTPException(status_code=500, detail="Authorization not configured")
@@ -1089,7 +1113,7 @@ async def missions_history():
 @app.get("/missions")
 async def missions():
     auth_header = os.getenv("SDK_API_TOKEN")
-    bot_slug = os.getenv("BOT_SLUG")
+    bot_slug = get_bot_slug()
 
     if not auth_header:
         raise HTTPException(
@@ -1201,7 +1225,7 @@ async def start_intervention(request: Request):
     await need_start_mission()
 
     auth_header = os.getenv("SDK_API_TOKEN")
-    bot_slug = os.getenv("BOT_SLUG")
+    bot_slug = get_bot_slug()
 
     if not auth_header:
         raise HTTPException(
@@ -1253,7 +1277,7 @@ async def end_intervention(request: Request):
     await need_start_mission()
 
     auth_header = os.getenv("SDK_API_TOKEN")
-    bot_slug = os.getenv("BOT_SLUG")
+    bot_slug = get_bot_slug()
 
     if not auth_header:
         raise HTTPException(
@@ -1300,7 +1324,7 @@ async def end_intervention(request: Request):
 @app.get("/interventions/history")
 async def interventions_history():
     auth_header = os.getenv("SDK_API_TOKEN")
-    bot_slug = os.getenv("BOT_SLUG")
+    bot_slug = get_bot_slug()
 
     if not auth_header:
         raise HTTPException(

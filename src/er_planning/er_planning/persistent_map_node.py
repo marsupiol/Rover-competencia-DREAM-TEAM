@@ -50,6 +50,8 @@ class PersistentMapNode(Node):
         self.declare_parameter("tf_lookup_timeout_s", 0.2)
         self.declare_parameter("seed_map_path", "")
         self.declare_parameter("seed_confidence_scale", 0.3)
+        self.declare_parameter("semantic_layer_enabled", True)
+        self.declare_parameter("semantic_override_threshold", 30.0)
 
         local_grid_topic = str(self.get_parameter("local_grid_topic").value)
         map_topic = str(self.get_parameter("map_topic").value)
@@ -77,18 +79,25 @@ class PersistentMapNode(Node):
         self.tf_lookup_timeout_s = float(self.get_parameter("tf_lookup_timeout_s").value)
         self.seed_map_path = str(self.get_parameter("seed_map_path").value).strip()
         self.seed_confidence_scale = float(self.get_parameter("seed_confidence_scale").value)
+        self.semantic_layer_enabled = bool(self.get_parameter("semantic_layer_enabled").value)
+        self.semantic_override_threshold = float(self.get_parameter("semantic_override_threshold").value)
 
         # ----------------------------------------------------------------------
-        # 2. Inicialización de la Grilla de Confianza Persistente
+        # 2. Inicialización de Canales de Grilla (Dinámico y Semántico)
         # ----------------------------------------------------------------------
         self.grid_w = max(1, int(round(self.map_width_m / self.map_resolution)))
         self.grid_h = max(1, int(round(self.map_height_m / self.map_resolution)))
 
-        # Grilla float32: >0 = evidencia ocupada, <0 = evidencia libre, 0 = desconocido
         self._lock = threading.Lock()
+        # Canal 1: Evidencia dinámica (>0 = obstáculo, <0 = libre, 0 = desconocido).
+        # Afectado por observaciones de cámara y decaimiento exponencial.
         self._confidence = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
 
-        # Precarga opcional de mapa semilla (OSM prior de baja/moderada confianza)
+        # Canal 2: Prior semántico estático (vereda=-24.0, calle=-6.0, neutral=0.0).
+        # Inmune al decaimiento temporal y desacoplado de las observaciones locales.
+        self._semantic = np.zeros((self.grid_h, self.grid_w), dtype=np.float32)
+
+        # Precarga opcional de mapa semilla (OSM prior) en canal semántico
         if self.seed_map_path:
             self._load_seed_map(self.seed_map_path)
 
@@ -125,27 +134,26 @@ class PersistentMapNode(Node):
 
     def _load_seed_map(self, path: str) -> None:
         """
-        Carga un mapa semilla (.npy) como prior de confianza moderada en el mapa persistente.
+        Carga un mapa semilla (.npy) como prior semántico estático en self._semantic.
 
-        Lógica de Carga y Validación (Parte B):
-          1. Fail Open: Si el archivo no existe o falla la lectura, se loggea WARNING y se continúa con grilla en 0.
+        Lógica de Carga y Validación:
+          1. Fail Open: Si el archivo no existe o falla la lectura, se loggea WARNING y se continúa con grilla semántica en 0.
           2. Validación de Shape: Si las dimensiones no coinciden exactamente con (grid_h, grid_w),
              se loggea ERROR y se descarta (se inicia en 0) para evitar desalineación espacial.
-          3. Escalado de Confianza: self._confidence = seed_array * self.seed_confidence_scale.
+          3. Escalado de Confianza: self._semantic = np.clip(seed_array * self.seed_confidence_scale, -self.confidence_max, self.confidence_max).
+             self._confidence permanece en 0.0 (canal de evidencia dinámica desacoplado).
 
         Ejemplo Numérico:
-          - Vereda generada en Parte A: raw_confidence = -80.0 (terreno libre/transitable).
+          - Vereda generada por OSM: raw_seed = -80.0.
           - Con seed_confidence_scale = 0.3:
-              confianza_inicial = -80.0 * 0.3 = -24.0.
-          - Comparación con umbrales:
-              - free_threshold = -20.0 -> -24.0 <= -20.0 (transitable con costo óptimo 1.0 en D* Lite).
-              - Lejos de saturación (-100.0). Solo 2-3 observaciones de obstáculo de la cámara
-                (+15 cada una: -24 + 15 + 15 = +6 > 0) revierten la evidencia si la vereda está bloqueada.
+              prior_semantico = -80.0 * 0.3 = -24.0.
+          - Calle generada por OSM: raw_seed = -20.0 -> prior_semantico = -20.0 * 0.3 = -6.0.
+          - Neutral / Desconocido: raw_seed = 0.0 -> prior_semantico = 0.0.
         """
         if not os.path.isfile(path):
             self.get_logger().warn(
                 f"Mapa semilla no encontrado en '{path}'. "
-                "Iniciando con grilla de confianza en cero (fail open)."
+                "Iniciando con capa semántica en cero (fail open)."
             )
             return
 
@@ -154,7 +162,7 @@ class PersistentMapNode(Node):
         except Exception as exc:
             self.get_logger().warn(
                 f"Fallo al cargar archivo de mapa semilla '{path}': {exc}. "
-                "Iniciando con grilla en cero (fail open)."
+                "Iniciando con capa semántica en cero (fail open)."
             )
             return
 
@@ -168,12 +176,13 @@ class PersistentMapNode(Node):
 
         scaled_seed = (seed_array * self.seed_confidence_scale).astype(np.float32)
         np.clip(scaled_seed, -self.confidence_max, self.confidence_max, out=scaled_seed)
-        self._confidence = scaled_seed
+        with self._lock:
+            self._semantic = scaled_seed
 
-        n_loaded_free = int(np.count_nonzero(self._confidence <= self.free_threshold))
-        n_loaded_occ = int(np.count_nonzero(self._confidence >= self.occupied_threshold))
+        n_loaded_free = int(np.count_nonzero(self._semantic <= self.free_threshold))
+        n_loaded_occ = int(np.count_nonzero(self._semantic >= self.occupied_threshold))
         self.get_logger().info(
-            f"Mapa semilla precargado exitosamente desde '{path}' "
+            f"Mapa semilla precargado exitosamente en capa semántica desde '{path}' "
             f"(escala={self.seed_confidence_scale:.2f}, celdas_libres={n_loaded_free}, celdas_ocupadas={n_loaded_occ})."
         )
 
@@ -334,7 +343,8 @@ class PersistentMapNode(Node):
     # --------------------------------------------------------------------------
     def _decay_timer_cb(self):
         """
-        Aplica decaimiento exponencial periódico a toda la grilla de confianza.
+        Aplica decaimiento exponencial periódico EXCLUSIVAMENTE a la grilla de evidencia dinámica (self._confidence).
+        La grilla semántica estática (self._semantic) NO sufre decaimiento.
 
         Fórmula Matemática:
           confidence[t] = confidence[t - 1] * decay_factor
@@ -345,14 +355,8 @@ class PersistentMapNode(Node):
               t=5s: 55.0 * 0.7738 = 42.56 < 55.0 -> Deja de considerarse obstáculo en 1 período (5s).
           - Caso 2: Obstáculo persistente saturado al máximo (confidence = 100.0).
               Buscamos k períodos para que 100.0 * (0.7738)^k < 55.0:
-                (0.7738)^k < 0.55
-                k * ln(0.7738) < ln(0.55)
                 k > ln(0.55) / ln(0.7738) = (-0.597837) / (-0.256441) = 2.331 períodos.
                 Tiempo efectivo = 2.331 * 5.0s = 11.66 segundos (~12s).
-              -> Comparación con esquema anterior (1.0s / 0.95):
-                 k > ln(0.55) / ln(0.95) = (-0.597837) / (-0.051293) = 11.655 períodos = 11.66s.
-                 Ambos esquemas poseen exactamente la misma constante de tiempo efectiva (tau ≈ 19.5s)
-                 y el mismo tiempo de olvido (~12s), pero reducen el churn de diffs en D* Lite por un factor de 5x.
         """
         with self._lock:
             self._confidence *= np.float32(self.decay_factor)
@@ -364,50 +368,103 @@ class PersistentMapNode(Node):
         """
         Publica la grilla persistente como nav_msgs/OccupancyGrid graduado en el marco 'map'.
 
-        Esquema de gradación lineal:
-          - confidence_max = 100.0
-          - unknown_evidence_band = 5.0 (|confidence| < 5.0 -> -1 desconocido)
-          - scaled = ((confidence + confidence_max) / (2.0 * confidence_max)) * 100.0
-          - Cuantización por publish_quantization_step = 5:
-              step = 5
-              occ_grid = round(scaled / 5) * 5
-              occ_grid[|confidence| < 5.0] = -1
+        Fusión de Canales (Evidencia Dinámica + Prior Semántico Estático):
+        ------------------------------------------------------------------
+        Se combinan dos fuentes de información ortogonales:
+          1. self._confidence: Evidencia dinámica observada por sensores locales (SAM-TP).
+             Sujeta a decaimiento exponencial para olvidar obstáculos móviles.
+          2. self._semantic: Prior topológico / semántico de OpenStreetMap (vereda=-24.0, calle=-6.0).
+             Inmune al decaimiento temporal y desacoplado de las observaciones locales.
 
-        Ejemplos numéricos:
-          - confidence = +60.0 -> scaled = ((60 + 100) / 200) * 100 = 80.0 -> publica 80.
-          - confidence = -60.0 -> scaled = ((-60 + 100) / 200) * 100 = 20.0 -> publica 20.
-          - confidence = +2.0  -> |2.0| < 5.0 (dentro de banda desconocida) -> publica -1.
-          - confidence = 0.0   -> |0.0| < 5.0 -> publica -1.
-          - confidence = +55.0 -> scaled = ((55 + 100) / 200) * 100 = 77.5 -> publica 80 (o 78 sin cuantizar).
-          - confidence = -20.0 -> scaled = ((-20 + 100) / 200) * 100 = 40.0 -> publica 40.
+        Fórmula de Combinación (Parte B):
+        ---------------------------------
+        Sean C = conf_copy (evidencia dinámica) y S = sem_copy (prior semántico estático).
+        Si semantic_layer_enabled es True:
+          - Condición de Override de Obstáculo: has_obstacle = (C >= semantic_override_threshold)
+          - Condición de Prior Semántico:       has_semantic = (|S| >= unknown_evidence_band)
 
-        NOTA CRÍTICA DE DISEÑO (C2):
-          El punto neutro de esta escala graduada es 50 (evidencia nula/desconocida), NO 0.
-          Una celda confirmada libre (confidence <= -20) publica valores en el rango [0, 40].
-          Una celda confirmada ocupada (confidence >= +55) publica valores en el rango [78, 100].
+          grid_effective = np.where(
+              has_obstacle,
+              np.maximum(C, S),               # Evidencia suficiente de obstáculo domina incondicionalmente
+              np.where(has_semantic, S, C)    # Sin obstáculo suficiente: prior semántico rige; si neutral, usa C
+          )
+        Si semantic_layer_enabled es False:
+          grid_effective = conf_copy
+
+        Derivación Numérica y Validación de Casos (global_planner_node._on_map):
+        -------------------------------------------------------------------------
+        Parámetros del contrato:
+          - confidence_max = 100.0, unknown_evidence_band = 5.0, semantic_override_threshold = 30.0, quantization_step = 5
+          - free_ref_value = 40, occupied_ref_value = 78, unknown_cell_cost = 2.5, max_finite_cost = 15.0
+          - scaled = ((grid_effective + 100) / 200) * 100.0
+          - occ_grid = round(scaled / 5) * 5 (con occ_grid[|grid_effective| < 5.0] = -1)
+          - En global_planner:
+              norm = clip((raw_data - 40) / 38, 0.0, 1.0)
+              cost = 1.0 + norm * 14.0 (o inf si raw_data >= 78, o 2.5 si raw_data == -1)
+
+        1. Vereda de OSM, sin evidencia de cámara (C=0.0, S=-24.0):
+           - has_obstacle = False (0.0 < 30.0), has_semantic = True (|-24.0| >= 5.0).
+           - grid_effective = -24.0.
+           - scaled = ((-24.0 + 100) / 200) * 100 = 38.0 -> occ_grid = round(38/5)*5 = 40.
+           - global_planner: raw_data = 40 <= 40 -> norm = 0.0 -> cost = 1.0 + 0.0 * 14.0 = 1.00.
+
+        2. Calle de OSM, sin evidencia de cámara (C=0.0, S=-6.0):
+           - has_obstacle = False (0.0 < 30.0), has_semantic = True (|-6.0| >= 5.0).
+           - grid_effective = -6.0.
+           - scaled = ((-6.0 + 100) / 200) * 100 = 47.0 -> occ_grid = round(47/5)*5 = 45.
+           - global_planner: raw_data = 45 -> norm = (45 - 40) / 38 = 5/38 = 0.13158 -> cost = 1.0 + 0.13158 * 14.0 = 2.8421 ≈ 2.84.
+
+        3. Sin prior ni evidencia (C=0.0, S=0.0):
+           - has_obstacle = False, has_semantic = False.
+           - grid_effective = 0.0 -> |0.0| < 5.0 (banda desconocida) -> occ_grid = -1.
+           - global_planner: raw_data = -1 -> cost = unknown_cell_cost = 2.50.
+
+        4. Obstáculo confirmado por cámara (C=55.0, S=0.0):
+           - has_obstacle = True (55.0 >= 30.0).
+           - grid_effective = max(55.0, 0.0) = 55.0.
+           - scaled = ((55.0 + 100) / 200) * 100 = 77.5 -> occ_grid = round(77.5/5)*5 = 80.
+           - global_planner: raw_data = 80 >= 78 -> cost = inf.
+
+        5. Vereda con obstáculo confirmado (C=55.0, S=-24.0):
+           - has_obstacle = True (55.0 >= 30.0).
+           - grid_effective = max(55.0, -24.0) = 55.0.
+           - scaled = 77.5 -> occ_grid = 80.
+           - global_planner: raw_data = 80 >= 78 -> cost = inf (NO se diluye por ser vereda).
         """
         with self._lock:
-            grid_copy = self._confidence.copy()
+            conf_copy = self._confidence.copy()
+            sem_copy = self._semantic.copy()
 
-        abs_conf = np.abs(grid_copy)
+        if self.semantic_layer_enabled:
+            has_obstacle = conf_copy >= self.semantic_override_threshold
+            has_semantic = np.abs(sem_copy) >= self.unknown_evidence_band
+            grid_effective = np.where(
+                has_obstacle,
+                np.maximum(conf_copy, sem_copy),
+                np.where(has_semantic, sem_copy, conf_copy),
+            )
+        else:
+            grid_effective = conf_copy
+
+        abs_conf = np.abs(grid_effective)
         unknown_mask = abs_conf < self.unknown_evidence_band
 
         scaled = np.clip(
-            ((grid_copy + self.confidence_max) / (2.0 * self.confidence_max)) * 100.0,
+            ((grid_effective + self.confidence_max) / (2.0 * self.confidence_max)) * 100.0,
             0.0,
             100.0,
         )
         step = max(1, int(self.publish_quantization_step))
-        occ_grid = (np.round(scaled / step) * step).astype(np.int8)
+        occ_grid = (np.round(np.round(scaled, 6) / step) * step).astype(np.int8)
         occ_grid[unknown_mask] = -1
 
         # Diagnóstico estadístico informativo throttled
-        n_occupied = int(np.count_nonzero(grid_copy >= self.occupied_threshold))
-        n_free = int(np.count_nonzero(grid_copy <= self.free_threshold))
+        n_occupied = int(np.count_nonzero(grid_effective >= self.occupied_threshold))
+        n_free = int(np.count_nonzero(grid_effective <= self.free_threshold))
         n_partial = int(
             np.count_nonzero(
-                (grid_copy > self.free_threshold)
-                & (grid_copy < self.occupied_threshold)
+                (grid_effective > self.free_threshold)
+                & (grid_effective < self.occupied_threshold)
                 & ~unknown_mask
             )
         )

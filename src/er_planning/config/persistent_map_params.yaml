@@ -30,3 +30,7 @@ persistent_map_node:
     # --- PRECARGA DE PRIOR OSM (MAPA SEMILLA) ---
     seed_map_path: ""              # Vacío = sin precarga, comportamiento original sin cambios
     seed_confidence_scale: 0.3     # Fracción de confidence_max — confianza moderada, no máxima
+    semantic_layer_enabled: true   # Habilita canal semántico estático independiente desacoplado del decaimiento
+    semantic_override_threshold: 30.0 # 2.0 * hit_gain = 30.0 -> requiere 2 hits consecutivos antes de anular el prior semántico
+
+
