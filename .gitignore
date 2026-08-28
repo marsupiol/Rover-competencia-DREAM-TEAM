@@ -10,6 +10,7 @@ tools/osm_seed/cache/
 .env
 *.env
 src/sdk_server/.env
+src/mini_plus_localization/config/datum_resolved.yaml
 
 # Local memory and workspace files
 MEMORY.md

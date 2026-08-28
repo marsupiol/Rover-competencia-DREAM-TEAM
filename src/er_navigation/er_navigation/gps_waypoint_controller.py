@@ -430,6 +430,11 @@ class GPSWaypointController(Node):
                     "Planner: sin camino válido (recovery turn activo).",
                     throttle_duration_sec=2.0,
                 )
+                self.get_logger().info(
+                    f"[RECOVERY] dist={distance:.1f}m, head_err=None, "
+                    f"cmd_v=0.00, cmd_w={twist.angular.z:+.2f}, align_phase={self._align_phase}",
+                    throttle_duration_sec=1.0,
+                )
                 status = f"[RECOVERY] dist={distance:.1f}m, cmd_v=0.00, cmd_w={twist.angular.z:+.2f}"
                 out = String()
                 out.data = status
@@ -515,6 +520,12 @@ class GPSWaypointController(Node):
                 if elapsed >= dynamic_burst:
                     self._begin_align_phase("PAUSE", now)
                     twist.angular.z = 0.0
+
+            self.get_logger().info(
+                f"[ALIGN] dist={distance:.1f}m, head_err={heading_error:+.1f}°, "
+                f"cmd_v={twist.linear.x:.2f}, cmd_w={twist.angular.z:+.2f}, align_phase={self._align_phase}",
+                throttle_duration_sec=1.0,
+            )
         else:
             mode = "DRIVE"
             self._align_phase = "PAUSE"
@@ -527,6 +538,12 @@ class GPSWaypointController(Node):
             clamped_angular = max(-self.max_drive_angular, min(self.max_drive_angular, correction))
             twist.angular.z = self._apply_angular_sign(
                 max(-self.max_total_drive_angular, min(self.max_total_drive_angular, clamped_angular))
+            )
+
+            self.get_logger().info(
+                f"[DRIVE] dist={distance:.1f}m, head_err={heading_error:+.1f}°, "
+                f"cmd_v={twist.linear.x:.2f}, cmd_w={twist.angular.z:+.2f}, align_phase={self._align_phase}",
+                throttle_duration_sec=1.0,
             )
 
         self.cmd_pub.publish(twist)

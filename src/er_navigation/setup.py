@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'gps_waypoint_controller = er_navigation.gps_waypoint_controller:main',
+            'test_nav_stimulus = er_navigation.test_nav_stimulus:main',
         ],
     },
 )
