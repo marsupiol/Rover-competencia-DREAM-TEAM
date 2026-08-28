@@ -6,8 +6,9 @@ services:
     image: dream-team/mini-plus-rover:jazzy-gpu
     container_name: mini_plus_rover
     environment:
-      # full | ekf | bridge  (ver comentarios en entrypoint.sh)
+      # full | ekf | bridge | manual (ver comentarios en entrypoint.sh)
       ROVER_MODE: "full"
+      CHROME_EXECUTABLE_PATH: "/usr/bin/google-chrome-stable"
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "all"
     ports:
@@ -16,6 +17,7 @@ services:
       # Montá tu .env real con credenciales (no se versiona ni se copia a la imagen).
       - ./src/sdk_server/.env:/root/ros2_ws/src/sdk_server/.env:ro
       - ./src:/root/ros2_ws/src
+      - ./entrypoint.sh:/root/ros2_ws/entrypoint.sh
     deploy:
       resources:
         reservations:
