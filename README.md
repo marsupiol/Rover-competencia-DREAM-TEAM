@@ -377,9 +377,67 @@ El workspace incluye soporte para despliegues contenerizados:
 - **`docker-compose.yml`**: Orquesta el contenedor montando el `.env` local (`ROVER_MODE: "full"`).
 ```bash
 docker compose up --build
+# O con soporte GPU NVIDIA:
+docker compose -f docker-compose.gpu.yml up --build -d
 ```
 
-### 5.4. Precarga de Mapa Semilla (OpenStreetMap Prior) y Orquestador de Misión
+### 5.4. Flujo de Desarrollo y Pruebas Rápidas
+
+Para iterar ágilmente sobre el código sin rebuilds innecesarios de Docker:
+
+1. **Levantar el contenedor en segundo plano (una sola vez):**
+   ```bash
+   docker compose -f docker-compose.gpu.yml up -d
+   ```
+   El contenedor `mini_plus_rover` quedará corriendo indefinidamente con el código fuente del host montado en tiempo real (`./src:/root/ros2_ws/src`) y las credenciales `.env` enlazadas.
+
+2. **Entrar al contenedor para correr o probar nodos:**
+   ```bash
+   docker exec -it mini_plus_rover bash
+   ```
+   Desde esta terminal interactiva, ejecutar directamente los comandos de ROS 2:
+   ```bash
+   source /opt/ros/jazzy/setup.bash
+   source /root/ros2_ws/install/setup.bash
+   ros2 run er_planning bev_planner_node --ros-args --params-file src/er_planning/config/planner_params.yaml
+   # O lanzar launch files directamente:
+   ros2 launch er_planning bev_planner_only.launch.py
+   ```
+   > [!IMPORTANT]
+   > **Nunca ejecutar `docker run` nuevo por cada prueba:** `docker run` crea contenedores anónimos adicionales que pueden quedar colgados en segundo plano reteniendo memoria VRAM de la GPU. Usar siempre `docker exec -it mini_plus_rover bash`.
+
+3. **Cuándo Rebuildear Docker vs. Cuándo NO:**
+   * **NO hace falta `docker compose build`:** Cualquier cambio o edición de código Python en `src/` se refleja inmediatamente en el contenedor gracias al bind mount de `./src`.
+   * **Compilación liviana interna (`colcon build` < 1s):** Si agregás un nuevo `entry_point` en `setup.py`, un paquete nuevo, o para sincronizar scripts de consola, ejecutá dentro del contenedor (`docker exec`):
+     ```bash
+     colcon build --symlink-install --packages-select <nombre_paquete>
+     source install/setup.bash
+     ```
+   * **SÍ hace falta `docker compose build`:** Únicamente si se modifican `requirements-ai.txt`, `src/sdk_server/requirements.txt`, paquetes de sistema `apt` o el propio `Dockerfile`.
+
+4. **Memoria Operativa para Agentes de IA:**
+   * Las directrices de entorno, decisiones de arquitectura y métricas de referencia están consolidadas en `MEMORY.md` y `GEMINI.md` / `AGENTS.md` en la raíz del repo (ignoradas por Git).
+   * Antigravity CLI / Gemini cargan automáticamente estas reglas al iniciar cualquier sesión de trabajo.
+
+### 5.5. Cómo Correr una Misión Completa (Punto de Entrada Único)
+
+Una vez levantado el contenedor (`docker compose -f docker-compose.gpu.yml up -d`), se ejecuta la misión completa con una única instrucción de launch consolidada:
+
+```bash
+docker exec -it mini_plus_rover bash
+source /opt/ros/jazzy/setup.bash && source install/setup.bash
+ros2 launch er_bringup mission_manager.launch.py mission_slug:=mission-1 bot_slug:=luke-notch-quirk enable_global_planning:=false
+```
+
+Este comando levanta de forma coordinada:
+1. **Bridge SDK (`earth_rover_bridge`):** Enlace bidireccional WebSocket y HTTP con el servidor SDK del rover.
+2. **Fusión Sensorial EKF (`ekf.launch.py`):** Filtros odometría local, global y transformación geodésica `/fromLL`.
+3. **Percepción y Planificación Local BEV (`bev_planner_node`):** Inferencia SAM-TP en GPU y trayectorias GeNIE optimizadas.
+4. **Controlador Motriz (`gps_waypoint_controller`):** Seguimiento de trayectorias locales y máquina de estados anti-latencia *Burst & Wait*.
+5. **Gestor de Misión con Estado (`mission_manager_node`):** Disparo automático de `POST /start-mission`, descarga de checkpoints, orquestación de paradas de seguridad y envío de `POST /checkpoint-reached`.
+6. *(Opcional)* **Mapa Persistente y D\* Lite (`enable_global_planning:=true`):** Habilita acumulación Bayesiana y planificación global de respaldo.
+
+### 5.6. Precarga de Mapa Semilla (OpenStreetMap Prior) y Orquestador de Misión
 
 Para evitar que `persistent_map_node` y D* Lite arranquen a ciegas en zonas inexploradas, el sistema permite precargar un prior geográfico de baja/moderada confianza a partir de datos reales de OpenStreetMap (veredas y calles).
 

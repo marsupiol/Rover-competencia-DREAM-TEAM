@@ -21,6 +21,12 @@ $(document).ready(function () {
     console.log(
       "on connection state changed to " + newState + " reason: " + reason
     );
+    if (newState === "ABORTED" || newState === "DISCONNECTED") {
+      console.log("RTM connection lost (" + newState + "/" + reason + "). Reconnecting in 1.5s...");
+      setTimeout(() => {
+        joinRTMChannel(USER_ID);
+      }, 1500);
+    }
   }
   rtmClient.on("ConnectionStateChanged", handleConnectionState);
   rtmClient.on("ConnectionStateChange", handleConnectionState); // belt & braces
