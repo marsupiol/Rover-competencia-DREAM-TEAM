@@ -128,8 +128,11 @@ class EarthRoverBridge(Node):
         self.battery_pub = self.create_publisher(
             BatteryState, "earth_rover/battery", image_qos
         )
+        # Heading crudo de la brújula (sin filtrar). Tópico exclusivo de diagnóstico/debug.
+        # Los nodos de navegación (gps_waypoint_controller, bev_planner_node) consumen
+        # exclusivamente el heading fusionado por el EKF en 'earth_rover/heading'.
         self.heading_pub = self.create_publisher(
-            Float32, "earth_rover/heading", image_qos
+            Float32, "earth_rover/heading_raw", image_qos
         )
 
         self.declare_parameter("publish_bridge_debug", True)
