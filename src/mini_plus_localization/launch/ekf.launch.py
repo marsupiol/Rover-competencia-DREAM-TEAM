@@ -79,7 +79,7 @@ def generate_launch_description():
             executable='navsat_transform_node',
             name='navsat_transform',
             output='screen',
-            parameters=[ekf_yaml],
+            parameters=navsat_parameters,
             remappings=[
                 ('imu', '/imu/data'),
                 ('gps/fix', '/gps/fix'),

@@ -15,7 +15,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-opencv \
     ros-jazzy-robot-localization \
     ros-jazzy-cv-bridge \
+    wget \
+    gnupg \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Instalar Google Chrome estable para soporte completo de códec H.264
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list && \
+    apt-get update && apt-get install -y --no-install-recommends google-chrome-stable && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 # Asegurar que el entorno ROS se cargue en shells interactivos
 RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc
@@ -24,6 +35,7 @@ WORKDIR /root/ros2_ws
  
 # 1. Copiar manifiestos de dependencias Python (SDK e IA)
 COPY src/sdk_server/requirements.txt src/sdk_server/requirements.txt
+COPY src/earth_rovers_sdk/requirements.txt src/earth_rovers_sdk/requirements.txt
 COPY requirements-ai.txt requirements-ai.txt
 
 # 2. Copiar código fuente de submódulos requeridos para instalación editable (-e)
@@ -31,6 +43,8 @@ COPY src/third_party/sana-earth-rover-policy/ src/third_party/sana-earth-rover-p
 
 # 3. Instalar dependencias Python del SDK y stack de IA
 RUN pip3 install --break-system-packages -r src/sdk_server/requirements.txt
+RUN pip3 install --break-system-packages -r src/earth_rovers_sdk/requirements.txt
+RUN python3 -m playwright install --with-deps chromium
 RUN pip3 install --break-system-packages -r requirements-ai.txt
 RUN pip3 install --break-system-packages --no-build-isolation \
     -e src/third_party/sana-earth-rover-policy/genie

@@ -41,6 +41,7 @@ huggingface_hub==1.28.0
 iopath==0.1.10
 portalocker==4.1.0
 tqdm==4.70.0
+setuptools<80
 
 # ------------------------------------------------------------------------------
 # Nota para instalación alternativa en CPU (sin GPU NVIDIA):
