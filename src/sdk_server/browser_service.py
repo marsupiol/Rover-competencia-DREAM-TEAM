@@ -135,6 +135,8 @@ class BrowserService:
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
             self._page = await self._context.new_page()
+            self._page.on("console", lambda msg: logger.info("PAGE LOG: [%s] %s", msg.type, msg.text))
+            self._page.on("pageerror", lambda err: logger.error("PAGE JS ERROR: %s", err))
             await self._page.goto(SDK_PAGE_URL, wait_until="domcontentloaded")
             await self._page.click("#join")
             # Control and telemetry must remain available when a camera is
