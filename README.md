@@ -6,6 +6,8 @@ Arquitectura de navegación autónoma, percepción visual profunda (SAM-TP), pla
 
 ## 1. Diagrama de Arquitectura del Sistema
 
+> Para una explicación detallada del funcionamiento interno de cada nodo, ver [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ```text
                                +-------------------------------------------------------------+
                                |                 FrodoBots Cloud / Rover Físico              |

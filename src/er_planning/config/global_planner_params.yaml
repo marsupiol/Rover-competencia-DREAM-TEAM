@@ -8,7 +8,7 @@ global_planner_node:
     base_frame: "base_link"
     from_ll_service: "/fromLL"
     replan_min_period_s: 2.0
-    occupied_ref_value: 78          # = confidence 55 en la escala graduada nueva: (55+100)/2 = 77.5 -> 78
+    occupied_ref_value: 78          # Umbral de obstáculo: confianza 55 -> (55+100)/2 = 77.5 -> cuantizado en pasos de 5 a 80 (80 >= 78 -> costo infinito)
     free_ref_value: 40              # = confidence -20 en la escala graduada nueva: (-20+100)/2 = 40
     unknown_cell_cost: 2.5          # bajado desde 20.0 para evitar rodeos patológicos
     max_finite_cost: 15.0
