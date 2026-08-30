@@ -12,6 +12,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Path
+from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Float32, String, Bool
 
@@ -20,6 +21,9 @@ class GPSWaypointController(Node):
         super().__init__("gps_waypoint_controller")
 
         # 1. DECLARACIÓN ESTRICTA DE PARÁMETROS (Tipado Fuerte)
+        self.declare_parameter("navigation_mode", "outdoor")
+        self.declare_parameter("gps_reliable_topic", "earth_rover/gps_reliable")
+        self.declare_parameter("goal_source_ready_topic", "earth_rover/goal_source_ready")
         self.declare_parameter("goal_tolerance_m", 14.0) # Se frena 1 metro adentro del perímetro
         self.declare_parameter("goal_dwell_s", 1.5)
         self.declare_parameter("align_threshold_deg", 15.0)
@@ -48,6 +52,9 @@ class GPSWaypointController(Node):
         self.declare_parameter("publish_control_debug", True)
 
         # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
+        self.navigation_mode = str(self.get_parameter("navigation_mode").value).lower()
+        gps_reliable_topic = str(self.get_parameter("gps_reliable_topic").value)
+        goal_source_ready_topic = str(self.get_parameter("goal_source_ready_topic").value)
 
         # --- Tolerancias y Distancias ---
         self.goal_tolerance = float(self.get_parameter("goal_tolerance_m").value)
@@ -130,9 +137,15 @@ class GPSWaypointController(Node):
         self.create_subscription(Bool, "earth_rover/navigation_pause", self._on_navigation_pause, reliable_qos)
         self.create_subscription(String, "earth_rover/waypoint_status", self._on_mission_status, reliable_qos)
 
+        # Suscripciones para Transición Multimodo (Brief 3 / Track 04)
+        self.create_subscription(Bool, gps_reliable_topic, self._on_gps_reliable, reliable_qos)
+        self.create_subscription(Bool, goal_source_ready_topic, self._on_goal_source_ready, sensor_qos)
+
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", reliable_qos)
         self.status_pub = self.create_publisher(String, "earth_rover/waypoint_status", reliable_qos)
         self.control_debug_pub = self.create_publisher(String, "earth_rover/control_debug", sensor_qos)
+
+        self.add_on_set_parameters_callback(self._on_set_params)
 
         # 5. Inicialización de Vectores de Estado
         self.current_lat = None
@@ -148,6 +161,14 @@ class GPSWaypointController(Node):
         self._path_poses: list[tuple[float, float]] = []
         self._path_valid: bool = False
         self._path_last_update = None
+
+        # Control de Transiciones Multimodo (Track 04 / Brief 3)
+        self._gps_reliable: bool = True
+        self._previous_gps_reliable: bool | None = None
+        self._goal_source_ready: bool = True
+        self._goal_source_ready_last_rx = None
+        self._transition_state: str | None = None  # "TRANSITIONING_TO_INDOOR" | "TRANSITIONING_TO_OUTDOOR" | None
+        self._transition_started_at = None
         
         # Flags de Máquina de Estados
         self.active_goal = False
@@ -162,8 +183,15 @@ class GPSWaypointController(Node):
         # 6. Bucle de Control Principal
         self.timer = self.create_timer(1.0 / self.loop_hz, self._control_loop)
         self.get_logger().info(
-            f"Controlador Híbrido Iniciado | Loop: {self.loop_hz} Hz | Burst: {self.turn_burst_s}s | Filter Alpha: {self.heading_filter_alpha}"
+            f"Controlador Híbrido Iniciado | Loop: {self.loop_hz} Hz | Burst: {self.turn_burst_s}s | Mode: {self.navigation_mode}"
         )
+
+    def _on_set_params(self, params):
+        for p in params:
+            if p.name == "navigation_mode":
+                self.navigation_mode = str(p.value).lower()
+                self.get_logger().info(f"[PARAM] navigation_mode cambiado a: '{self.navigation_mode}'")
+        return SetParametersResult(successful=True)
 
     # --- CALLBACKS DE SENSORES Y PERCEPCIÓN ---
     def _on_gps(self, msg: NavSatFix):
@@ -199,6 +227,35 @@ class GPSWaypointController(Node):
     def _on_path_valid(self, msg: Bool):
         self._path_valid = bool(msg.data)
         self._path_last_update = self.get_clock().now()
+
+    def _on_gps_reliable(self, msg: Bool):
+        new_reliable = bool(msg.data)
+        nav_mode = getattr(self, "navigation_mode", "outdoor").lower()
+        if nav_mode == "auto" and self._previous_gps_reliable is not None:
+            if not new_reliable and self._previous_gps_reliable:
+                # Transición de Outdoor -> Indoor
+                self._transition_state = "TRANSITIONING_TO_INDOOR"
+                self._transition_started_at = self.get_clock().now()
+                self._goal_source_ready = False
+                self._stop_robot()
+                self.get_logger().info(
+                    "[TRANSITIONING] Cambio de fuente detectado: Outdoor -> Indoor. Entrando en TRANSITIONING_TO_INDOOR (frenado total)."
+                )
+            elif new_reliable and not self._previous_gps_reliable:
+                # Transición de Indoor -> Outdoor
+                self._transition_state = "TRANSITIONING_TO_OUTDOOR"
+                self._transition_started_at = self.get_clock().now()
+                self._goal_source_ready = False
+                self._stop_robot()
+                self.get_logger().info(
+                    "[TRANSITIONING] Cambio de fuente detectado: Indoor -> Outdoor. Entrando en TRANSITIONING_TO_OUTDOOR (frenado total)."
+                )
+        self._previous_gps_reliable = new_reliable
+        self._gps_reliable = new_reliable
+
+    def _on_goal_source_ready(self, msg: Bool):
+        self._goal_source_ready = bool(msg.data)
+        self._goal_source_ready_last_rx = self.get_clock().now()
 
     # --- CALLBACKS DE MÁQUINA DE ESTADOS ---
     def _on_target(self, msg: NavSatFix):
@@ -364,6 +421,78 @@ class GPSWaypointController(Node):
     def _control_loop(self):
         now = self.get_clock().now()
 
+        # Guarda de seguridad 0: Transición Multimodo activa (Brief 3: TRANSITIONING_TO_INDOOR / TRANSITIONING_TO_OUTDOOR)
+        if self._transition_state is not None:
+            elapsed = (now - self._transition_started_at).nanoseconds / 1e9 if self._transition_started_at else 0.0
+
+            # Salir únicamente cuando la nueva fuente confirme que está lista (no por tiempo fijo)
+            if self._goal_source_ready:
+                self.get_logger().info(
+                    f"[TRANSITIONING] Transición {self._transition_state} completada tras {elapsed:.2f}s (fuente confirmada lista). Retomando navegación normal."
+                )
+                self._transition_state = None
+                self._transition_started_at = None
+                self._align_phase = "PAUSE"
+                self._align_phase_started_at = None
+                self._burst_turn_sign = 0
+            else:
+                # Frenado total estricto: cero componente lineal, cero componente angular (sin giro alguno)
+                empty_twist = Twist()
+                self.cmd_pub.publish(empty_twist)
+
+                self.get_logger().info(
+                    f"[TRANSITIONING] state={self._transition_state}, waiting_s={elapsed:.1f}s, "
+                    f"goal_source_ready={self._goal_source_ready}, cmd_v=0.00, cmd_w=0.00",
+                    throttle_duration_sec=1.0,
+                )
+
+                status = f"[{self._transition_state}] waiting_s={elapsed:.1f}s, ready={self._goal_source_ready}"
+                out = String()
+                out.data = status
+                self.status_pub.publish(out)
+
+                if self.publish_control_debug:
+                    now_sec = now.nanoseconds / 1e9
+                    heading_rx_sec = (
+                        (self._heading_last_rx.nanoseconds / 1e9)
+                        if self._heading_last_rx is not None
+                        else None
+                    )
+                    gps_age = (
+                        ((now - self._gps_last_update).nanoseconds / 1e9)
+                        if self._gps_last_update is not None
+                        else None
+                    )
+                    path_age = (
+                        ((now - self._path_last_update).nanoseconds / 1e9)
+                        if self._path_last_update is not None
+                        else None
+                    )
+                    distance_debug = (
+                        float(self.haversine_distance(self.current_lat, self.current_lon, self.target_lat, self.target_lon))
+                        if (self.current_lat is not None and self.target_lat is not None)
+                        else None
+                    )
+                    debug_payload = {
+                        "timestamp_sec": now_sec,
+                        "mode": self._transition_state,
+                        "heading_error": None,
+                        "heading_source": "none",
+                        "current_heading": float(self.current_heading) if self.current_heading is not None else None,
+                        "heading_rx_sec": heading_rx_sec,
+                        "cmd_linear_x": 0.0,
+                        "cmd_angular_z": 0.0,
+                        "align_phase": "TRANSITION",
+                        "gps_age_s": gps_age,
+                        "path_age_s": path_age,
+                        "distance_m": distance_debug,
+                    }
+                    dbg_msg = String()
+                    dbg_msg.data = json.dumps(debug_payload)
+                    self.control_debug_pub.publish(dbg_msg)
+
+                return
+
         # Guarda de seguridad 1: Pausa externa
         if self._navigation_paused:
             self._stop_robot()
@@ -381,16 +510,26 @@ class GPSWaypointController(Node):
             return
 
         # Guarda de seguridad 3: Datos insuficientes
-        if not self.active_goal or self.current_lat is None or self.current_lon is None:
+        if not self.active_goal:
             return
 
-        # Guarda de seguridad 4: GPS Stale Guard
-        if not self._gps_is_fresh():
-            self.cmd_pub.publish(Twist())
-            self.get_logger().warn("GPS stale: frenando y esperando.", throttle_duration_sec=2.0)
-            return
+        nav_mode = getattr(self, "navigation_mode", "outdoor").lower()
+        use_gps = (nav_mode == "outdoor") or (nav_mode == "auto" and self._gps_reliable)
 
-        distance = self.haversine_distance(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
+        if use_gps:
+            if self.current_lat is None or self.current_lon is None or self.target_lat is None or self.target_lon is None:
+                return
+
+            # Guarda de seguridad 4: GPS Stale Guard
+            if not self._gps_is_fresh():
+                self.cmd_pub.publish(Twist())
+                self.get_logger().warn("GPS stale: frenando y esperando.", throttle_duration_sec=2.0)
+                return
+
+            distance = self.haversine_distance(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
+        else:
+            # En modo Indoor, la navegación se rige por las trayectorias visuales (evitar falso disparo de meta GPS)
+            distance = 50.0
 
         # 1. EVALUACIÓN DE META ALCANZADA
         if distance <= self.goal_tolerance:
