@@ -26,10 +26,13 @@ def run_experiment_scenario(mode: str, duration_s: float = 30.0) -> dict:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    pkg_dir = os.path.dirname(this_dir)
+
     # Lanzar gps_waypoint_controller
     controller_cmd = [
         sys.executable,
-        "/root/ros2_ws/src/er_navigation/er_navigation/gps_waypoint_controller.py",
+        os.path.join(pkg_dir, "gps_waypoint_controller.py"),
         "--ros-args",
         "-p", "control_loop_hz:=5.0",
         "-p", "publish_control_debug:=true",
@@ -38,7 +41,7 @@ def run_experiment_scenario(mode: str, duration_s: float = 30.0) -> dict:
     # Lanzar test_dual_heading_stimulus
     stimulus_cmd = [
         sys.executable,
-        "/root/ros2_ws/src/er_navigation/er_navigation/test_dual_heading_stimulus.py",
+        os.path.join(this_dir, "test_dual_heading_stimulus.py"),
         "--mode", mode,
         "--duration", str(duration_s),
     ]
@@ -47,7 +50,7 @@ def run_experiment_scenario(mode: str, duration_s: float = 30.0) -> dict:
     csv_path = f"/tmp/heading_diag_{mode}.csv"
     monitor_cmd = [
         sys.executable,
-        "/root/ros2_ws/src/er_navigation/er_navigation/heading_diagnostic_monitor.py",
+        os.path.join(this_dir, "heading_diagnostic_monitor.py"),
         "--csv", csv_path,
         "--threshold", "6.0",
     ]

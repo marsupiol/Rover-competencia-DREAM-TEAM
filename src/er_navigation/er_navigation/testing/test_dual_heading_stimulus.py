@@ -253,13 +253,13 @@ def run_benchmark(mode: str, duration_s: float = 30.0) -> SimulationMetrics:
     return node.metrics
 
 
-if __name__ == "__main__":
+def main(args=None):
     parser = argparse.ArgumentParser(description="Test dual heading stimulus node")
     parser.add_argument("--mode", choices=["dual", "postfix_dual", "prefix_dual", "ekf_only", "raw_only"], default="postfix_dual")
     parser.add_argument("--duration", type=float, default=30.0)
-    args = parser.parse_args()
+    parsed_args, _ = parser.parse_known_args(args)
 
-    metrics = run_benchmark(args.mode, args.duration)
+    metrics = run_benchmark(parsed_args.mode, parsed_args.duration)
     print(f"\n--- Resumen Simulación [{metrics.mode_name}] ---")
     print(f"Mensajes Heading Totales: {metrics.total_heading_msgs} (EKF: {metrics.ekf_heading_msgs}, Raw: {metrics.raw_heading_msgs})")
     print(f"Ticks de Control: {metrics.control_ticks} (ALIGN: {metrics.align_ticks}, DRIVE: {metrics.drive_ticks})")
@@ -272,3 +272,7 @@ if __name__ == "__main__":
         mean_delta = sum(metrics.heading_deltas) / len(metrics.heading_deltas)
         max_delta = max(metrics.heading_deltas)
         print(f"Delta entre mensajes sucesivos en topic: media = {mean_delta:.2f}°, max = {max_delta:.2f}°")
+
+
+if __name__ == "__main__":
+    main()
