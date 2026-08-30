@@ -310,6 +310,7 @@ class BEVPlannerNode(Node):
 
         self._frame_lock = threading.Lock()
         self._latest_rgb: np.ndarray | None = None
+        self._latest_stamp = None
         self._stop_event = threading.Event()
         self._infer_thread = threading.Thread(target=self._planning_loop, daemon=True)
         self._infer_thread.start()
@@ -331,6 +332,7 @@ class BEVPlannerNode(Node):
         rgb = bgr[:, :, ::-1]
         with self._frame_lock:
             self._latest_rgb = rgb
+            self._latest_stamp = msg.header.stamp
 
     def _on_gps(self, msg: NavSatFix):
         self._current_lat = float(msg.latitude)
@@ -596,8 +598,17 @@ class BEVPlannerNode(Node):
         )
         grid_2d = cost_bev[::-1, ::-1].T
 
+        with self._frame_lock:
+            latest_stamp = self._latest_stamp
+
         local_grid_msg = OccupancyGrid()
-        local_grid_msg.header.stamp = self.get_clock().now().to_msg()
+        if latest_stamp is not None:
+            local_grid_msg.header.stamp = latest_stamp
+            stamp_sec = float(latest_stamp.sec) + float(latest_stamp.nanosec) * 1e-9
+        else:
+            local_grid_msg.header.stamp = self.get_clock().now().to_msg()
+            stamp_sec = float(local_grid_msg.header.stamp.sec) + float(local_grid_msg.header.stamp.nanosec) * 1e-9
+
         local_grid_msg.header.frame_id = "base_link"
         local_grid_msg.info.resolution = float(self.bev_resolution)
         local_grid_msg.info.width = int(bev_h)
@@ -634,11 +645,20 @@ class BEVPlannerNode(Node):
         )
         t_after_plan = time.perf_counter()
 
+        t_infer_ms = (t_after_infer - t_start) * 1000.0
+        t_bev_ms = (t_after_bev - t_after_infer) * 1000.0
+        t_plan_ms = (t_after_plan - t_after_bev) * 1000.0
+        t_total_ms = (time.perf_counter() - t_start) * 1000.0
+
         now = self.get_clock().now()
         is_valid = bool(
             planned.final_path_xy_m is not None
             and planned.final_path_xy_m.shape[0] > 0
             and planned.metadata.get("status") == "ok"
+        )
+
+        self.get_logger().info(
+            f"[TRACE][BEV] img_stamp={stamp_sec:.3f}s | infer={t_infer_ms:.1f}ms | bev={t_bev_ms:.1f}ms | plan={t_plan_ms:.1f}ms | total={t_total_ms:.1f}ms | valid={is_valid}"
         )
 
         # 5. Publicación del estado de validez

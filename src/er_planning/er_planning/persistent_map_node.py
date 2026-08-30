@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 
 import numpy as np
 import rclpy
@@ -223,6 +224,7 @@ class PersistentMapNode(Node):
               Frame 2: -10 -> -20.0 <= -20.0 -> Pasa a LIBRE (0).
               -> Requiere ceil(20/10) = 2 observaciones consecutivas para confirmar libre.
         """
+        t_start = time.perf_counter()
         # 1. Lookup de la transformación map -> base_link
         target_frame = self.map_frame
         source_frame = msg.header.frame_id if msg.header.frame_id else "base_link"
@@ -338,6 +340,12 @@ class PersistentMapNode(Node):
             self._confidence[uniq_rows, uniq_cols] += deltas_unique
             np.clip(self._confidence, -self.confidence_max, self.confidence_max, out=self._confidence)
 
+        t_int_ms = (time.perf_counter() - t_start) * 1000.0
+        stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        self.get_logger().info(
+            f"[TRACE][MAP_INTEGRATE] grid_stamp={stamp_sec:.3f}s | duration={t_int_ms:.1f}ms | unique_cells={num_unique}"
+        )
+
     # --------------------------------------------------------------------------
     # Temporizador de Decaimiento Exponencial
     # --------------------------------------------------------------------------
@@ -422,7 +430,7 @@ class PersistentMapNode(Node):
         4. Obstáculo confirmado por cámara (C=55.0, S=0.0):
            - has_obstacle = True (55.0 >= 30.0).
            - grid_effective = max(55.0, 0.0) = 55.0.
-           - scaled = ((55.0 + 100) / 200) * 100 = 77.5 -> occ_grid = round(77.5/5)*5 = 80.
+           - scaled = ((55.0 + 100) / 200) * 100 = 77.5 -> occ_grid = 80.
            - global_planner: raw_data = 80 >= 78 -> cost = inf.
 
         5. Vereda con obstáculo confirmado (C=55.0, S=-24.0):
@@ -431,6 +439,7 @@ class PersistentMapNode(Node):
            - scaled = 77.5 -> occ_grid = 80.
            - global_planner: raw_data = 80 >= 78 -> cost = inf (NO se diluye por ser vereda).
         """
+        t_pub_start = time.perf_counter()
         with self._lock:
             conf_copy = self._confidence.copy()
             sem_copy = self._semantic.copy()
@@ -488,6 +497,12 @@ class PersistentMapNode(Node):
 
         msg.data = occ_grid.flatten().tolist()
         self.map_pub.publish(msg)
+
+        t_pub_ms = (time.perf_counter() - t_pub_start) * 1000.0
+        stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        self.get_logger().info(
+            f"[TRACE][MAP_PUB] stamp={stamp_sec:.3f}s | duration={t_pub_ms:.1f}ms | occ_cells={n_occupied}"
+        )
 
 
 def main(args=None):

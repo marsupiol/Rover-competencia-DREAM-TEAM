@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import math
 import rclpy
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import Point, PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from robot_localization.srv import FromLL
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Bool, Float32
+import tf2_ros
 
 
 class TestNavStimulus(Node):
@@ -36,6 +38,7 @@ class TestNavStimulus(Node):
         self.declare_parameter("bev_path_valid", True)
         self.declare_parameter("bev_path_curvature", 0.0)
         self.declare_parameter("bev_path_length_m", 3.5)
+        self.declare_parameter("broadcast_tf", True)
 
         # 2. Parámetros de inyección de fallas / diagnósticos
         self.declare_parameter("republish_target_period_s", 0.0) # >0 = republica periódicamente
@@ -44,8 +47,10 @@ class TestNavStimulus(Node):
         self.declare_parameter("jump_is_permanent", False)       # True = el offset se mantiene en el sensor
 
         self.rate_hz = float(self.get_parameter("publish_rate_hz").value)
-        self.current_lat = float(self.get_parameter("initial_lat").value)
-        self.current_lon = float(self.get_parameter("initial_lon").value)
+        self.initial_lat = float(self.get_parameter("initial_lat").value)
+        self.initial_lon = float(self.get_parameter("initial_lon").value)
+        self.current_lat = self.initial_lat
+        self.current_lon = self.initial_lon
         self.target_dist_m = float(self.get_parameter("target_distance_m").value)
         self.target_bearing_deg = float(self.get_parameter("target_bearing_deg").value)
         self.current_heading_deg = float(self.get_parameter("initial_heading_deg").value)
@@ -55,11 +60,17 @@ class TestNavStimulus(Node):
         self.bev_path_valid = bool(self.get_parameter("bev_path_valid").value)
         self.bev_path_curvature = float(self.get_parameter("bev_path_curvature").value)
         self.bev_path_length_m = float(self.get_parameter("bev_path_length_m").value)
+        self.broadcast_tf = bool(self.get_parameter("broadcast_tf").value)
 
         self.republish_target_period = float(self.get_parameter("republish_target_period_s").value)
         self.jump_deg = float(self.get_parameter("inject_heading_jump_deg").value)
         self.jump_at_s = float(self.get_parameter("inject_heading_jump_at_s").value)
         self.jump_is_permanent = bool(self.get_parameter("jump_is_permanent").value)
+
+        # Factores de proyección geodésica plana centrada en el origen
+        lat_rad = math.radians(self.initial_lat)
+        self._m_per_lat = 111132.954 - 559.822 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad)
+        self._m_per_lon = 111412.84 * math.cos(lat_rad)
 
         # Calcular coordenadas del target
         self.target_lat, self.target_lon = self._calculate_destination(
@@ -75,6 +86,12 @@ class TestNavStimulus(Node):
         self._last_target_pub_time = None
         self._jump_injected = False
         self._permanent_offset_deg = 0.0
+
+        # Broadcaster de Transformaciones TF
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+
+        # Servidor de proyección /fromLL para compatibilidad nativa con GlobalPlannerNode
+        self.from_ll_srv = self.create_service(FromLL, "/fromLL", self._on_from_ll)
 
         # Perfiles QoS
         sensor_qos = QoSProfile(
@@ -106,8 +123,19 @@ class TestNavStimulus(Node):
             f"TestNavStimulus inicializado | Heading inicial: {self.current_heading_deg:.1f}° | "
             f"Target a {self.target_dist_m:.1f}m rumbo {self.target_bearing_deg:.1f}° | "
             f"Republish target: {self.republish_target_period}s | "
-            f"Jump: {self.jump_deg}° a los {self.jump_at_s}s (permanente={self.jump_is_permanent})"
+            f"Jump: {self.jump_deg}° a los {self.jump_at_s}s (permanente={self.jump_is_permanent}) | "
+            f"TF broadcast={self.broadcast_tf}"
         )
+
+    def _on_from_ll(self, req: FromLL.Request, res: FromLL.Response) -> FromLL.Response:
+        dlat = float(req.ll_point.latitude) - self.initial_lat
+        dlon = float(req.ll_point.longitude) - self.initial_lon
+        res.map_point = Point(
+            x=dlon * self._m_per_lon,
+            y=dlat * self._m_per_lat,
+            z=0.0,
+        )
+        return res
 
     def _on_cmd_vel(self, msg: Twist):
         self.last_cmd_v = float(msg.linear.x)
@@ -179,6 +207,45 @@ class TestNavStimulus(Node):
         head_msg = Float32()
         head_msg.data = float(published_heading % 360.0)
         self.heading_pub.publish(head_msg)
+
+        # 2b. Broadcast TF (map -> base_link) para localización sintética
+        if self.broadcast_tf:
+            dlat = self.current_lat - self.initial_lat
+            dlon = self.current_lon - self.initial_lon
+            tx = dlon * self._m_per_lon
+            ty = dlat * self._m_per_lat
+            yaw_rad = math.radians(90.0 - (published_heading % 360.0))
+
+            t = TransformStamped()
+            t.header.stamp = now.to_msg()
+            t.header.frame_id = "map"
+            t.child_frame_id = "base_link"
+            t.transform.translation.x = float(tx)
+            t.transform.translation.y = float(ty)
+            t.transform.translation.z = 0.0
+            t.transform.rotation.x = 0.0
+            t.transform.rotation.y = 0.0
+            t.transform.rotation.z = math.sin(yaw_rad * 0.5)
+            t.transform.rotation.w = math.cos(yaw_rad * 0.5)
+            self.tf_broadcaster.sendTransform(t)
+
+            # TF estático/dinámico base_link -> earth_rover_gps
+            t_gps = TransformStamped()
+            t_gps.header.stamp = now.to_msg()
+            t_gps.header.frame_id = "base_link"
+            t_gps.child_frame_id = "earth_rover_gps"
+            t_gps.transform.rotation.w = 1.0
+            self.tf_broadcaster.sendTransform(t_gps)
+
+            # TF estático/dinámico base_link -> earth_rover_front_camera
+            t_cam = TransformStamped()
+            t_cam.header.stamp = now.to_msg()
+            t_cam.header.frame_id = "base_link"
+            t_cam.child_frame_id = "earth_rover_front_camera"
+            t_cam.transform.translation.x = 0.15
+            t_cam.transform.translation.z = 0.20
+            t_cam.transform.rotation.w = 1.0
+            self.tf_broadcaster.sendTransform(t_cam)
 
         # 3. Publicar Target (inicial o periódico según parámetro)
         should_publish_target = False

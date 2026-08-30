@@ -546,6 +546,11 @@ class GPSWaypointController(Node):
                 throttle_duration_sec=1.0,
             )
 
+        now_stamp = (now.nanoseconds) / 1e9
+        self.get_logger().info(
+            f"[TRACE][CTRL] stamp={now_stamp:.3f}s | mode={mode} | v={twist.linear.x:.2f} | w={twist.angular.z:+.2f} | dist={distance:.1f}m | err={heading_error:+.1f}°"
+        )
+
         self.cmd_pub.publish(twist)
 
         # Telemetría interna para Depuración

@@ -29,8 +29,8 @@ El sistema se distribuye en los siguientes paquetes de ROS 2:
 3. [x] [**`bev_planner_node`**](#3-bev_planner_node) *(paquete `er_planning` / integración con `er_perception`)*
 4. [x] [**`persistent_map_node`**](#4-persistent_map_node) *(paquete `er_planning`)*
 5. [x] [**`global_planner_node`**](#5-global_planner_node) *(paquete `er_planning`)*
-6. [ ] [**`gps_waypoint_controller`**](#6-gps_waypoint_controller) *(paquete `er_navigation`)* — *(pendiente)*
-7. [ ] [**`mission_manager_node`**](#7-mission_manager_node) *(paquete `er_mission`)* — *(pendiente)*
+6. [x] [**`gps_waypoint_controller`**](#6-gps_waypoint_controller) *(paquete `er_navigation`)*
+7. [x] [**`mission_manager_node`**](#7-mission_manager_node) *(paquete `er_mission`)*
 
 ---
 
@@ -347,15 +347,133 @@ El bucle `_compute_shortest_path` procesa vértices inconsistentes en orden de p
 ## 6. `gps_waypoint_controller`
 
 > **Paquete:** `er_navigation`  
-> **Rol:** Seguimiento cinemático de waypoints y control de velocidad
+> **Rol:** Seguimiento cinemático de waypoints y control de velocidad (el que efectivamente mueve las ruedas)
 
-*(Sección en desarrollo — pendiente de documentación detallada)*
+### Rol
+
+Es la capa más baja de la jerarquía de decisión: no decide "hacia dónde ir" en un sentido estratégico (eso lo hacen `bev_planner_node`/`global_planner_node`), decide cómo traducir "hacia allá" en comandos concretos de motor, respetando las limitaciones físicas y de red del rover real (latencia 4G, brújula ruidosa, GPS que llega a 1Hz).
+
+---
+
+### Los valores reales que rigen hoy (del YAML, sin clamps)
+
+Con el hallazgo de la ronda anterior confirmado —el código ya no clampea nada—, estos son los números que gobiernan el rover en producción:
+- `goal_tolerance_m`: `13.0`
+- `align_threshold_deg`: `18.0` (umbral fino, cerca de la meta)
+- `coarse_align_threshold_deg`: `25.0` (umbral grueso, lejos)
+- `approach_align_distance_m`: `8.0` (el punto donde pasa de uno a otro)
+- `forward_speed`: `0.4`
+- `turn_speed`: `0.7`
+- `control_loop_hz`: `3.0`
+- `turn_burst_s`: `0.25`
+- `pause_after_turn_s`: `0.8`
+- `max_heading_jump_deg`: `150.0`
+- `heading_filter_alpha`: `0.35`
+- `gps_max_stale_s`: `2.0`
+- `path_max_stale_s`: `8.0`
+
+---
+
+### El orden de las guardas de seguridad en `_control_loop` — por qué importa el orden, no solo qué chequea cada una
+
+Cada ciclo (3Hz) evalúa, en este orden estricto, y sale apenas una condición aplica:
+
+1. **Pausa externa (`_navigation_paused`)** — si `mission_manager_node` lo pausó, frena y no evalúa nada más.
+2. **Esperando confirmación del SDK (`_awaiting_next_target`)** — ya llegó a la meta, está esperando que el manager confirme el checkpoint; mientras tanto, re-publica `REACHED` periódicamente por si el mensaje anterior se perdió.
+3. **Datos insuficientes** — sin meta activa o sin GPS, no hace nada (ni siquiera frena explícitamente, porque no hay "hacia dónde" para calcular).
+4. **GPS viejo (`gps_max_stale_s=2.0`)** — frena y espera, sin intentar navegar con datos de posición desactualizados.
+
+Recién después de pasar las cuatro, calcula distancia y decide qué hacer. El orden importa porque cada guarda es más barata de evaluar que la siguiente, y porque las primeras representan condiciones que deben anular cualquier cálculo posterior sin excepción — no importa qué tan bueno sea el heading, si estás pausado, estás pausado.
+
+---
+
+### La selección de fuente de rumbo — tres caminos, no dos
+
+Esto es más rico de lo que parece a primera vista:
+
+1. **Si hay un camino BEV fresco y válido** (`path_max_stale_s=8.0`, mucho más permisivo que el `global_path_max_stale_s=3.0` de `bev_planner_node` — tiene sentido, es una capa más abajo en la cadena, con más margen antes de considerar el dato "viejo"): sigue ese camino, calculando el error de rumbo hacia un punto a `lookahead_distance_m=1.0` metros adelante en la trayectoria.
+2. **Si el camino está fresco pero es inválido** (`bev_planner_node` no encontró ruta): entra en modo **RECOVERY** — gira en el lugar a `recovery_turn_speed=0.3` sin avanzar, una respuesta activa de "estoy atascado, déjame reorientarme" en vez de simplemente frenar y esperar.
+3. **Si no hay camino fresco en absoluto:** cae al cálculo GPS puro (bearing directo Haversine) — el mismo fallback de siempre, la base de todo el diseño fail-open.
+
+---
+
+### El burst & wait, con una capa de sofisticación que no habíamos visto en detalle
+
+La máquina ALIGN/DRIVE ya la conocíamos, pero el `turn_burst_s` del YAML (`0.25s`) resulta ser solo el piso — dentro de la fase TURN, hay un burst dinámico según la gravedad del error:
+- $\text{error} > 30^\circ \implies$ ráfaga de `0.65s` (giro agresivo)
+- $\text{error} > 15^\circ \implies$ `0.40s` (medio)
+- si no $\implies$ `0.22s` ("micro-toque de francotirador", según el propio comentario del código).
+
+O sea, cuanto más lejos está el rumbo correcto, más tiempo gira de corrido antes de pausar a revisar — evita el desperdicio de hacer 5 micro-correcciones cuando bastaría con una ráfaga larga.
+
+---
+
+### El filtro de heading y su bug conocido, ahora en contexto completo
+
+`heading_filter_alpha=0.35` es un filtro exponencial simple: cada lectura nueva mueve el heading interno un 35% hacia el valor recibido, suavizando el ruido. El chequeo `max_heading_jump_deg=150.0` descarta lecturas que saltan demasiado — y acá está el bug que ya diagnosticamos con el arnés de pruebas: no hay ningún control de antigüedad sobre `current_heading`. Si el heading queda "congelado" tras un rechazo de salto, puede seguir usándose indefinidamente sin que nada lo marque como stale, a diferencia del GPS (que sí tiene `_gps_is_fresh()`). Sigue siendo un pendiente real, no resuelto.
+
+---
+
+### Un mecanismo elegante que no habíamos nombrado: el "detector de rechazo del SDK"
+
+En `_on_navigation_pause`: si el controlador estaba pausado (por `mission_manager_node`, esperando confirmar un checkpoint), y lo despausan mientras todavía está en `_awaiting_next_target=True`, eso solo puede significar una cosa: el SDK rechazó el checkpoint como "todavía no llegaste" — así que el controlador reduce su propia tolerancia a la mitad (`goal_tolerance *= 0.5`, con piso de `0.5m`). Es una forma de decir "el servidor dice que no estoy tan cerca como pensaba, sé más estricto la próxima vez que declare 'llegué'". Con corridas repetidas de rechazo, la tolerancia converge geométricamente hacia el piso mínimo — auto-corrección sin intervención externa.
 
 ---
 
 ## 7. `mission_manager_node`
 
 > **Paquete:** `er_mission`  
-> **Rol:** Gestión de objetivos de alto nivel y máquina de estados de misión
+> **Rol:** Gestión de objetivos de alto nivel, orquestación del ciclo de vida y comunicación con SDK (el jefe de misión)
 
-*(Sección en desarrollo — pendiente de documentación detallada)*
+### Rol
+
+Es el único nodo que le habla al SDK por HTTP. Todo lo demás del sistema no sabe nada de la existencia del servidor remoto — recibe posiciones GPS y publica comandos de movimiento, punto. Este nodo es el puente entre "lo que pasa localmente" y "lo que el backend de la competencia necesita saber".
+
+---
+
+### La máquina de estados completa
+
+```mermaid
+flowchart LR
+    STARTING_MISSION --> FETCHING_CHECKPOINTS
+    FETCHING_CHECKPOINTS --> WAITING_FOR_GPS
+    WAITING_FOR_GPS --> NAVIGATING_CHECKPOINT
+    NAVIGATING_CHECKPOINT -->|al llegar| PRE_POST_STOP
+    PRE_POST_STOP --> AWAITING_HTTP_RESPONSE
+    AWAITING_HTTP_RESPONSE --> CONFIRMING_CHECKPOINT
+    CONFIRMING_CHECKPOINT -->|siguiente checkpoint| NAVIGATING_CHECKPOINT
+    CONFIRMING_CHECKPOINT -->|completado| FINISHED
+```
+
+`STARTING_MISSION` → `FETCHING_CHECKPOINTS` → `WAITING_FOR_GPS` → `NAVIGATING_CHECKPOINT` → (al llegar) `PRE_POST_STOP` → `AWAITING_HTTP_RESPONSE` → `CONFIRMING_CHECKPOINT` → vuelve a `NAVIGATING_CHECKPOINT` con el siguiente, o `FINISHED`.
+
+---
+
+### El patrón "hilo + estado de espera" — el mismo truco que ya vimos en el bridge, aplicado a HTTP lento
+
+`_notify_checkpoint_reached` no bloquea el nodo esperando la respuesta del servidor — lanza un hilo (`http_worker`) y cambia el estado a `AWAITING_HTTP_RESPONSE`, devolviendo `"in_flight"` de inmediato. El `_state_machine_loop` (corriendo a 1Hz) revisa en cada tick si el hilo ya terminó (`_http_request_in_flight`); cuando sí, procesa el resultado. Es exactamente la misma filosofía que `_control_tick` en `earth_rover_bridge` — nunca bloquear el hilo principal de ROS esperando una llamada de red, delegar a un hilo secundario y sincronizar por bandera.
+
+---
+
+### El "parche de amnesia" — una decisión deliberada, documentada como tal
+
+Al recibir la lista de checkpoints, si es la primera vez (`state in (FETCHING_CHECKPOINTS, WAITING_FOR_GPS)`), ignora deliberadamente lo que el SDK diga sobre `latest_scanned_checkpoint` y fuerza el inicio desde el Checkpoint 1. El propio nombre ("amnesia") reconoce que esto es una simplificación consciente — probablemente para que cada corrida de prueba empiece limpia sin arrastrar progreso de intentos anteriores en el servidor. Una vez que ya está navegando, sí respeta el progreso real (`max(self.latest_scanned_checkpoint, sdk_latest)`).
+
+---
+
+### Dos formas independientes de detectar "llegué" — defensa en profundidad
+
+La forma principal es la señal `REACHED` que publica `gps_waypoint_controller`. Pero hay un backup completamente independiente: `_check_proximity_to_checkpoint`, que corre en cada tick mientras `NAVIGATING_CHECKPOINT`, midiendo la distancia real por su cuenta. Si detecta que está dentro de `checkpoint_max_distance_m` (13.5m del YAML) durante `proximity_dwell_s` seguidos (2.0 segundos según el YAML — mucho más agresivo que el default de 15.0 del código, como marqué antes), dispara el POST de checkpoint aunque el controlador nunca haya declarado `REACHED`. Esto cubre el caso donde, por ejemplo, `gps_waypoint_controller` tiene una tolerancia distinta o algo falla en la cadena de señales — el manager no depende ciegamente de una sola fuente de verdad.
+
+Hay un guard adicional (`min_navigation_time_s=8.0`) que evita que este backup dispare en el primer instante de haber fijado el target — sin él, un warm-start real podría confundirse con "backup de proximidad" antes de darle tiempo al controlador a operar normalmente.
+
+---
+
+### 🔴 Hallazgo real: código muerto que crashearía si alguna vez se ejecutara
+
+`_post_checkpoint_task` es un método completo, con su propia lógica de POST HTTP, que llama a `self._handle_successful_checkpoint_response(seq, completed)` y `self._handle_rejected_checkpoint_response(dist)` — ninguno de los dos métodos existe en el archivo. Si `_post_checkpoint_task` se ejecutara alguna vez, tiraría `AttributeError` de inmediato.
+
+La buena noticia: nunca se llama desde ningún lado. Revisé todo el archivo — el único camino real de POST de checkpoint es `_notify_checkpoint_reached` (el patrón hilo + estado que expliqué arriba), invocado desde `_handle_checkpoint_reached_impl`. `_post_checkpoint_task` parece ser un resto de una implementación anterior, más simple y bloqueante, que se reemplazó por el patrón asíncrono actual sin borrar el código viejo.
+
+No es un bug activo — es código muerto e inofensivo mientras nadie lo invoque. Pero si en algún refactor futuro alguien lo conecta pensando que es funcional (por ejemplo, "ah, hay una función que ya hace esto"), va a crashear el nodo en el peor momento posible: justo al reportar un checkpoint. Vale la pena borrarlo cuando haya una ronda de limpieza, y de paso los dos `import threading`/`import requests` duplicados al principio del archivo (inofensivos, pero descuidados).
+

@@ -1,31 +1,35 @@
 gps_waypoint_controller:
   ros__parameters:
-    # NOTA: estos valores son los que el código termina forzando via los
-    # clamps de seguridad en __init__ (a propósito, ver comentarios ahí).
-    # Se dejaron acá iguales al resultado real del clamp para que el yaml
-    # no mienta sobre el comportamiento efectivo del rover.
-    goal_tolerance_m: 13.0            # antes 6.0 -> clamp min(3.0, raw) lo forzaba a 3.0
-    goal_dwell_s: 1.0
-    align_threshold_deg: 18.0
-    coarse_align_threshold_deg: 25.0
-    approach_align_distance_m: 8.0
-    forward_speed: 0.4
-    turn_speed: 0.7
+    # --- Tolerancias y Distancias ---
+    goal_tolerance_m: 13.0            # Radio de llegada al waypoint/checkpoint (metros)
+    goal_dwell_s: 1.0                 # Tiempo de permanencia mínima en meta para confirmar llegada (segundos)
+    approach_align_distance_m: 8.0    # Distancia a la meta a partir de la cual se aplica el umbral fino de alineación (metros)
 
-    drive_correction_gain: 0.01      # antes 0.0 -> clamp max(0.03, raw) lo forzaba a 0.03
-    max_drive_angular: 0.15           # antes 0.14 -> clamp max(0.4, raw) lo forzaba a 0.4
-    invert_angular: true
-    control_loop_hz: 3.0
-    turn_burst_s: 0.25               # antes 1.4 -> clamp min(0.25, raw) lo forzaba a 0.25
-    pause_after_turn_s: 0.8          # antes 1.3 -> clamp max(2.2, raw) lo forzaba a 2.2
-    max_heading_jump_deg: 150.0      # antes 40.0 -> clamp max(150.0, raw) lo forzaba a 150.0
-    heading_filter_alpha: 0.35
-    reached_publish_period_s: 1.0
-    gps_max_stale_s: 2.0
+    # --- Umbrales de Alineación Angular ---
+    align_threshold_deg: 18.0         # Umbral fino de error angular para pasar a DRIVE en aproximación cercana (grados)
+    coarse_align_threshold_deg: 25.0  # Umbral grueso de error angular a larga distancia (grados)
+
+    # --- Dinámica de Movimiento y Giro ---
+    forward_speed: 0.4                # Velocidad lineal de avance en modo DRIVE (m/s)
+    turn_speed: 0.7                   # Velocidad angular de giro en modo ALIGN (rad/s)
+    drive_correction_gain: 0.01       # Ganancia proporcional para corrección angular durante el avance (modo DRIVE)
+    max_drive_angular: 0.15           # Límite de velocidad angular correctiva en modo DRIVE (rad/s)
+    max_total_drive_angular: 0.8      # Límite de seguridad absoluto para la velocidad angular en DRIVE (rad/s)
+    invert_angular: true              # Inversión de signo angular para coincidir con la convención cinemática del robot
+    control_loop_hz: 3.0              # Frecuencia del lazo principal de control (Hz)
+
+    # --- Mitigación de Latencia y Filtros (Burst & Wait) ---
+    turn_burst_s: 0.25                # Duración nominal del pulso de giro en ALIGN (segundos)
+    pause_after_turn_s: 0.8           # Pausa tras cada pulso de giro para esperar estabilización física (segundos)
+    max_heading_jump_deg: 150.0       # Salto angular instantáneo máximo tolerado antes de rechazar la muestra (grados)
+    heading_filter_alpha: 0.35        # Factor de suavizado pasa-bajos exponencial para el rumbo
+    reached_publish_period_s: 1.0     # Período de republicación del estado REACHED (segundos)
+    gps_max_stale_s: 2.0              # Antigüedad máxima permitida para datos GPS antes de frenar (segundos)
+
+    # --- Seguimiento de Trayectorias Planificadas (BEV) ---
+    path_following_enabled: true      # Habilita seguimiento de trayectorias locales BEV
     path_topic: "earth_rover/planned_path"
     path_valid_topic: "earth_rover/planner_valid"
-    path_max_stale_s: 8.0
-    lookahead_distance_m: 1.0
-    path_following_enabled: true
-    recovery_turn_speed: 0.3
-    max_total_drive_angular: 0.8
+    path_max_stale_s: 8.0             # Antigüedad máxima de trayectoria planificada antes de fallback a GPS (segundos)
+    lookahead_distance_m: 1.0         # Distancia de persecución sobre la trayectoria (metros)
+    recovery_turn_speed: 0.3          # Velocidad angular de búsqueda en modo RECOVERY cuando no hay camino válido (rad/s)
