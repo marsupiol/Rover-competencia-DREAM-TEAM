@@ -34,6 +34,7 @@ install(DIRECTORY
 # --- NODOS PYTHON ---
 install(PROGRAMS
   scripts/ekf_heading_bridge.py
+  scripts/gps_quality_monitor.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
