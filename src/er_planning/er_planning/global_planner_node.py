@@ -123,9 +123,13 @@ class GlobalPlannerNode(Node):
         self._s_last: tuple[int, int] | None = None
         self._km: float = 0.0
 
-        # Costos g(u) y rhs(u) almacenados en diccionarios dispersos (default = inf)
-        self._g: dict[tuple[int, int], float] = {}
-        self._rhs: dict[tuple[int, int], float] = {}
+        # Costos g(u) y rhs(u) almacenados en matrices densas 2D float64 (default = inf)
+        self._g: np.ndarray | None = None
+        self._rhs: np.ndarray | None = None
+
+        # Banco de direcciones y distancias precomputado para vecinos adyacentes
+        self._neighbors_8: tuple[tuple[int, int, float], ...] = ()
+        self._precompute_neighbor_offsets()
 
         # Cola de prioridad U con clave [k1, k2] y versioning para borrado O(1) perezoso
         self._pq_heap: list[tuple[float, float, tuple[int, int], int]] = []
@@ -142,6 +146,28 @@ class GlobalPlannerNode(Node):
             f"target={target_topic} | path={global_path_topic} | replan_period={self.replan_min_period_s}s"
         )
 
+    def _precompute_neighbor_offsets(self):
+        """Precomputa las tuplas fijas de (dr, dc, base_dist) para conectividad 4 u 8."""
+        diag_dist = math.sqrt(2.0) * self._map_res
+        if self.connectivity == 8:
+            self._neighbors_8 = (
+                (-1, 0, self._map_res),
+                (1, 0, self._map_res),
+                (0, -1, self._map_res),
+                (0, 1, self._map_res),
+                (-1, -1, diag_dist),
+                (-1, 1, diag_dist),
+                (1, -1, diag_dist),
+                (1, 1, diag_dist),
+            )
+        else:
+            self._neighbors_8 = (
+                (-1, 0, self._map_res),
+                (1, 0, self._map_res),
+                (0, -1, self._map_res),
+                (0, 1, self._map_res),
+            )
+
     # --------------------------------------------------------------------------
     # Callbacks de Sensores y Servicios
     # --------------------------------------------------------------------------
@@ -152,18 +178,14 @@ class GlobalPlannerNode(Node):
         """
         lat = float(msg.latitude)
         lon = float(msg.longitude)
-
-        # Evitar peticiones duplicadas si la meta no ha cambiado
         if (
-            self._current_target_lat is not None
+            self._goal_map_xy is not None
+            and self._current_target_lat is not None
             and self._current_target_lon is not None
             and math.isclose(lat, self._current_target_lat, abs_tol=1e-7)
             and math.isclose(lon, self._current_target_lon, abs_tol=1e-7)
         ):
             return
-
-        self._current_target_lat = lat
-        self._current_target_lon = lon
 
         if not self.from_ll_client.service_is_ready():
             self.get_logger().warn(
@@ -171,6 +193,9 @@ class GlobalPlannerNode(Node):
                 throttle_duration_sec=3.0,
             )
             return
+
+        self._current_target_lat = lat
+        self._current_target_lon = lon
 
         req = FromLL.Request()
         req.ll_point = GeoPoint(latitude=lat, longitude=lon, altitude=0.0)
@@ -218,7 +243,7 @@ class GlobalPlannerNode(Node):
         raw_data = np.asarray(msg.data, dtype=np.int16).reshape((h, w))
 
         # 1. Asignación de costos referenciada a la escala graduada (C2)
-        new_costs = np.full((h, w), float("inf"), dtype=np.float32)
+        new_costs = np.full((h, w), float("inf"), dtype=np.float64)
         known = raw_data != -1
         occupied = known & (raw_data >= self.occupied_ref_value)
         free_ish = known & ~occupied
@@ -227,7 +252,7 @@ class GlobalPlannerNode(Node):
 
         span = max(1.0, float(self.occupied_ref_value - self.free_ref_value))
         norm = np.clip(
-            (raw_data[free_ish].astype(np.float32) - self.free_ref_value) / span,
+            (raw_data[free_ish].astype(np.float64) - self.free_ref_value) / span,
             0.0,
             1.0,
         )
@@ -257,6 +282,10 @@ class GlobalPlannerNode(Node):
             self._map_orig_x = orig_x
             self._map_orig_y = orig_y
             self._cell_costs = new_costs
+            self._precompute_neighbor_offsets()
+
+            if self._s_goal is None and self._goal_map_xy is not None:
+                self._reset_dstar_lite()
 
             # Si D* Lite está activo y hubo un mapa previo, reparar los vértices modificados
             # NOTA CRÍTICA: El diff se compara DESPUÉS de la inflación (Fase 2.C).
@@ -288,8 +317,10 @@ class GlobalPlannerNode(Node):
                     for r, c in zip(diff_rows, diff_cols):
                         u = (int(r), int(c))
                         self._update_vertex(u)
-                        for s in self._get_neighbors(u):
-                            self._update_vertex(s)
+                        for dr, dc, _ in self._neighbors_8:
+                            nr, nc = u[0] + dr, u[1] + dc
+                            if 0 <= nr < self._map_h and 0 <= nc < self._map_w:
+                                self._update_vertex((nr, nc))
 
         elapsed_map_ms = (time.perf_counter() - t_map_start) * 1000.0
         self.get_logger().debug(
@@ -352,14 +383,20 @@ class GlobalPlannerNode(Node):
 
         self._s_goal = (r_goal, c_goal)
         self._km = 0.0
-        self._g.clear()
-        self._rhs.clear()
+
+        if self._g is None or self._g.shape != (self._map_h, self._map_w):
+            self._g = np.full((self._map_h, self._map_w), float("inf"), dtype=np.float64)
+            self._rhs = np.full((self._map_h, self._map_w), float("inf"), dtype=np.float64)
+        else:
+            self._g.fill(float("inf"))
+            self._rhs.fill(float("inf"))
+
         self._pq_heap.clear()
         self._pq_dict.clear()
         self._pq_entry_id = 0
 
         # Inicialización fundamental: rhs(s_goal) = 0, resto = inf
-        self._set_rhs(self._s_goal, 0.0)
+        self._rhs[r_goal, c_goal] = 0.0
 
         rover_cell = self._get_rover_cell()
         if rover_cell is not None:
@@ -390,22 +427,22 @@ class GlobalPlannerNode(Node):
             return None
 
     def _get_g(self, u: tuple[int, int]) -> float:
-        return self._g.get(u, float("inf"))
+        if self._g is None:
+            return float("inf")
+        return float(self._g[u[0], u[1]])
 
     def _set_g(self, u: tuple[int, int], val: float):
-        if math.isinf(val):
-            self._g.pop(u, None)
-        else:
-            self._g[u] = float(val)
+        if self._g is not None:
+            self._g[u[0], u[1]] = float(val)
 
     def _get_rhs(self, u: tuple[int, int]) -> float:
-        return self._rhs.get(u, float("inf"))
+        if self._rhs is None:
+            return float("inf")
+        return float(self._rhs[u[0], u[1]])
 
     def _set_rhs(self, u: tuple[int, int], val: float):
-        if math.isinf(val):
-            self._rhs.pop(u, None)
-        else:
-            self._rhs[u] = float(val)
+        if self._rhs is not None:
+            self._rhs[u[0], u[1]] = float(val)
 
     def _heuristic(self, u: tuple[int, int], v: tuple[int, int]) -> float:
         """Distancia euclídea admisible y consistente en el espacio de la grilla métrica."""
@@ -415,11 +452,14 @@ class GlobalPlannerNode(Node):
 
     def _calculate_key(self, u: tuple[int, int]) -> tuple[float, float]:
         """Calcula la clave de prioridad k(u) = [k1, k2]."""
-        g_val = self._get_g(u)
-        rhs_val = self._get_rhs(u)
-        min_val = min(g_val, rhs_val)
+        r, c = u
+        g_val = float(self._g[r, c]) if self._g is not None else float("inf")
+        rhs_val = float(self._rhs[r, c]) if self._rhs is not None else float("inf")
+        min_val = g_val if g_val < rhs_val else rhs_val
         if self._s_start is not None:
-            h_val = self._heuristic(self._s_start, u)
+            dr = (self._s_start[0] - r) * self._map_res
+            dc = (self._s_start[1] - c) * self._map_res
+            h_val = math.hypot(dr, dc)
         else:
             h_val = 0.0
         k1 = min_val + h_val + self._km
@@ -448,20 +488,13 @@ class GlobalPlannerNode(Node):
         return base_dist * ((cost_u + cost_v) * 0.5)
 
     def _get_neighbors(self, u: tuple[int, int]) -> list[tuple[int, int]]:
-        """Retorna los vecinos válidos según la conectividad (4 u 8)."""
+        """Retorna los vecinos válidos según la conectividad precomputada."""
         r, c = u
+        h, w = self._map_h, self._map_w
         neighbors = []
-        if self.connectivity == 8:
-            offsets = [
-                (-1, 0), (1, 0), (0, -1), (0, 1),
-                (-1, -1), (-1, 1), (1, -1), (1, 1),
-            ]
-        else:
-            offsets = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-        for dr, dc in offsets:
+        for dr, dc, _ in self._neighbors_8:
             nr, nc = r + dr, c + dc
-            if 0 <= nr < self._map_h and 0 <= nc < self._map_w:
+            if 0 <= nr < h and 0 <= nc < w:
                 neighbors.append((nr, nc))
         return neighbors
 
@@ -501,36 +534,54 @@ class GlobalPlannerNode(Node):
     # Reparación Incremental de Vértices y Búsqueda del Camino Más Corto
     # --------------------------------------------------------------------------
     def _update_vertex(self, u: tuple[int, int]):
+        r, c = u
         if u != self._s_goal:
-            min_rhs = float("inf")
-            for sprime in self._get_neighbors(u):
-                c_val = self._transition_cost(u, sprime)
-                if not math.isinf(c_val):
-                    cost_candidate = c_val + self._get_g(sprime)
-                    if cost_candidate < min_rhs:
-                        min_rhs = cost_candidate
-            self._set_rhs(u, min_rhs)
+            cost_u = float(self._cell_costs[r, c])
+            if math.isinf(cost_u):
+                min_rhs = float("inf")
+            else:
+                min_rhs = float("inf")
+                h, w = self._map_h, self._map_w
+                costs = self._cell_costs
+                g = self._g
+                for dr, dc, base_dist in self._neighbors_8:
+                    nr = r + dr
+                    nc = c + dc
+                    if 0 <= nr < h and 0 <= nc < w:
+                        cost_v = float(costs[nr, nc])
+                        if not math.isinf(cost_v):
+                            g_v = float(g[nr, nc])
+                            if not math.isinf(g_v):
+                                candidate = base_dist * ((cost_u + cost_v) * 0.5) + g_v
+                                if candidate < min_rhs:
+                                    min_rhs = candidate
+            self._rhs[r, c] = min_rhs
 
-        if self._pq_contains(u):
-            self._pq_remove(u)
+        g_val = float(self._g[r, c])
+        rhs_val = float(self._rhs[r, c])
 
-        if not math.isclose(self._get_g(u), self._get_rhs(u), abs_tol=1e-5):
+        if u in self._pq_dict:
+            del self._pq_dict[u]
+
+        if not math.isclose(g_val, rhs_val, abs_tol=1e-5):
             self._pq_insert(u, self._calculate_key(u))
 
     def _compute_shortest_path(self, max_expansions: int = 40000) -> bool:
         """
-        Bucle central de D* Lite. Expande vértices inconsistentes hasta satisfacer
-        la condición de optimalidad en s_start.
+        Bucle central de D* Lite optimizado con arrays directos y offsets precomputados.
         """
-        if self._s_start is None or self._s_goal is None:
+        if self._s_start is None or self._s_goal is None or self._g is None or self._rhs is None:
             return False
 
         expansions = 0
+        h, w = self._map_h, self._map_w
+        neighbors_8 = self._neighbors_8
+
         while True:
             top_k = self._pq_top_key()
             start_k = self._calculate_key(self._s_start)
-            g_start = self._get_g(self._s_start)
-            rhs_start = self._get_rhs(self._s_start)
+            g_start = float(self._g[self._s_start[0], self._s_start[1]])
+            rhs_start = float(self._rhs[self._s_start[0], self._s_start[1]])
 
             # Condición de parada de D* Lite: la cima de la cola es peor que la clave del inicio
             # y el vértice de inicio es consistente
@@ -553,45 +604,68 @@ class GlobalPlannerNode(Node):
 
             if k_old < k_new:
                 self._pq_insert(u, k_new)
-            elif self._get_g(u) > self._get_rhs(u):
-                self._set_g(u, self._get_rhs(u))
-                for s in self._get_neighbors(u):
-                    self._update_vertex(s)
             else:
-                self._set_g(u, float("inf"))
-                self._update_vertex(u)
-                for s in self._get_neighbors(u):
-                    self._update_vertex(s)
+                ur, uc = u
+                g_u = float(self._g[ur, uc])
+                rhs_u = float(self._rhs[ur, uc])
 
-        return not math.isinf(self._get_g(self._s_start))
+                if g_u > rhs_u:
+                    self._g[ur, uc] = rhs_u
+                    for dr, dc, _ in neighbors_8:
+                        nr = ur + dr
+                        nc = uc + dc
+                        if 0 <= nr < h and 0 <= nc < w:
+                            self._update_vertex((nr, nc))
+                else:
+                    self._g[ur, uc] = float("inf")
+                    self._update_vertex(u)
+                    for dr, dc, _ in neighbors_8:
+                        nr = ur + dr
+                        nc = uc + dc
+                        if 0 <= nr < h and 0 <= nc < w:
+                            self._update_vertex((nr, nc))
+
+        return not math.isinf(float(self._g[self._s_start[0], self._s_start[1]]))
 
     def _extract_path(self) -> list[tuple[float, float]] | None:
         """
         Extrae el camino óptimo descendiendo por el gradiente de g desde la pose
         actual del rover (s_start) hasta la meta (s_goal).
         """
-        if self._s_start is None or self._s_goal is None:
+        if self._s_start is None or self._s_goal is None or self._g is None or self._cell_costs is None:
             return None
 
-        if math.isinf(self._get_g(self._s_start)):
+        if math.isinf(float(self._g[self._s_start[0], self._s_start[1]])):
             return None
 
         path_cells = [self._s_start]
         curr = self._s_start
         visited = {curr}
         max_steps = 10000
+        h, w = self._map_h, self._map_w
+        neighbors_8 = self._neighbors_8
+        costs = self._cell_costs
+        g = self._g
 
         while curr != self._s_goal and len(path_cells) < max_steps:
+            cr, cc = curr
+            cost_u = float(costs[cr, cc])
             best_next = None
             min_cost = float("inf")
 
-            for sprime in self._get_neighbors(curr):
-                c_val = self._transition_cost(curr, sprime)
-                if not math.isinf(c_val):
-                    candidate_g = c_val + self._get_g(sprime)
-                    if candidate_g < min_cost:
-                        min_cost = candidate_g
-                        best_next = sprime
+            for dr, dc, base_dist in neighbors_8:
+                nr = cr + dr
+                nc = cc + dc
+                if 0 <= nr < h and 0 <= nc < w:
+                    cost_v = float(costs[nr, nc])
+                    if not math.isinf(cost_v):
+                        g_v = float(g[nr, nc])
+                        if not math.isinf(g_v):
+                            c_val = base_dist * ((cost_u + cost_v) * 0.5)
+                            candidate_g = c_val + g_v
+                            if candidate_g < min_cost:
+                                min_cost = candidate_g
+                                best_next = (nr, nc)
 
             if best_next is None or math.isinf(min_cost) or best_next in visited:
                 break
@@ -602,7 +676,7 @@ class GlobalPlannerNode(Node):
 
         if curr != self._s_goal:
             # Fase 2.G: Distinguir fallo de extracción interno de ausencia de camino
-            if not math.isinf(self._get_g(self._s_start)):
+            if not math.isinf(float(self._g[self._s_start[0], self._s_start[1]])):
                 self.get_logger().error(
                     "g(s_start) finito pero extracción de camino falló — posible inconsistencia del grafo"
                 )
@@ -671,11 +745,16 @@ class GlobalPlannerNode(Node):
                 self._s_last = rover_cell
 
             # Ejecutar búsqueda incremental D* Lite
+            t_dstar_start = time.perf_counter()
             success = self._compute_shortest_path()
             path_points = self._extract_path() if success else None
+            t_dstar_ms = (time.perf_counter() - t_dstar_start) * 1000.0
             self._last_plan_time = time.monotonic()
 
         is_valid = path_points is not None and len(path_points) > 0
+        self.get_logger().debug(
+            f"D* Lite Plan: plan={t_dstar_ms:.1f}ms | valid={is_valid} | points={len(path_points) if path_points else 0}"
+        )
         self._publish_path_msg(path_points, is_valid=is_valid)
 
     def _publish_path_msg(self, path_points: list[tuple[float, float]] | None, is_valid: bool):
