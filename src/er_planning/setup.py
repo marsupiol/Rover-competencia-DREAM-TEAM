@@ -1,13 +1,13 @@
 import os
 from glob import glob
-from setuptools import setup
+from setuptools import find_packages, setup
 
 package_name = 'er_planning'
 
 setup(
     name=package_name,
     version='0.1.0',
-    packages=[package_name],
+    packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
@@ -27,6 +27,7 @@ setup(
             'bev_planner_node = er_planning.bev_planner_node:main',
             'persistent_map_node = er_planning.persistent_map_node:main',
             'global_planner_node = er_planning.global_planner_node:main',
+            'image_goal_stub_node = er_planning.testing.image_goal_stub_node:main',
         ],
     },
 )

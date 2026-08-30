@@ -22,8 +22,9 @@ from typing import Any
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3
 from nav_msgs.msg import OccupancyGrid, Path
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -86,6 +87,14 @@ class BEVPlannerNode(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("tf_lookup_timeout_s", 0.2)
 
+        # Modo de Navegación e Interfaz de Image-Goal (Brief 2 / Track 04)
+        self.declare_parameter("navigation_mode", "outdoor")
+        self.declare_parameter("gps_reliable_topic", "earth_rover/gps_reliable")
+        self.declare_parameter("image_goal_topic", "earth_rover/image_goal_relative")
+        self.declare_parameter("image_goal_ready_topic", "earth_rover/image_goal_ready")
+        self.declare_parameter("goal_source_ready_topic", "earth_rover/goal_source_ready")
+        self.declare_parameter("image_goal_max_stale_s", 2.0)
+
         self.declare_parameter("planning_min_period_s", 0.1)
         self.declare_parameter("checkpoint_path", "")
         self.declare_parameter("hf_repo", "")
@@ -140,6 +149,13 @@ class BEVPlannerNode(Node):
         self.map_frame = str(self.get_parameter("map_frame").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
         self.tf_lookup_timeout_s = float(self.get_parameter("tf_lookup_timeout_s").value)
+
+        self.navigation_mode = str(self.get_parameter("navigation_mode").value)
+        gps_reliable_topic = str(self.get_parameter("gps_reliable_topic").value)
+        image_goal_topic = str(self.get_parameter("image_goal_topic").value)
+        image_goal_ready_topic = str(self.get_parameter("image_goal_ready_topic").value)
+        goal_source_ready_topic = str(self.get_parameter("goal_source_ready_topic").value)
+        self.image_goal_max_stale_s = float(self.get_parameter("image_goal_max_stale_s").value)
 
         self.planning_min_period_s = float(self.get_parameter("planning_min_period_s").value)
         checkpoint_path = str(self.get_parameter("checkpoint_path").value) or None
@@ -284,8 +300,14 @@ class BEVPlannerNode(Node):
         self.create_subscription(Path, global_path_topic, self._on_global_path, sensor_qos)
         self.create_subscription(Bool, global_planner_valid_topic, self._on_global_valid, sensor_qos)
 
+        # Suscripciones para conmutación de modos e Image-Goal
+        self.create_subscription(Bool, gps_reliable_topic, self._on_gps_reliable, reliable_qos)
+        self.create_subscription(Vector3, image_goal_topic, self._on_image_goal, sensor_qos)
+        self.create_subscription(Bool, image_goal_ready_topic, self._on_image_goal_ready, sensor_qos)
+
         self.path_pub = self.create_publisher(Path, planned_path_topic, reliable_qos)
         self.valid_pub = self.create_publisher(Bool, valid_topic, sensor_qos)
+        self.goal_source_ready_pub = self.create_publisher(Bool, goal_source_ready_topic, sensor_qos)
         self.local_grid_pub = self.create_publisher(OccupancyGrid, local_bev_grid_topic, sensor_qos)
         self.vis_pub = (
             self.create_publisher(Image, visualization_topic, sensor_qos)
@@ -302,13 +324,25 @@ class BEVPlannerNode(Node):
         self._target_lat: float | None = None
         self._target_lon: float | None = None
 
+        # Estado de Fuentes de Meta e Image-Goal (Indoor / Auto)
+        self._goal_source_lock = threading.RLock()
+        self._gps_reliable: bool = True
+        self._gps_reliable_last_rx: Time | None = None
+        self._image_goal_relative: tuple[float, float] | None = None
+        self._image_goal_last_rx: Time | None = None
+        self._image_goal_ready: bool = False
+        self._image_goal_ready_last_rx: Time | None = None
+        self._last_active_goal_source: str = "none"
+
         # Estado del Plan Global (D* Lite)
-        self._global_lock = threading.Lock()
+        self._global_lock = threading.RLock()
         self._global_path_poses: list[tuple[float, float]] = []
         self._global_path_valid: bool = False
         self._global_path_last_update: Time | None = None
 
-        self._frame_lock = threading.Lock()
+        self.add_on_set_parameters_callback(self._on_set_params)
+
+        self._frame_lock = threading.RLock()
         self._latest_rgb: np.ndarray | None = None
         self._latest_stamp = None
         self._stop_event = threading.Event()
@@ -318,6 +352,13 @@ class BEVPlannerNode(Node):
         self.get_logger().info(
             f"BEV Planner Node inicializado | image={image_topic} | path={planned_path_topic}"
         )
+
+    def _on_set_params(self, params):
+        for p in params:
+            if p.name == "navigation_mode":
+                self.navigation_mode = str(p.value).lower()
+                self.get_logger().info(f"[PARAM] navigation_mode cambiado a: '{self.navigation_mode}'")
+        return SetParametersResult(successful=True)
 
     # --------------------------------------------------------------------------
     # Callbacks de Sensores y Guía Global
@@ -364,6 +405,40 @@ class BEVPlannerNode(Node):
                 return False
             age_s = (self.get_clock().now() - self._global_path_last_update).nanoseconds / 1e9
             return age_s <= self.global_path_max_stale_s
+
+    def _on_gps_reliable(self, msg: Bool):
+        with self._goal_source_lock:
+            self._gps_reliable = bool(msg.data)
+            self._gps_reliable_last_rx = self.get_clock().now()
+
+    def _on_image_goal(self, msg: Vector3):
+        with self._goal_source_lock:
+            self._image_goal_relative = (float(msg.x), float(msg.y))
+            self._image_goal_last_rx = self.get_clock().now()
+
+    def _on_image_goal_ready(self, msg: Bool):
+        with self._goal_source_lock:
+            self._image_goal_ready = bool(msg.data)
+            self._image_goal_ready_last_rx = self.get_clock().now()
+
+    def _image_goal_is_fresh(self) -> bool:
+        with self._goal_source_lock:
+            if self._image_goal_last_rx is None:
+                return False
+            age_s = (self.get_clock().now() - self._image_goal_last_rx).nanoseconds / 1e9
+            return age_s <= self.image_goal_max_stale_s
+
+    def goal_source_is_ready(self) -> bool:
+        """Indica si la fuente de meta activa del modo configurado está lista y disponible."""
+        nav_mode = str(self.get_parameter("navigation_mode").value).lower()
+        if nav_mode == "outdoor":
+            return True
+        if nav_mode == "auto":
+            with self._goal_source_lock:
+                if self._gps_reliable:
+                    return True
+        with self._goal_source_lock:
+            return bool(self._image_goal_ready and self._image_goal_relative is not None and self._image_goal_is_fresh())
 
     # --------------------------------------------------------------------------
     # Motor Matemático Geodésico (Idéntico a gps_waypoint_controller)
@@ -620,29 +695,78 @@ class BEVPlannerNode(Node):
         local_grid_msg.data = grid_2d.flatten().tolist()
         self.local_grid_pub.publish(local_grid_msg)
 
-        # 3. Cálculo de la meta relativa (x_right, y_forward)
-        if (
-            self._global_path_is_fresh()
-            and self._global_path_valid
-            and len(self._global_path_poses) >= 2
-        ):
-            sub_goal = self._compute_global_subgoal_base_link()
-            goal_x_m, goal_y_m = (
-                sub_goal if sub_goal is not None else self._compute_relative_goal()
+        # 3. Determinación de modo de navegación y selección de meta de tres vías
+        nav_mode = str(getattr(self, "navigation_mode", "outdoor")).lower()
+        if nav_mode not in ("outdoor", "indoor", "auto"):
+            self.get_logger().warn(
+                f"navigation_mode desconocido: '{nav_mode}'. Fallback a 'outdoor'.",
+                throttle_duration_sec=5.0,
             )
+            nav_mode = "outdoor"
+
+        use_outdoor = False
+        if nav_mode == "outdoor":
+            use_outdoor = True
+        elif nav_mode == "auto":
+            with self._goal_source_lock:
+                use_outdoor = bool(self._gps_reliable)
+        else:  # "indoor"
+            use_outdoor = False
+
+        goal_source_ready = False
+        goal_x_m: float | None = None
+        goal_y_m: float | None = None
+        active_source = "none"
+
+        if use_outdoor:
+            # Modo Outdoor: comportamiento estándar (Global Path -> GPS directo)
+            if (
+                self._global_path_is_fresh()
+                and self._global_path_valid
+                and len(self._global_path_poses) >= 2
+            ):
+                sub_goal = self._compute_global_subgoal_base_link()
+                if sub_goal is not None:
+                    goal_x_m, goal_y_m = sub_goal
+                    active_source = "global_path"
+                    goal_source_ready = True
+                else:
+                    goal_x_m, goal_y_m = self._compute_relative_goal()
+                    active_source = "gps_direct"
+                    goal_source_ready = True
+            else:
+                goal_x_m, goal_y_m = self._compute_relative_goal()
+                active_source = "gps_direct"
+                goal_source_ready = True
         else:
-            goal_x_m, goal_y_m = self._compute_relative_goal()
+            # Modo Indoor (o Auto degradado): exclusivamente image-goal
+            with self._goal_source_lock:
+                ready_flag = self._image_goal_ready
+                goal_pt = self._image_goal_relative
+                is_fresh = self._image_goal_is_fresh()
+
+            if ready_flag and goal_pt is not None and is_fresh:
+                goal_x_m, goal_y_m = goal_pt
+                active_source = "image_goal"
+                goal_source_ready = True
+            else:
+                # No inventar fallback geodésico; declarar sin meta válida explícitamente
+                goal_x_m, goal_y_m = None, None
+                active_source = "indoor_unready"
+                goal_source_ready = False
 
         # 4. Planificación del camino sobre la grilla de costos BEV
-        planned = self._plan_on_bev(
-            bev_traversability=bev_flat,
-            observed_mask=observed,
-            goal_x_m=goal_x_m,
-            goal_y_m=goal_y_m,
-            bev_resolution_m=self.bev_resolution,
-            config=self._planner_cfg,
-            candidate_path_bank=self._candidate_path_bank,
-        )
+        planned = None
+        if goal_source_ready and goal_x_m is not None and goal_y_m is not None:
+            planned = self._plan_on_bev(
+                bev_traversability=bev_flat,
+                observed_mask=observed,
+                goal_x_m=goal_x_m,
+                goal_y_m=goal_y_m,
+                bev_resolution_m=self.bev_resolution,
+                config=self._planner_cfg,
+                candidate_path_bank=self._candidate_path_bank,
+            )
         t_after_plan = time.perf_counter()
 
         t_infer_ms = (t_after_infer - t_start) * 1000.0
@@ -652,26 +776,32 @@ class BEVPlannerNode(Node):
 
         now = self.get_clock().now()
         is_valid = bool(
-            planned.final_path_xy_m is not None
+            goal_source_ready
+            and planned is not None
+            and planned.final_path_xy_m is not None
             and planned.final_path_xy_m.shape[0] > 0
             and planned.metadata.get("status") == "ok"
         )
 
         self.get_logger().info(
-            f"[TRACE][BEV] img_stamp={stamp_sec:.3f}s | infer={t_infer_ms:.1f}ms | bev={t_bev_ms:.1f}ms | plan={t_plan_ms:.1f}ms | total={t_total_ms:.1f}ms | valid={is_valid}"
+            f"[TRACE][BEV] img_stamp={stamp_sec:.3f}s | mode={nav_mode}({active_source}) | ready={goal_source_ready} | infer={t_infer_ms:.1f}ms | bev={t_bev_ms:.1f}ms | plan={t_plan_ms:.1f}ms | total={t_total_ms:.1f}ms | valid={is_valid}"
         )
 
-        # 5. Publicación del estado de validez
+        # 5. Publicación del estado de validez y disponibilidad de fuente
         valid_msg = Bool()
         valid_msg.data = is_valid
         self.valid_pub.publish(valid_msg)
+
+        source_ready_msg = Bool()
+        source_ready_msg.data = goal_source_ready
+        self.goal_source_ready_pub.publish(source_ready_msg)
 
         # 6. Publicación del camino planificado en nav_msgs/Path (marco 'base_link')
         path_msg = Path()
         path_msg.header.stamp = now.to_msg()
         path_msg.header.frame_id = "base_link"
 
-        if is_valid:
+        if is_valid and planned is not None and planned.final_path_xy_m is not None:
             for pt in planned.final_path_xy_m:
                 x_genie_right = float(pt[0])
                 y_genie_forward = float(pt[1])
@@ -688,7 +818,11 @@ class BEVPlannerNode(Node):
         self.path_pub.publish(path_msg)
 
         # 7. Publicación de imagen de depuración si está habilitada
-        if self.vis_pub is not None and isinstance(planned.visualization, np.ndarray):
+        if (
+            self.vis_pub is not None
+            and planned is not None
+            and isinstance(planned.visualization, np.ndarray)
+        ):
             vis_bgr = planned.visualization[:, :, ::-1]  # RGB a BGR para OpenCV / cv_bridge
             vis_msg = self.bridge.cv2_to_imgmsg(vis_bgr, encoding="bgr8")
             vis_msg.header.stamp = now.to_msg()
