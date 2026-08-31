@@ -24,10 +24,11 @@ if(BUILD_TESTING)
 endif()
 
 # --- INSTALACIÓN DE DIRECTORIOS COMPLEMENTARIOS ---
-# --- INSTALACIÓN DE DIRECTORIOS COMPLEMENTARIOS ---
 install(DIRECTORY 
   config 
   launch
+  urdf
+  worlds
   DESTINATION share/${PROJECT_NAME}
 )
 
