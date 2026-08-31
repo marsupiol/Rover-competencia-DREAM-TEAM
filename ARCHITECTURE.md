@@ -22,7 +22,7 @@ El sistema se distribuye en los siguientes paquetes de ROS 2:
 
 ---
 
-## Índice de Nodos
+## Índice de Nodos y Subsistemas
 
 1. [x] [**`earth_rover_bridge`**](#1-earth_rover_bridge) *(paquete `earth_rovers_sdk`)*
 2. [x] [**`mini_plus_localization`**](#2-mini_plus_localization) *(paquete `mini_plus_localization` — EKF dual, `navsat_transform`)*
@@ -31,6 +31,9 @@ El sistema se distribuye en los siguientes paquetes de ROS 2:
 5. [x] [**`global_planner_node`**](#5-global_planner_node) *(paquete `er_planning`)*
 6. [x] [**`gps_waypoint_controller`**](#6-gps_waypoint_controller) *(paquete `er_navigation`)*
 7. [x] [**`mission_manager_node`**](#7-mission_manager_node) *(paquete `er_mission`)*
+8. [x] [**`Filtro Complementario Roll/Pitch`**](#8-filtro-complementario-de-inclinación-roll--pitch) *(paquete `earth_rovers_sdk`)*
+9. [x] [**`Gobernador Dinámico de Velocidad`**](#9-gobernador-dinámico-de-velocidad) *(paquete `er_planning`)*
+10. [x] [**`Limitaciones Conocidas y Trabajo Pendiente`**](#10-limitaciones-conocidas-y-trabajo-pendiente) *(análisis integral)*
 
 ---
 
@@ -144,9 +147,12 @@ El procesamiento de tramas WebSocket entrantes comprende cuatro etapas:
 3. **Monitoreo de Batería:**  
    Publicación directa del estado de carga energética.
 
-4. **Reconstrucción Temporal de IMU y Odometría:**  
-   El hardware transmite ráfagas de 100 muestras de aceleración y velocidad angular cada 2 segundos. El nodo interpola uniformemente marcas de tiempo retroactivas ($dt = 2.0 / N \approx 50\text{ Hz}$) para reconstruir una serie temporal continua admisible por el EKF.  
-   La odometría de tracción se calcula mediante integración cinemática bidimensional ($v \cdot \Delta t \cdot [\cos(\theta), \sin(\theta)]$), generando la pose relativa base en `odometry/local`.
+4. **Preprocesamiento Sensorial de IMU y Odometría:**  
+   El hardware transmite ráfagas de aceleración y velocidad angular en paquetes WebSocket cada ~2 segundos.  
+   * **Problema del diseño anterior:** Se interpolaban artificialmente marcas de tiempo retroactivas ($dt = 2.0 / N \approx 50\text{ Hz}$) emitiendo 100 mensajes IMU en el pasado. Esto provocaba dos fallas graves: (1) violación de la causalidad temporal en los buffers TF y descarte sistemático de paquetes en `robot_localization`, y (2) una sobreconfianza artificial de $100\times$ en el rumbo magnético que asfixiaba la estimación del EKF.  
+   * **Comportamiento actual:** Se publica **un único mensaje `sensor_msgs/Imu` en `/imu/data` por reporte de telemetría** con el timestamp actual de ROS, la aceleración lineal promediada de la ráfaga (descontando `accel_bias`) y la velocidad angular promediada corregida por el sesgo calibrado (`_gyro_bias`).  
+   * **Odometría de tracción:** Se calcula mediante integración cinemática bidimensional ($v \cdot \Delta t \cdot [\cos(\theta), \sin(\theta)]$) y se publica en el tópico `/wheel_odom` (`nav_msgs/Odometry`). La pose filtrada en `odometry/local` es responsabilidad exclusiva de `ekf_filter_node_odom`.  
+   * **Carga de Calibración Inercial:** Mediante `_load_inertial_calibration_files()`, el bridge busca automáticamente `config/gyro_bias.json` y `config/accel_bias.json` al inicializar; si no existen, inicializa limpiamente en $0.0$.
 
 ---
 
@@ -167,16 +173,16 @@ Para conciliar la necesidad de una estimación continua y suave con el anclaje g
 
 ```mermaid
 flowchart LR
-    SensorsLocal["Ruedas + IMU"] --> EKF_Odom["ekf_filter_node_odom<br/>(Filtro Local Suave)"]
+    SensorsLocal["Ruedas (/wheel_odom) + IMU (/imu/data)"] --> EKF_Odom["ekf_filter_node_odom<br/>(Filtro Local @ 10 Hz)"]
     EKF_Odom -->|odometry/local| Control["Controladores"]
-    SensorsGlobal["GPS + Brújula"] --> NavSat["navsat_transform"]
-    NavSat --> EKF_Map["ekf_filter_node_map<br/>(Filtro Global)"]
+    SensorsGlobal["GPS (/gps/fix) + Brújula"] --> NavSat["navsat_transform"]
+    NavSat --> EKF_Map["ekf_filter_node_map<br/>(Filtro Global @ 10 Hz)"]
     EKF_Odom -.-> EKF_Map
     EKF_Map -->|odometry/global| GlobalNav["Planificación Global"]
 ```
 
-- **Filtro Local (`ekf_filter_node_odom`):** Fusiona exclusivamente odometría de ruedas e IMU. Publica `odometry/local` y la transformada `odom` $\to$ `base_link`. Su salida es continua y monótona, libre de discontinuidades por saltos de señal de satélite, ideal para los lazos de control cinemático.
-- **Filtro Global (`ekf_filter_node_map`):** Fusiona la odometría local junto a las lecturas geodésicas procesadas por `navsat_transform`. Publica `odometry/global` y la transformada `map` $\to$ `odom`.
+- **Filtro Local (`ekf_filter_node_odom`):** Fusiona la odometría de ruedas `/wheel_odom` y la aceleración/velocidad angular de `/imu/data` a una frecuencia fija de **`frequency: 10.0` Hz**. Publica `odometry/local` y la transformada `odom` $\to$ `base_link`. Su salida es continua y monótona, libre de saltos de satélite, ideal para los lazos de control cinemático.
+- **Filtro Global (`ekf_filter_node_map`):** Fusiona la odometría local junto a las lecturas geodésicas procesadas por `navsat_transform` a **`frequency: 10.0` Hz**. Publica `odometry/global` y la transformada `map` $\to$ `odom`.
 
 ---
 
@@ -190,9 +196,10 @@ Ambos nodos operan con `publish_tf: true` complementándose mutuamente sin gener
 
 ---
 
-### Parámetros Críticos de Configuración
+### Parámetros Críticos y Limitación Arquitectónica de Orientación
 
-- **`odom0_config` (Filtro Local):** Se restringe únicamente a velocidades lineales ($V_x, V_y$), delegando la velocidad angular y orientación estrictamente a la IMU para mitigar el error por deslizamiento de ruedas.
+- **`odom0_config` (Filtro Local):** Se restringe únicamente a velocidades lineales ($V_x, V_y$), manteniendo $V_{\text{yaw}}$ (índice 11) en `false`. Al carecer de encoders independientes por rueda, la velocidad angular de guiñada se delega a la IMU.
+- **Limitación de Fuente Única de Guiñada:** Actualmente **no existe una fuente de orientación absoluta independiente de la brújula magnética**. Dado que `/wheel_odom` se proyecta trigonométricamente usando el mismo rumbo de compás que alimenta `/imu/data`, ambas señales se desvían de forma correlacionada ante distorsiones magnéticas del entorno, impidiendo que el EKF detecte la inconsistencia.
 - **`imu0_relative`:** Configurado en `true` para el filtro local (origen relativo en $\text{yaw}=0$) y en `false` para el filtro global (orientación absoluta respecto al polo magnético/geográfico).
 - **Compensación de Retardo de Red:** Parámetros `sensor_timeout: 2.0`, `delay: 0.1` y `transform_time_offset: 0.05`. Este último publica las transformadas con un adelanto de 50 ms para prevenir errores de extrapolación temporal en nodos clientes ante fluctuaciones de red.
 
@@ -200,7 +207,7 @@ Ambos nodos operan con `publish_tf: true` complementándose mutuamente sin gener
 
 ### Proyección Geodésica (`navsat_transform`)
 
-El nodo `navsat_transform` convierte coordenadas geográficas (latitud, longitud, altitud) en posiciones cartesianas métricas dentro del marco `map`.
+El nodo `navsat_transform` convierte coordenadas geográficas (latitud, longitud, altitud) en posiciones cartesianas métricas dentro del marco `map`, y publica `gps/filtered` convirtiendo continuamente la pose global del EKF a WGS84 por *dead-reckoning* durante cortes de señal GNSS.
 
 La inicialización del origen geodésico (*datum*) se realiza cargando `datum_resolved.yaml` (calculado dinámicamente en la inicialización a partir del primer checkpoint), evitando la selección arbitraria del primer fix GPS ruidoso.
 
@@ -226,17 +233,23 @@ El procesamiento se desacopla en un hilo independiente (`_planning_loop`):
 
 ```mermaid
 flowchart TD
-    A["1. Inferencia SAM-TP<br/>(RGB &rarr; score_mask ~85-90 ms en GPU)"] --> B["2. Proyección Homográfica a BEV<br/>(project_score_to_bev &rarr; 4m&times;4m @ 0.03 m/px)"]
+    A["1. Inferencia SAM-TP<br/>(RGB &rarr; score_mask ~85-90 ms en GPU)"] --> B["2. Proyección Homográfica a BEV<br/>(project_score_to_bev &rarr; 4m&times;4m @ 0.03 m/px, 134&times;134)"]
     B --> C["3. Determinación de Sub-meta Relativa<br/>(Lookahead global @ 3.5 m o Rumbo Geodésico)"]
-    C --> D["4. Evaluación de Trayectorias GeNIE<br/>(277 curvas precomputadas &rarr; Path Óptimo)"]
+    C --> D["4. Evaluación de Trayectorias GeNIE<br/>(Banco de 600 curvas &rarr; Path Óptimo)"]
+    D --> E["5. Gobernador Dinámico P95<br/>(Cálculo de v_safe &rarr; earth_rover/safe_velocity_limit)"]
 ```
 
-1. **Inferencia de Transitabilidad (SAM-TP):** Segmenta la superficie transitable generando una matriz de puntuación continua (`score_mask`). Tiempo de ejecución típico: ~85–90 ms en acelerador GPU.
-2. **Proyección en Perspectiva Cenital (`project_score_to_bev`):** Mediante parámetros intrínsecos (`camera_k`) y extrínsecos (`camera_t`) con hipótesis de plano de suelo (`ground_z = 0.0`), proyecta la máscara a una grilla métrica cenital de $4\text{m} \times 4\text{m}$ ($133 \times 133$ celdas a $0.03\text{ m/px}$). Publica la grilla en `earth_rover/local_bev_grid`.
+1. **Inferencia de Transitabilidad (SAM-TP):** Segmenta la superficie transitable generando una matriz de puntuación continua (`score_mask`). Tiempo de ejecución típico: ~85–90 ms en acelerador GPU RTX 5060 (~4.5 s en CPU).
+2. **Proyección en Perspectiva Cenital (`project_score_to_bev`):** Mediante parámetros intrínsecos (`camera_k`) y extrínsecos (`camera_t`) con hipótesis de plano de suelo (`ground_z = 0.0`), proyecta la máscara a una grilla métrica cenital isótropa de $4.0\text{m} \times 4.0\text{m}$ ($134 \times 134$ celdas a $0.03\text{ m/px}$, $\lceil 4.0/0.03 \rceil = 134$). Publica la grilla en `earth_rover/local_bev_grid`.
 3. **Selección de Meta Relativa:**
    - *Modo Jerárquico:* Si existe una ruta global válida y vigente (`_global_path_is_fresh()`, antigüedad $< 3.0\text{ s}$), extrae una sub-meta a una distancia de prospección (`global_lookahead_distance_m = 3.5\text{ m}`).
    - *Modo Fallback:* Si la ruta global expira o es inválida, computa el rumbo directo por trigonometría esférica (fórmula de Haversine).
-4. **Optimización de Trayectoria GeNIE (`_plan_on_bev`):** Evalúa un conjunto de 277 primitivas de movimiento precomputadas contra la grilla de costos locales, aplicando filtrado de colisión (`threshold_cost = 0.50`), agrupamiento direccional (`max_clusters = 4`) y fusión de los mejores candidatos (`best_k = 12`).
+4. **Optimización de Trayectoria GeNIE (`_plan_on_bev`):** 
+   - El banco contiene **600 trayectorias polinomiales precomputadas una única vez al inicio en `__init__`**.
+   - Evalúa las 600 curvas contra la grilla de costos locales con huella dilada (`footprint_px = ceil(0.30 / 0.03) = 10\text{ px}`). En un escenario despejado, sobreviven al filtro de colisión típicamente $\approx 277$ curvas.
+   - Aplica agrupamiento direccional K-Means (`max_clusters = 4`) y fusión de los mejores candidatos (`best_k = 12`).
+   - *Hallazgo de escalamiento:* La latencia de GeNIE escala con la cantidad de caminos sobrevivientes; por lo tanto, el planner evalúa más rápido en entornos con obstáculos que en áreas completamente despejadas.
+5. **Gobernador Dinámico de Velocidad P95:** Registra la latencia total del ciclo en una ventana móvil de 30 muestras, calcula el percentil 95 ($t_{\text{plan,P95}}$) y resuelve la velocidad máxima segura $v_{\text{safe}}$ garantizando parada dentro del horizonte visible ($2.40\text{ m}$) con margen de seguridad $1.5$. Si $v_{\text{safe}} < 0.15\text{ m/s}$, aplica corte a $0.0$ (*Stop & Wait*). Publica el límite en `earth_rover/safe_velocity_limit`.
 
 ---
 
@@ -244,6 +257,7 @@ flowchart TD
 
 - **`genie_xy_to_ros_base_link()`:** Convierte la salida cinemática local de GeNIE al estándar ROS ($x_{\text{adelante}} = y_{\text{genie}}, y_{\text{izquierda}} = -x_{\text{genie}}$) mediante rotación rígida constante a tiempo idéntico.
 - **`_compute_global_subgoal_base_link()`:** Transforma puntos expresados en el marco inercial `map` al marco móvil `base_link` utilizando la pose completa y orientación $\text{yaw}$ provistas por TF en el instante actual.
+- **Validación de Isotropía:** Garantiza que la resolución métrica por píxel en el eje longitudinal ($X$) y lateral ($Y$) sea estrictamente idéntica ($0.03\text{ m/px}$), preservando la geometría euclidiana y radios de curvatura de las trayectorias muestreadas.
 
 ---
 
@@ -357,81 +371,69 @@ Es la capa más baja de la jerarquía de decisión: no decide "hacia dónde ir" 
 
 ### Los valores reales que rigen hoy (del YAML, sin clamps)
 
-Con el hallazgo de la ronda anterior confirmado —el código ya no clampea nada—, estos son los números que gobiernan el rover en producción:
+Con el hallazgo confirmado —el código ya no clampea nada—, estos son los números que gobiernan el rover en producción:
 - `goal_tolerance_m`: `13.0`
 - `align_threshold_deg`: `18.0` (umbral fino, cerca de la meta)
 - `coarse_align_threshold_deg`: `25.0` (umbral grueso, lejos)
 - `approach_align_distance_m`: `8.0` (el punto donde pasa de uno a otro)
-- `forward_speed`: `0.4`
-- `turn_speed`: `0.7`
+- `forward_speed`: `0.40`
+- `turn_speed`: `0.70`
 - `control_loop_hz`: `3.0`
 - `turn_burst_s`: `0.25`
-- `pause_after_turn_s`: `0.8`
+- `pause_after_turn_s`: `0.80`
 - `max_heading_jump_deg`: `150.0`
 - `heading_filter_alpha`: `0.35`
 - `gps_max_stale_s`: `2.0`
+- `heading_max_stale_s`: `2.0`
 - `path_max_stale_s`: `8.0`
+- `require_velocity_governor`: `true`
+- `geodesic_fallback_speed`: `0.20`
 
 ---
 
-### El orden de las guardas de seguridad en `_control_loop` — por qué importa el orden, no solo qué chequea cada una
+### El orden de las guardas de seguridad en `_control_loop`
 
-Cada ciclo (3Hz) evalúa, en este orden estricto, y sale apenas una condición aplica:
+Cada ciclo (3 Hz) evalúa en este orden estricto, saliendo apenas una condición aplica:
 
-1. **Pausa externa (`_navigation_paused`)** — si `mission_manager_node` lo pausó, frena y no evalúa nada más.
-2. **Esperando confirmación del SDK (`_awaiting_next_target`)** — ya llegó a la meta, está esperando que el manager confirme el checkpoint; mientras tanto, re-publica `REACHED` periódicamente por si el mensaje anterior se perdió.
-3. **Datos insuficientes** — sin meta activa o sin GPS, no hace nada (ni siquiera frena explícitamente, porque no hay "hacia dónde" para calcular).
-4. **GPS viejo (`gps_max_stale_s=2.0`)** — frena y espera, sin intentar navegar con datos de posición desactualizados.
-
-Recién después de pasar las cuatro, calcula distancia y decide qué hacer. El orden importa porque cada guarda es más barata de evaluar que la siguiente, y porque las primeras representan condiciones que deben anular cualquier cálculo posterior sin excepción — no importa qué tan bueno sea el heading, si estás pausado, estás pausado.
-
----
-
-### La selección de fuente de rumbo — tres caminos, no dos
-
-Esto es más rico de lo que parece a primera vista:
-
-1. **Si hay un camino BEV fresco y válido** (`path_max_stale_s=8.0`, mucho más permisivo que el `global_path_max_stale_s=3.0` de `bev_planner_node` — tiene sentido, es una capa más abajo en la cadena, con más margen antes de considerar el dato "viejo"): sigue ese camino, calculando el error de rumbo hacia un punto a `lookahead_distance_m=1.0` metros adelante en la trayectoria.
-2. **Si el camino está fresco pero es inválido** (`bev_planner_node` no encontró ruta): entra en modo **RECOVERY** — gira en el lugar a `recovery_turn_speed=0.3` sin avanzar, una respuesta activa de "estoy atascado, déjame reorientarme" en vez de simplemente frenar y esperar.
-3. **Si no hay camino fresco en absoluto:** cae al cálculo GPS puro (bearing directo Haversine) — el mismo fallback de siempre, la base de todo el diseño fail-open.
+1. **Pausa externa (`_navigation_paused`):** Si `mission_manager_node` pausó la navegación, frena inmediatamente ($v=0, \omega=0$) y no evalúa nada más.
+2. **Esperando confirmación del SDK (`_awaiting_next_target`):** Ya llegó a la meta; republica periódicamente `REACHED` sin avanzar mientras espera que el manager confirme el checkpoint.
+3. **Datos insuficientes:** Sin meta activa (`target_lat is None`) o sin GPS (`current_lat is None`), no emite movimiento.
+4. **GPS viejo (`_gps_is_fresh()` con `gps_max_stale_s = 2.0`):** Frena y espera sin navegar a ciegas.
+5. **Heading viejo (`_heading_is_fresh()` con `heading_max_stale_s = 2.0`):** Si los datos de brújula se congelan por más de 2 segundos (o son rechazados sucesivamente por la guarda de salto de $150^\circ$), frena de inmediato por seguridad. Un rumbo desactualizado es mucho más peligroso que la ausencia de dato, pues comandaría rotaciones y avances hacia direcciones arbitrarias.
 
 ---
 
-### El burst & wait, con una capa de sofisticación que no habíamos visto en detalle
+### La selección de fuente de rumbo y velocidad (Arquitectura Fail-Safe)
 
-La máquina ALIGN/DRIVE ya la conocíamos, pero el `turn_burst_s` del YAML (`0.25s`) resulta ser solo el piso — dentro de la fase TURN, hay un burst dinámico según la gravedad del error:
-- $\text{error} > 30^\circ \implies$ ráfaga de `0.65s` (giro agresivo)
-- $\text{error} > 15^\circ \implies$ `0.40s` (medio)
-- si no $\implies$ `0.22s` ("micro-toque de francotirador", según el propio comentario del código).
+El diseño anterior operaba en modo *Fail-Open* (si el planificador fallaba, el rover avanzaba a máxima velocidad hacia el GPS). El diseño actual es **estrictamente Fail-Safe**:
 
-O sea, cuanto más lejos está el rumbo correcto, más tiempo gira de corrido antes de pausar a revisar — evita el desperdicio de hacer 5 micro-correcciones cuando bastaría con una ráfaga larga.
-
----
-
-### El filtro de heading y su bug conocido, ahora en contexto completo
-
-`heading_filter_alpha=0.35` es un filtro exponencial simple: cada lectura nueva mueve el heading interno un 35% hacia el valor recibido, suavizando el ruido. El chequeo `max_heading_jump_deg=150.0` descarta lecturas que saltan demasiado — y acá está el bug que ya diagnosticamos con el arnés de pruebas: no hay ningún control de antigüedad sobre `current_heading`. Si el heading queda "congelado" tras un rechazo de salto, puede seguir usándose indefinidamente sin que nada lo marque como stale, a diferencia del GPS (que sí tiene `_gps_is_fresh()`). Sigue siendo un pendiente real, no resuelto.
+1. **Seguimiento de Trayectoria BEV:** Si hay un camino válido y fresco (`path_max_stale_s = 8.0`), sigue los waypoints con lookahead dinámico (`lookahead_distance_m = 1.0`).
+2. **Recovery Mode Activo:** Si el camino está fresco pero no es válido (`planner_valid = False`), entra en `RECOVERY` rotando en el lugar (`recovery_turn_speed = 0.3\text{ rad/s}`) para despejar el campo visual sin avanzar hacia el obstáculo.
+3. **Gobernador de Velocidad Dinámico:**
+   - **Caso 1 (Nunca recibido):** Si `require_velocity_governor: true`, $v_{\text{eff}} = 0.0\text{ m/s}$ (detención por arranque o caída temprana del planner). Si `require_velocity_governor: false` (modo geodésico puro deliberado), $v_{\text{eff}} = \min(v_{\text{fallback}}, v_{\text{fwd}}) = 0.20\text{ m/s}$.
+   - **Caso 2 (Vigente $\le 3.0\text{ s}$):** $v_{\text{eff}} = \min(v_{\text{fwd}}, v_{\text{safe}})$.
+   - **Caso 3 (Expirado $> 3.0\text{ s}$):** Si `path_following_enabled: true`, detención total $v_{\text{eff}} = 0.0\text{ m/s}$. En navegación geodésica pura, limita a $v_{\text{eff}} = 0.20\text{ m/s}$.
 
 ---
 
-### Un mecanismo elegante que no habíamos nombrado: el "detector de rechazo del SDK"
+### Burst & Wait Adaptativo y Detector de Rechazo del SDK
 
-En `_on_navigation_pause`: si el controlador estaba pausado (por `mission_manager_node`, esperando confirmar un checkpoint), y lo despausan mientras todavía está en `_awaiting_next_target=True`, eso solo puede significar una cosa: el SDK rechazó el checkpoint como "todavía no llegaste" — así que el controlador reduce su propia tolerancia a la mitad (`goal_tolerance *= 0.5`, con piso de `0.5m`). Es una forma de decir "el servidor dice que no estoy tan cerca como pensaba, sé más estricto la próxima vez que declare 'llegué'". Con corridas repetidas de rechazo, la tolerancia converge geométricamente hacia el piso mínimo — auto-corrección sin intervención externa.
+* **Ráfaga Dinámica según Error de Rumbo:**
+  - $\text{error} > 30^\circ \implies$ ráfaga de $0.65\text{ s}$ (giro agresivo).
+  - $\text{error} > 15^\circ \implies$ ráfaga de $0.40\text{ s}$ (giro medio).
+  - $\text{error} \le 15^\circ \implies$ ráfaga de $0.22\text{ s}$ (micro-ajuste fino).
+* **Detector de Rechazo:** Si el manager despausa mientras `_awaiting_next_target` sigue activo (indicando que el backend del SDK rechazó el checkpoint por distancia insuficiente), el controlador reduce automáticamente su tolerancia a la mitad (`goal_tolerance *= 0.5`, piso en $0.5\text{ m}$), convergiendo hacia el centro del checkpoint.
 
 ---
 
 ## 7. `mission_manager_node`
 
 > **Paquete:** `er_mission`  
-> **Rol:** Gestión de objetivos de alto nivel, orquestación del ciclo de vida y comunicación con SDK (el jefe de misión)
+> **Rol:** Gestión de objetivos de alto nivel, orquestación del ciclo de vida y comunicación con SDK
 
-### Rol
+### Rol y Máquina de Estados
 
-Es el único nodo que le habla al SDK por HTTP. Todo lo demás del sistema no sabe nada de la existencia del servidor remoto — recibe posiciones GPS y publica comandos de movimiento, punto. Este nodo es el puente entre "lo que pasa localmente" y "lo que el backend de la competencia necesita saber".
-
----
-
-### La máquina de estados completa
+Es el único nodo que interactúa con la API REST del SDK. 
 
 ```mermaid
 flowchart LR
@@ -445,35 +447,87 @@ flowchart LR
     CONFIRMING_CHECKPOINT -->|completado| FINISHED
 ```
 
-`STARTING_MISSION` → `FETCHING_CHECKPOINTS` → `WAITING_FOR_GPS` → `NAVIGATING_CHECKPOINT` → (al llegar) `PRE_POST_STOP` → `AWAITING_HTTP_RESPONSE` → `CONFIRMING_CHECKPOINT` → vuelve a `NAVIGATING_CHECKPOINT` con el siguiente, o `FINISHED`.
+---
+
+### Concurrencia Protegida con `threading.Lock()` y Protocolo Asíncrono
+
+`_notify_checkpoint_reached` no bloquea el executor de ROS:
+1. Pasa al estado `PRE_POST_STOP`, pausa la navegación (`earth_rover/navigation_pause -> True`) e inicia un hilo secundario `http_worker`.
+2. El hilo ejecuta la petición HTTP `POST /checkpoint-reached`.
+3. Las variables compartidas (`_http_response_data`, `_http_response_status`, `_http_request_in_flight`) se leen y escriben bajo protección atómica estricta con **`self._http_lock = threading.Lock()`**, previniendo condiciones de carrera con el bucle de la máquina de estados a 1 Hz.
 
 ---
 
-### El patrón "hilo + estado de espera" — el mismo truco que ya vimos en el bridge, aplicado a HTTP lento
+### Reanudación de Misión y Warm Start (`_abort_and_resume_navigation`)
 
-`_notify_checkpoint_reached` no bloquea el nodo esperando la respuesta del servidor — lanza un hilo (`http_worker`) y cambia el estado a `AWAITING_HTTP_RESPONSE`, devolviendo `"in_flight"` de inmediato. El `_state_machine_loop` (corriendo a 1Hz) revisa en cada tick si el hilo ya terminó (`_http_request_in_flight`); cuando sí, procesa el resultado. Es exactamente la misma filosofía que `_control_tick` en `earth_rover_bridge` — nunca bloquear el hilo principal de ROS esperando una llamada de red, delegar a un hilo secundario y sincronizar por bandera.
+Ante rechazos del SDK o reintentos de comunicación, `_abort_and_resume_navigation()` despausa el controlador (`navigation_pause -> False`) e invoca determinísticamente a **`_publish_current_checkpoint_goal()`**, republicando las coordenadas del objetivo actual en `earth_rover/target_waypoint` para que el controlador reanude el guiado sin quedar inactivo.
 
----
-
-### El "parche de amnesia" — una decisión deliberada, documentada como tal
-
-Al recibir la lista de checkpoints, si es la primera vez (`state in (FETCHING_CHECKPOINTS, WAITING_FOR_GPS)`), ignora deliberadamente lo que el SDK diga sobre `latest_scanned_checkpoint` y fuerza el inicio desde el Checkpoint 1. El propio nombre ("amnesia") reconoce que esto es una simplificación consciente — probablemente para que cada corrida de prueba empiece limpia sin arrastrar progreso de intentos anteriores en el servidor. Una vez que ya está navegando, sí respeta el progreso real (`max(self.latest_scanned_checkpoint, sdk_latest)`).
+*(Nota: En la auditoría de limpieza se eliminó el método inalcanzable `_post_checkpoint_task` y los imports duplicados).*
 
 ---
 
-### Dos formas independientes de detectar "llegué" — defensa en profundidad
+## 8. Filtro Complementario de Inclinación (Roll / Pitch)
 
-La forma principal es la señal `REACHED` que publica `gps_waypoint_controller`. Pero hay un backup completamente independiente: `_check_proximity_to_checkpoint`, que corre en cada tick mientras `NAVIGATING_CHECKPOINT`, midiendo la distancia real por su cuenta. Si detecta que está dentro de `checkpoint_max_distance_m` (13.5m del YAML) durante `proximity_dwell_s` seguidos (2.0 segundos según el YAML — mucho más agresivo que el default de 15.0 del código, como marqué antes), dispara el POST de checkpoint aunque el controlador nunca haya declarado `REACHED`. Esto cubre el caso donde, por ejemplo, `gps_waypoint_controller` tiene una tolerancia distinta o algo falla en la cadena de señales — el manager no depende ciegamente de una sola fuente de verdad.
+> **Paquete:** `earth_rovers_sdk` (`bridge_node.py`)  
+> **Rol:** Estimación continua de inclinación sobre el plano de rodadura y diagnóstico inercial
 
-Hay un guard adicional (`min_navigation_time_s=8.0`) que evita que este backup dispare en el primer instante de haber fijado el target — sin él, un warm-start real podría confundirse con "backup de proximidad" antes de darle tiempo al controlador a operar normalmente.
+### Justificación Física y Sustitución del Watchdog
+
+El diseño anterior empleaba un watchdog que reseteaba arbitrariamente $\text{roll} = 0.0$ y $\text{pitch} = 0.0$ tras 6 segundos con aceleración no estacionaria. En rampas rugosas o puentes con vibración continua ($\sigma_m > 0.06\text{ g}$), este reseteo provocaba que el rover afirmara falsamente estar sobre terreno plano mientras ascendía pendientes de $10^\circ$, introduciendo discontinuidades y un error de rumbo proyectado de hasta $16.7^\circ$.
+
+### Doble Compuerta Estadística y Propagación Continua
+
+El filtro complementario implementa una compuerta dual basada en la magnitud media y dispersión del vector de aceleración corregido por sesgo $\mathbf{a} = (a_x, a_y, a_z)$:
+1. **Compuerta Abierta (Aceleración Estacionaria):**
+   $$|\|\mathbf{a}\| - 1.0\text{ g}| < 0.08\text{ g} \quad \land \quad \sigma_m < 0.06\text{ g}$$
+   Se actualizan roll y pitch fusionando la inclinación del acelerómetro con la integración giroscópica ($\alpha = 0.20$):
+   $$\theta_k = (1 - \alpha)(\theta_{k-1} + \omega_y \cdot \Delta t) + \alpha \cdot \theta_{\text{acc}}$$
+   $$P_{\theta, k} = (1 - \alpha)^2 (P_{\theta, k-1} + Q \cdot \Delta t) + \alpha^2 \cdot \sigma_{\text{acc}}^2$$
+2. **Compuerta Cerrada (Movimiento Acelerado / Vibración Sostenida):**
+   El acelerómetro se desacopla por completo y el ángulo se propaga puramente por integración de giróscopo:
+   $$\theta_k = \theta_{k-1} + \omega_y \cdot \Delta t$$
+   $$P_{\theta, k} = P_{\theta, k-1} + Q \cdot \Delta t \quad (Q = 0.005\text{ rad}^2/\text{s})$$
+3. **Telemetría de Diagnóstico:** Se publica en `earth_rover/tilt_gate_diag` un payload JSON con `gate_open`, `duty_cycle_pct`, `roll_deg`, `pitch_deg`, `roll_std_deg` y `pitch_std_deg`.
 
 ---
 
-### 🔴 Hallazgo real: código muerto que crashearía si alguna vez se ejecutara
+## 9. Gobernador Dinámico de Velocidad
 
-`_post_checkpoint_task` es un método completo, con su propia lógica de POST HTTP, que llama a `self._handle_successful_checkpoint_response(seq, completed)` y `self._handle_rejected_checkpoint_response(dist)` — ninguno de los dos métodos existe en el archivo. Si `_post_checkpoint_task` se ejecutara alguna vez, tiraría `AttributeError` de inmediato.
+> **Paquete:** `er_planning` (`bev_planner_node.py`)  
+> **Rol:** Cálculo de velocidad máxima admisible en función de la latencia real del pipeline
 
-La buena noticia: nunca se llama desde ningún lado. Revisé todo el archivo — el único camino real de POST de checkpoint es `_notify_checkpoint_reached` (el patrón hilo + estado que expliqué arriba), invocado desde `_handle_checkpoint_reached_impl`. `_post_checkpoint_task` parece ser un resto de una implementación anterior, más simple y bloqueante, que se reemplazó por el patrón asíncrono actual sin borrar el código viejo.
+### Derivación Matemática de la Ecuación de Frenado Cuadrática
 
-No es un bug activo — es código muerto e inofensivo mientras nadie lo invoque. Pero si en algún refactor futuro alguien lo conecta pensando que es funcional (por ejemplo, "ah, hay una función que ya hace esto"), va a crashear el nodo en el peor momento posible: justo al reportar un checkpoint. Vale la pena borrarlo cuando haya una ronda de limpieza, y de paso los dos `import threading`/`import requests` duplicados al principio del archivo (inofensivos, pero descuidados).
+La distancia requerida de parada ($d_{\text{stop}}$) con desaceleración constante $a_{\text{brake}} = 1.5\text{ m/s}^2$ y tiempo total de retardo $b = t_{\text{plan,P95}} + t_{\text{rtt}} + t_{\text{delay}}$ es:
+$$d_{\text{stop}} = v \cdot b + \frac{v^2}{2 \cdot a_{\text{brake}}}$$
+
+Exigiendo un margen de seguridad multiplicativo $\text{margin} = 1.5$ sobre el horizonte visible $d_{\text{horizon}} = 2.40\text{ m}$:
+$$v \cdot b + \frac{v^2}{2 \cdot a_{\text{brake}}} \le \frac{d_{\text{horizon}}}{\text{margin}} \iff \frac{1}{2 \cdot a_{\text{brake}}} v^2 + b \cdot v - \frac{d_{\text{horizon}}}{\text{margin}} = 0$$
+
+Resolviendo para la raíz positiva:
+$$v_{\text{safe}} = a_{\text{brake}} \cdot \left( \sqrt{b^2 + \frac{2 \cdot d_{\text{horizon}}}{a_{\text{brake}} \cdot \text{margin}}} - b \right)$$
+
+### Tabla de Comportamiento Nominal ($d = 2.40\text{ m}, \text{margin} = 1.5, a = 1.5\text{ m/s}^2, t_{\text{rtt}} = 0.10\text{ s}, t_{\text{delay}} = 0.041\text{ s}$)
+
+| $t_{\text{plan}}$ (ms) | $b$ (s) | $v_{\text{safe}}$ Teórico (m/s) | $v_{\text{safe}}$ Efectivo (m/s) | Estado Operativo |
+| :---: | :---: | :---: | :---: | :--- |
+| **280 ms** | 0.421 s | 1.65 m/s | **0.40 m/s** (tope nominal) | Operación fluida en GPU |
+| **1000 ms** | 1.141 s | 1.07 m/s | **0.40 m/s** | Umbral de tráfico dinámico |
+| **2000 ms** | 2.141 s | 0.68 m/s | **0.40 m/s** | Latencia degradada |
+| **8130 ms** | 8.271 s | 0.19 m/s | **0.19 m/s** | Modo arrastre de seguridad |
+| **11200 ms** | 11.341 s | 0.14 m/s | **0.00 m/s** (piso $<0.15$) | Parada de seguridad (*Stop & Wait*) |
+
+> [!NOTE]
+> **Alerta de Tráfico Dinámico:** Si $t_{\text{plan,P95}} > 1.0\text{ s}$, el nodo emite una advertencia de diagnóstico pues a tasas inferiores a 1 Hz no es posible garantizar la evasión de peatones o vehículos en movimiento rápido.
+
+---
+
+## 10. Limitaciones Conocidas y Trabajo Pendiente
+
+1. **Calibración Óptica Pendiente:** Los parámetros intrínsecos de cámara ($f_x, f_y, c_x, c_y$) y extrínsecos ($h=0.18\text{ m}, \text{pitch}=-8^\circ$) son nominales. La proyección BEV tiene error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
+2. **Dependencia de Sensor de Guiñada Único:** `/wheel_odom` utiliza el mismo rumbo de brújula que alimenta `/imu/data`; por ende, no existe una fuente de orientación independiente para desacoplar perturbaciones magnéticas en el EKF.
+3. **Compensación Dinámica de Inclinación:** La rotación homográfica por roll/pitch no está activada en producción para evitar introducir ruido óptico adicional hasta calibrar la cámara.
+4. **Telemetría de RPMs sin Explotar:** El SDK reporta `rpms` de tracción pero actualmente no se integran para estimación de patinamiento lateral.
+5. **Configuración de Grilla BEV:** El ajuste de resolución de celda ($0.05\text{ m/px}$) permanece congelado a la espera de las mediciones de latencia en la máquina de la RTX 5060.
+6. **Optimización de GeNIE:** El frente de poda y reescritura de `third_party/genie` se encuentra suspendido a la espera del profiling formal en hardware final.
 

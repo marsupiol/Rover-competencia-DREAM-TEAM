@@ -8,6 +8,10 @@ Arquitectura de navegación autónoma, percepción visual profunda (SAM-TP), pla
 
 > Para una explicación detallada del funcionamiento interno de cada nodo, ver [ARCHITECTURE.md](ARCHITECTURE.md).
 
+> [!WARNING]
+> **ESTADO DE LA CALIBRACIÓN DE CÁMARA (LIMITACIÓN PRINCIPAL DEL SISTEMA):**  
+> Los parámetros intrínsecos de la cámara ($f_x, f_y, c_x, c_y$) y extrínsecos ($h = 0.18\text{ m}$, $\text{pitch} = -8^\circ$) son actualmente **nominales y aproximados**, no calibrados en banco óptico sobre el chasis físico. La proyección métrica BEV y la cobertura lateral tienen un error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
+
 ```text
                                +-------------------------------------------------------------+
                                |                 FrodoBots Cloud / Rover Físico              |
@@ -29,7 +33,8 @@ Arquitectura de navegación autónoma, percepción visual profunda (SAM-TP), pla
 |    - Publica telemetría GNSS cruda: /gps/fix (sensor_msgs/NavSatFix)                              |
 |    - Publica IMU MPU-6050: /imu/data (sensor_msgs/Imu)                                             |
 |    - Publica odometría cinemática: /wheel_odom (nav_msgs/Odometry)                                 |
-|    - Publica rumbo magnético: earth_rover/heading (std_msgs/Float32)                               |
+|    - Publica rumbo magnético: earth_rover/heading_raw (std_msgs/Float32)                           |
+|    - Publica diagnóstico de compuerta de inclinación: earth_rover/tilt_gate_diag (std_msgs/String) |
 |    - Suscribe control motriz: cmd_vel (geometry_msgs/Twist)                                        |
 +----------------------------------------------------------------------------------------------------+
        │                          │                     │                            ▲
@@ -43,23 +48,24 @@ Arquitectura de navegación autónoma, percepción visual profunda (SAM-TP), pla
 |    -> gps/filtered           |  │  |    - Proyección matemática a Bird's-Eye-View (BEV)            |
 |    -> /odometry/gps          |  │  |    - Banco de trayectorias polinomiales (GeNIE Path Bank)     |
 |    -> Srv: /fromLL           |  │  |    - Clustering adaptativo K-Means orientado a la meta        |
-|                              |  │  |    - Publica: earth_rover/planned_path (nav_msgs/Path)        |
-|  [ekf_filter_node_odom]      |  │  |    - Publica: earth_rover/planner_valid (std_msgs/Bool)       |
-|    -> odometry/local (odom)  |  │  |    - Publica: earth_rover/planner_visualization (Image)       |
-|                              |  │  |    - Publica: earth_rover/local_bev_grid (OccupancyGrid)      |
-|  [ekf_filter_node_map]       |  │  +---------------------------------------------------------------+
-|    -> odometry/global (map)  |  │          │                   │                     │ local_bev_grid
-|                              |  │          │ planned_path      │ planner_valid       │ (base_link)
-|  [ekf_heading_bridge]        |  │          ▼                   ▼                     ▼
-|    -> earth_rover/heading    |  │  +---------------------------------------------------------------+
-+------------------------------+  │  | PAQUETE: er_navigation                                        |
-       │                          │  |                                                               |
-       │ gps/filtered             │  |  [gps_waypoint_controller]                                    |
-       │                          │  |    - Guard de frescura GNSS: gps_max_stale_s                  |
+|                              |  │  |    - Gobernador dinámico de velocidad P95                     |
+|  [ekf_filter_node_odom]      |  │  |    - Publica: earth_rover/planned_path (nav_msgs/Path)        |
+|    -> odometry/local (odom)  |  │  |    - Publica: earth_rover/planner_valid (std_msgs/Bool)       |
+|                              |  │  |    - Publica: earth_rover/safe_velocity_limit (Float32)      |
+|  [ekf_filter_node_map]       |  │  |    - Publica: earth_rover/planner_visualization (Image)       |
+|    -> odometry/global (map)  |  │  |    - Publica: earth_rover/local_bev_grid (OccupancyGrid)      |
+|                              |  │  +---------------------------------------------------------------+
+|  [ekf_heading_bridge]        |  │          │             │                   │ safe_velocity_limit
+|    -> earth_rover/heading    |  │          │ planned_path│ planner_valid     ▼
++------------------------------+  │          ▼             ▼     +-----------------------------------+
+       │                          │  +---------------------------| PAQUETE: er_navigation            |
+       │ gps/filtered             │  |                           |                                   |
+       │                          │  |  [gps_waypoint_controller]|                                   |
+       │                          │  |    - Gobernador Fail-Safe: require_velocity_governor          |
+       │                          │  |    - Guard de frescura GNSS & Heading (heading_max_stale_s)   |
        │                          │  |    - Path Follower: lookahead sobre earth_rover/planned_path  |
-       │                          │  |    - Fallback: cálculo de rumbo geodésico (Haversine/Bearing) |
-       │                          │  |    - Recovery Mode: giro sobre el eje si el planner no halla  |
-       │                          │  |      caminos viables libres de obstáculos                     |
+       │                          │  |    - Fallback: rumbo geodésico (geodesic_fallback_speed)      |
+       │                          │  |    - Recovery Mode: giro si el planner no halla caminos       |
        │                          │  |    - Máquina de estados: ALIGN (Burst & Wait) / DRIVE (Curva) |
        │                          │  |    - Publica: cmd_vel (geometry_msgs/Twist)                   |
        │                          │  |    - Publica: earth_rover/waypoint_status ("REACHED")         |
@@ -564,15 +570,24 @@ pip install hydra-core "scikit-learn<1.5" "scipy<1.15" huggingface-hub
 
 ---
 
+---
+
 ## 8. Estado Actual y Limitaciones Conocidas
 
-1. **Rendimiento de Inferencia en CPU:** En procesadores x86 estándar sin GPU dedicada, el ciclo completo de inferencia SAM-TP toma entre $4.0\text{ s}$ y $5.5\text{ s}$ por frame (medido en tests reales). Gracias a la arquitectura desacoplada en hilos independientes y al fallback de frescura (`path_max_stale_s`), el bucle de control no se congela, pero la navegación en tiempo real a alta velocidad requiere aceleración GPU.
-2. **Dimensiones de la Huella (`footprint_px`):** El parámetro `footprint_px` en `planner_params.yaml` está configurado por defecto en 10 píxeles ($\approx 30\text{ cm}$). Se encuentra pendiente la confirmación milimétrica en banco de pruebas del chasis real del Earth Rover Mini+.
-3. **Mapeo Persistente y Planificador Global D\* Lite:** Integrados en el launch de producción `mission1.launch.py` detrás del flag de activación `enable_global_planning` (default: `true`), con acumulación Bayesiana, escala graduada de costos, decaimiento temporal y dilación de footprint.
-4. **Comportamiento Asesor del Planificador Global:** El planificador global es puramente ASESOR. Si D* Lite determina que la única ruta es un rodeo hacia atrás, la sub-meta apuntará hacia atrás, pero el planificador local BEV — que sólo ve 4m hacia adelante y prioriza avanzar — puede ignorarla sistemáticamente y quedar oscilando si no hay caminos viables en esa dirección. No hay mecanismo para que el planificador global "insista" o fuerce una maniobra de retroceso en el planificador local.
-5. **Reemplazo en Vivo de Traversability:** `traversability_node` (percepción 2D basada en franjas de imagen) ha sido desacoplado del pipeline en vivo a favor de `bev_planner_node` (que provee proyección métrica BEV y trayectorias continuas).
-6. **Jitter de Red 4G/LTE:** La latencia variable en la transmisión de comandos y telemetría del rover es mitigada mediante la máquina de estados *Burst & Wait* y los filtros EKF duales.
-7. **Límite de Escala del Mapa Persistente (grilla densa):** `persistent_map_node` usa hoy una grilla densa de tamaño fijo (400m x 400m @ 0.20m/px = 4 millones de celdas, ~1.6GB en RAM como float32). El decaimiento (`_decay_timer_cb`) y el diff de costos (`_on_map`) procesan la grilla COMPLETA en cada ciclo, sin importar cuánto del mapa esté realmente cerca del rover en ese momento. Esto es adecuado para el área de una competencia (cientos de metros), pero NO escala a trayectos largos (por ejemplo, 80km entre dos puntos): a esa distancia, incluso un corredor angosto de 200m de ancho ya requiere del orden de 400 millones de celdas (~1.6GB adicionales), y el costo de procesamiento por ciclo crece con el tamaño TOTAL del mapa acumulado durante todo el viaje, no con la distancia restante al checkpoint. D* Lite en sí mismo no es el cuello de botella (sus estructuras `g`/`rhs` son diccionarios dispersos que escalan con el camino buscado, no con el mapa completo) — el límite está en la infraestructura de `persistent_map_node` alrededor de él. Ver sección 10 (Roadmap) para el diseño propuesto que resuelve esto.
+1. **Estado de la Calibración Óptica (Limitación Principal):** Los parámetros intrínsecos ($f_x, f_y, c_x, c_y$) y extrínsecos ($h=0.18\text{ m}, \text{pitch}=-8^\circ$) son nominales. La proyección BEV tiene error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
+2. **Dependencia de Sensor de Rumbo Único:** No existe una segunda fuente de orientación absoluta independiente del compás magnético. La odometría cinemática `/wheel_odom` proyecta velocidades integrando el mismo rumbo de brújula que alimenta `/imu/data`; por ende, si la brújula sufre perturbaciones ferromagnéticas, ambas fuentes se desvían de forma correlacionada y el EKF no puede detectar la inconsistencia.
+3. **Gobernador Dinámico de Velocidad (Fail-Safe vs. Fail-Open):** El gobernador calcula la velocidad máxima segura $v_{\text{safe}}$ resolviendo la ecuación cuadrática de frenado según la latencia percentil 95 ($t_{\text{plan,P95}}$) de inferencia y planificación. El controlador motriz implementa una política estrictamente *Fail-Safe* con tres estados:
+   * **Nunca recibido (`None`):** Si `require_velocity_governor: true`, el rover permanece inmovilizado ($v = 0.0\text{ m/s}$) protegiendo el avance a ciegas. Si `require_velocity_governor: false` (modo geodésico puro deliberado), avanza a velocidad de fallback (`geodesic_fallback_speed: 0.20\text{ m/s}`).
+   * **Vigente ($\le 3.0\text{ s}$):** Velocidad acotada a $\min(v_{\text{fwd}}, v_{\text{safe}})$.
+   * **Expirado ($> 3.0\text{ s}$):** Si `path_following_enabled: true`, detención total ($v = 0.0\text{ m/s}$). En modo geodésico puro, navegación conservadora a $0.20\text{ m/s}$.
+4. **Filtro Complementario Roll/Pitch y Diagnóstico Inercial:** Reemplaza al watchdog que revertía roll/pitch a cero tras 6 segundos (el cual afirmaba falsamente estar en plano al subir rampas rugosas). Emplea doble compuerta estadística (media $|\|\mathbf{a}\| - 1.0| < 0.08\text{ g}$, dispersión $\sigma_m < 0.06\text{ g}$). Con compuerta cerrada, propaga por integración giroscópica expandiendo continuamente la covarianza analítica ($P_k = P_{k-1} + Q \cdot \Delta t$) y publica telemetría en `earth_rover/tilt_gate_diag`.
+5. **Archivos de Calibración Inercial (`gyro_bias.json` y `accel_bias.json`):** Al iniciar, `earth_rover_bridge` busca automáticamente archivos JSON en `config/`. Si existen, descuenta los sesgos medidos; si no existen, inicializa limpiamente en $0.0$ emitiendo logs informativos.
+6. **Rendimiento de Inferencia en CPU vs GPU:** En CPU (Ryzen 3 3200G), SAM-TP toma $\approx 4.5\text{ s}$ por ciclo, disparando el piso del gobernador a $v=0.0\text{ m/s}$ (*Stop & Wait*). La navegación fluida en tiempo real requiere aceleración GPU dedicada (RTX 5060).
+7. **Modos de Despliegue `ROVER_MODE`:** 
+   * `ROVER_MODE: "manual"` (por defecto en `docker-compose.gpu.yml`): Contenedor en espera para depuración interactiva y pruebas de profiling.
+   * `ROVER_MODE: "full"` (por defecto en `docker-compose.yml`): Lanza automáticamente `mission1.launch.py`.
+   > [!CAUTION]
+   > Con `ROVER_MODE: "full"`, **NUNCA** ejecutar `mission_manager.launch.py` manualmente dentro del contenedor, ya que se ejecutarán dos instancias completas del stack compitiendo por la GPU y el control del robot.
 
 ---
 
@@ -580,82 +595,84 @@ pip install hydra-core "scikit-learn<1.5" "scipy<1.15" huggingface-hub
 
 ### 9.0. Changelog Reciente (Fixes Críticos y Mejoras de Infraestructura)
 
-- **Canal Semántico Dual en Mapa Persistente (`persistent_map_node`):**
-  - *Problema:* El prior topológico de OpenStreetMap (veredas y calles) se disolvía por el decaimiento temporal exponencial de la grilla de ocupación, o una sola observación fugaz de cámara anulaba la preferencia de vereda.
-  - *Solución:* Separación estricta en dos capas internas: `self._confidence` (evidencia dinámica sujeta a decaimiento) y `self._semantic` (prior estático inmune al decaimiento), combinadas con umbral de seguridad `semantic_override_threshold: 30.0` (solo evidencia acumulada sólida de obstáculo sobreescribe el prior).
-- **Google Chrome Estable para Decodificación H.264 y RTM:**
-  - *Problema:* El Chromium bundled por defecto en Playwright carecía de códecs propietarios para streaming H.264 WebRTC, provocando congelamiento de video y cortes intermitentes en Agora RTM.
-  - *Solución:* Instalación de `google-chrome-stable` oficial en el `Dockerfile` y configuración de `CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome-stable`, garantizando transmisión continua y reconexión automática RTM.
-- **Dependencias de `earth_rovers_sdk` en Dockerfile:**
-  - *Problema:* Faltaba instalar el manifiesto de dependencias de `earth_rovers_sdk` en la imagen Docker, generando errores de importación (`websocket-client`, `opencv-python-headless`) al arrancar `earth_rover_bridge`.
-  - *Solución:* Creación de `src/earth_rovers_sdk/requirements.txt` e incorporación del paso `pip3 install -r src/earth_rovers_sdk/requirements.txt` en el `Dockerfile`.
-- **Anclaje de Datum Resuelto en `ekf.launch.py`:**
-  - *Problema:* `navsat_transform_node` recibía `parameters=[ekf_yaml]`, dejando inactivo el archivo `datum_resolved.yaml` generado dinámicamente desde el Checkpoint #1 de la misión SDK.
-  - *Solución:* Corrección del pase de parámetros a `parameters=navsat_parameters`, aplicando el anclaje geodésico determinista al inicializar la odometría global.
-- **Modo `ROVER_MODE=manual` en `entrypoint.sh`:**
-  - *Problema:* El entrypoint auto-arrancaba siempre todos los procesos en segundo plano, dificultando el debugging interactivo y desarrollo modular con `docker exec`.
-  - *Solución:* Incorporación de `ROVER_MODE=manual` (mantiene el contenedor vivo con `sleep infinity` listo para control manual sin disparar nodos), conservando `ROVER_MODE=full` como valor por defecto para producción.
-- **Optimización de Caché de Capas en `Dockerfile`:**
-  - *Problema:* Cualquier edición en el código fuente de `src/` invalidaba las capas pesadas de instalación de dependencias de IA (PyTorch, SAM-TP, GeNIE).
-  - *Solución:* Reorganización de las instrucciones `COPY` y `RUN` en `Dockerfile` para cachear manifiestos y librerías de IA antes de montar el workspace de ROS 2.
-
-### 9.1. Integrado a la Misión de Producción
-Al ejecutar `ros2 launch er_bringup mission1.launch.py` con `enable_global_planning:=true` (valor por defecto), los siguientes componentes corren de forma orquestada:
-- **`earth_rover_bridge`**: Ingesta de video MJPEG ($1024 \times 576$), telemetría GNSS cruda, IMU MPU-6050, odometría de ruedas, rumbo magnético y envío de `cmd_vel` al servidor SDK.
-- **`mini_plus_localization`**: EKF dual (`odometry/local`, `odometry/global`), proyección geodésica `/fromLL` y bridge de rumbo REP-105.
-- **`bev_planner_node`**: Inferencia de transitabilidad SAM-TP, proyección BEV local ($0.03\text{ m/px}$), banco de caminos GeNIE y cálculo de sub-meta global con fallback automático a rumbo geodésico.
-- **`persistent_map_node`** *(activado por `enable_global_planning:=true`)*: Acumulación Bayesiana de evidencia en marco `map` ($400\text{ m} \times 400\text{ m}$ @ $0.20\text{ m/px}$) con decaimiento temporal periódico ($0.7738$ cada $5\text{ s}$).
-- **`global_planner_node`** *(activado por `enable_global_planning:=true`)*: Planificación global incremental D* Lite sobre el mapa persistente, publicando `earth_rover/global_path` y estado de validez.
-- **`gps_waypoint_controller`**: Seguimiento de trayectorias locales (`earth_rover/planned_path`), guard de frescura GNSS, control de avance/giro con máquina de estados *Burst & Wait* y detección de llegada a checkpoint.
-- **`mission_manager_node`**: Orquestador de checkpoints y sincronización de protocolo HTTP asíncrono con el backend de la competencia.
-
-*(Si se pasa `enable_global_planning:=false`, los nodos `persistent_map_node` y `global_planner_node` no se ejecutan y `bev_planner_node` opera de forma puramente local con rumbo geodésico directo).*
-
-### 9.2. Estado de Validación por Nivel de Confianza
-
-Para no mezclar niveles de certeza técnica, el estado de cada componente se divide estrictamente según el tipo de evidencia existente:
-
-#### A) Revisión de Código y Derivación Analítica (Matemática Verificada)
-- **Orientación geométrica de `local_bev_grid`:** Derivación formal de la transformación matricial $90^\circ$ e inversión de ejes hacia la convención REP-103 en `base_link` ($+X$ adelante, $+Y$ izquierda).
-- **Transformación de sub-meta global a local en `bev_planner_node`:** Verificada analíticamente con ejemplos numéricos de cálculo trigonométrico (ángulos a $45^\circ$, $135^\circ$ y distancias métricas hacia adelante/lateral).
-- **Lógica de fallback *Fail-Open* en `bev_planner_node`:** Revisión exhaustiva de código que garantiza que si el path global no está disponible o expira, el planificador local calcula automáticamente el rumbo geodésico directo sin bloquear el hilo.
-- **Fusión de Canal Semántico Dual:** Verificación analítica de la combinación `grid_effective`, cuantización a múltiplos de 5 y comportamiento asintótico del prior de veredas (`-24.0`) frente al decaimiento temporal.
-
-#### B) Verificado con Pruebas Unitarias / Escenarios Sintéticos (Sin Hardware Real)
-- **Canal Semántico Dual y Progresión de Evidencia:** Validado exhaustivamente mediante tests unitarios programáticos ([`test_dual_channel_persistent_map.py`](src/er_planning/test/test_dual_channel_persistent_map.py) y [`test_evidence_progression.py`](src/er_planning/test/test_evidence_progression.py)), certificando la no-disolución del prior OSM, persistencia del costo óptimo (1.00) en veredas y sobreescritura estricta ante obstáculos persistentes observados por la cámara. *(Nivel B: aún no validado en corrida física con el canal semántico activo)*.
-- **Test de obstáculo asimétrico:** Validación programática de la matriz de `local_bev_grid` confirmando que un obstáculo a la izquierda no se proyecta a la derecha.
-- **Rendimiento de `persistent_map_node`:** Tiempo de procesamiento de `_on_map` medido en ~17–74 ms sobre una grilla densa sintética ($400\text{ m} \times 400\text{ m}$). Decaimiento Bayesiano verificado con pruebas de expiración de evidencia.
-- **Algoritmo D\* Lite (`global_planner_node`):** Verificado en grillas sintéticas con obstáculos simulados dinámicamente; tiempo de ciclo incremental acotado por `max_vertex_updates_per_cycle`.
-- **Precomputación del Banco de Trayectorias GeNIE:** Verificado en `bev_planner_node` mediante benchmarks de inicialización única (`sample_paths_polynomial` en `__init__`, reduciendo latencia de 1985ms a ~283ms/frame).
-- **Comportamiento en `global_map_test.launch.py`:** En esta prueba aislada, al no haber cámara física ni stream de video real conectado, `bev_planner_node` solo instanció sus suscriptores/publicadores pero no ejecutó su bucle interno de inferencia visual.
-
-#### C) Validado con Datos Reales del Hardware
-- **Bridge SDK y Servidor (`earth_rover_bridge` + `sdk_server`):** Conexión HTTP REST, WebSockets y recepción de streams MJPEG reales ($1024 \times 576$) y telemetría de sensores desde el servidor SDK.
-- **Estabilidad de Video H.264 y RTM con Google Chrome:** Validada conexión persistente y recepción de video WebRTC en misión real sin desconexiones de señal.
-- **Misión Real con Checkpoints Alcanzados (`mission_manager_node` + Controlador BEV):** Ejecución física en hardware real completando tramos de misión y registrando checkpoints alcanzados exitosamente.
-  > [!IMPORTANT]
-  > **Limitación / Condición de Prueba:** Esta corrida real en hardware se ejecutó con `enable_global_planning:=false` (es decir, en modo puramente reactivo con percepción SAM-TP en GPU, planificador local BEV y controlador *Burst & Wait*). Por ende, el **canal semántico dual y D\* Lite NO estuvieron activos** en esta validación física.
-- **Inferencia SAM-TP en GPU Dedicada (RTX 5060 Laptop):** Latencia real de ciclo completo optimizado medida en ~283.83 ms promedio (~3.5 Hz, N=54 frames reales). Inferencia SAM-TP aislada en ~86–91 ms y ray-casting BEV en ~59 ms.
-
-#### D) ⚠️ LO QUE NUNCA SE CORRIÓ CON DATOS REALES (Declaración Explícita)
-- **Misión de punta a punta con Planificación Global y Canal Semántico Activos (`enable_global_planning:=true`):** El stack completo unificado (cámara en vivo + SAM-TP en GPU + prior semántico OSM + mapa persistente dual + D* Lite + sub-meta global + control motriz con hardware real) **NUNCA se corrió conjuntamente en una misión física en movimiento**. Las pruebas reales exitosas se ejecutaron en modo local reactivo (`enable_global_planning:=false`).
-- **Dinámicas y latencias del controlador:** Los números de inercia del chasis, constantes de tiempo de giro y latencia de red 4G del controlador son sintéticos y basados en emulación, no en una corrida real en terreno.
-
-### 9.3. Pendiente Antes de Confiar en Competencia Real
-Orden de prioridad técnica estricto:
-1. **Corrida real de punta a punta con Planificador Global (`enable_global_planning:=true`):** Ejecutar una misión completa con el rover físico y cámara real conectando todo el stack unificado para verificar estabilidad de memoria RAM, carga de CPU/GPU, persistencia del canal semántico y respuesta ante obstáculos del mundo real.
-2. **Identificación de sistema (System ID) con datos reales del rover:** Registrar y procesar un rosbag de telemetría real (`earth_rover/control_debug`, `earth_rover/bridge_debug`, `/imu/data`, `/wheel_odom`, `gps/filtered`) para calibrar tiempos de respuesta motriz, latencia real del enlace 4G/WebSockets y parámetros de *Burst & Wait* (`turn_burst_s`, `pause_after_turn_s`).
-3. **Confirmar estado de aceleración GPU:** Confirmar si el entorno de ejecución cuenta con GPU dedicada operativa (NVIDIA Passthrough / CUDA); de lo contrario, en CPU persiste la latencia de 4.0–5.5 s por frame en SAM-TP.
+- **Gobernador Dinámico de Velocidad P95 y Fail-Safe (`bev_planner_node` & `gps_waypoint_controller`):**
+  - Adaptación continua de velocidad segura según latencia P95 del ciclo, eliminación del fail-open inseguro y parámetro `require_velocity_governor` para evitar deadlocks en modos aislados.
+- **Filtro Complementario Roll/Pitch con Compuerta Estadística (`bridge_node.py`):**
+  - Sustitución del watchdog discontinuo por integración continua de giróscopo con compuerta de aceleración y tópico de diagnóstico `earth_rover/tilt_gate_diag`.
+- **Guarda de Expiración de Rumbo (`gps_waypoint_controller`):**
+  - Implementación de `heading_max_stale_s: 2.0` para abortar la navegación ante congelamiento de datos de brújula.
+- **Protección Atómica de Respuestas HTTP y Warm Start (`mission_manager_node`):**
+  - Protección de variables de respuesta con `threading.Lock()` y restablecimiento inmediato de navegación hacia checkpoints en reanudaciones.
+- **Carga Automática de Calibración Inercial (`bridge_node.py`):**
+  - Lectura automática de `gyro_bias.json` y `accel_bias.json` con fallback a parámetros base.
 
 ---
 
-## 10. Próximos Módulos y Roadmap
+## 11. Simulación y Banco de Pruebas Gazebo (FrodoBots Mini+ V6.2)
 
-- [x] **Integración de `earth_rover/global_path` como sub-meta en `bev_planner_node` y `mission1.launch.py`:** Conectado mediante proyección de sub-meta local (`global_lookahead_distance_m`), fallback geodésico (*Fail-Open*) y flag configurable `enable_global_planning`.
-- [x] **Canal Semántico Dual y Fusión de Priors de OpenStreetMap en Mapa Persistente:** Desacople de capas de evidencia dinámica (`self._confidence`) y prior estático (`self._semantic`) con `semantic_override_threshold` para evitar disolución de veredas.
-- [x] **Contenerización y Despliegue con Aceleración GPU NVIDIA y Chrome Estable:** Contenedor unificado Dockerfile con Playwright/Chrome H.264, cacheo de capas PyTorch/SAM-TP/GeNIE, y soporte para `ROVER_MODE=manual`.
-- [ ] **Validación End-to-End con Planificación Global Activa en Hardware Real (`enable_global_planning:=true`):** Prueba física en movimiento con cámara en vivo, mapa persistente dual y D* Lite guiando la sub-meta hacia los checkpoints.
-- [ ] **Arquitectura de Tres Niveles Jerárquicos para Trayectos Largos (ej. 80km entre dos ciudades/universidades):** reemplazar la grilla densa de tamaño fijo de `persistent_map_node` por una ventana local rodante ("rolling window") de tamaño constante (cientos de metros) que se re-centra alrededor de la posición actual del rover, descartando lo que queda muy atrás — acota memoria y cómputo a un tamaño constante sin importar la distancia total del viaje (mismo patrón que el "rolling_window" del costmap global de Nav2). Para la decisión de "por qué calles ir" a lo largo de todo el trayecto, se necesita además un nivel superior de ruteo vial basado en un grafo de calles (tipo OSRM/OpenStreetMap) que entregue una secuencia de waypoints/tramos intermedios — una grilla de celdas no es la representación adecuada para decisiones a escala de kilómetros. Con esto, el sistema queda en tres niveles: (1) ruteo vial por grafo (kilómetros), (2) mapa persistente + D* Lite en ventana rodante (cientos de metros, entre waypoints intermedios) — lo que existe hoy —, y (3) planificador local reactivo BEV (4m, ya implementado en `bev_planner_node`). Fuera de alcance de la competencia actual; queda documentado para una fase posterior.
-- [ ] **Validación End-to-End con Servidor GPU Remoto:** Despliegue del nodo de inferencia en estación base remota y transmisión de trayectorias planificadas comprimidas vía DDS/ZeroMQ.
-- [ ] **Evasión Reactiva Lateral Fina (Wall Following):** Integración de control de contorno lateral en pasillos estrechos cuando ambos lados presentan obstáculos cercanos.
-- [ ] **Calibración Dinámica de Tracción y Deslizamiento:** Ajuste empírico de las matrices de covarianza de odometría según el tipo de terreno (arena, asfalto, césped).
+Se dispone de un modelo cinemático URDF y un mundo sintético SDF en el paquete [`mini_plus_localization`](src/mini_plus_localization/) para validación offline de control, odometría, inclinaciones y navegación sin requerir hardware físico ni GPU con CUDA:
+
+* **Modelo URDF del Rover:** [`src/mini_plus_localization/urdf/mini_plus.urdf`](src/mini_plus_localization/urdf/mini_plus.urdf)
+  * Dimensiones oficiales de chasis: $250\text{ mm} \times 190\text{ mm} \times 195\text{ mm}$, masa $1.4\text{ kg}$, despeje $45\text{ mm}$.
+  * Cinemática Skid-Steer con 4 ruedas de $95\text{ mm}$ de diámetro ($r = 0.0475\text{ m}$), vía de $160\text{ mm}$.
+  * Plugins de simulación para ROS 2 Jazzy: `diff_drive` (skid-steer 4WD), `imu_plugin` (MPU-6050 a 50 Hz), `camera_controller` (cámara frontal $1024 \times 576$, HFOV $126^\circ$), y `gps_controller` (GNSS WGS84).
+* **Mundo Sintético de Prueba:** [`src/mini_plus_localization/worlds/test_track.world`](src/mini_plus_localization/worlds/test_track.world)
+  * Plano horizontal base de $20\text{ m} \times 20\text{ m}$ anclado geodésicamente en Ciudad de México ($19.432608^\circ, -99.133209^\circ$).
+  * Corredor tipo vereda de $1.5\text{ m}$ de ancho con bordillos laterales de $15\text{ cm}$ de altura.
+  * Rampa de $10^\circ$ de pendiente ($3.0\text{ m}$ de longitud) para validación del filtro complementario y seguimiento inercial.
+  * Rampa de $18^\circ$ de pendiente ($2.5\text{ m}$ de longitud), correspondiente a la pendiente máxima nominal del Mini+ V6.2.
+  * Obstáculos verticales para pruebas de evasión reactiva.
+
+### 11.1. Alcance y Límites de la Simulación
+
+> [!WARNING]
+> **Advertencia sobre Parámetros Geométricos sin Respaldo Empírico:**
+> 1. **Pitch de Cámara ($-8^\circ$):** Proviene del valor nominal adoptado tentativamente en el repositorio base. Gazebo **NO PUEDE** validar la calibración de cámara ni la proyección matemática a BEV, porque su verdad de terreno sintética coincide por construcción con el valor geométrico asignado al sensor. La calibración óptica debe realizarse contra el rover físico.
+> 2. **Batalla entre ejes ($150\text{ mm}$):** Es una estimación geométrica (la ficha técnica oficial solo especifica la vía de $160\text{ mm}$ y el largo total de $250\text{ mm}$). Debe medirse físicamente en el chasis real.
+
+---
+
+## 12. Suite de Tests Offline y Verificación Continua
+
+Para validar matemáticamente algoritmos, transformaciones geométricas, gobernadores y fusiones sensoriales sin requerir hardware físico ni GPU:
+
+```bash
+# Ejecutar suite completa de tests unitarios y de integración offline
+pytest src/er_planning/test/test_offline_suite.py src/er_planning/test/test_dual_channel_persistent_map.py -v
+```
+
+### Cobertura de la Suite (19 tests):
+1. **Filtro Complementario Roll/Pitch:** Convergencia en reposo, seguimiento en rampas dinámicas, integración inercial con compuerta cerrada y continuidad sin saltos en transiciones.
+2. **Gobernador Dinámico de Velocidad:** Validación estricta de la tabla de frenado cuadrático, corte por piso de velocidad ($0.15\text{ m/s}$), reacción a picos P95 y latencias extremas.
+3. **Controlador Motriz Fail-Safe:** Verificación de estados del gobernador con `require_velocity_governor` y timeout de rumbo desactualizado (`heading_max_stale_s`).
+4. **Geometría BEV e Isotropía:** Validación de dimensiones de celdas idénticas en ejes longitudinal y lateral ($0.03\text{ m/px}$), y derivación de huella de colisión (`footprint_px`).
+5. **Canal Semántico Dual y Mapa Persistente:** Verificación de contrato Bayesiano de 5 casos, decaimiento temporal sobre veredas OSM y persistencia de evidencia.
+
+---
+
+## 13. Procedimiento de Transición y Despliegue en Máquina GPU (RTX 5060)
+
+Para migrar y ejecutar el entorno en la estación de trabajo con GPU dedicada:
+
+### 13.1. Pasos de Inicialización
+```bash
+# 1. Actualizar repositorio
+git pull origin main
+
+# 2. Levantar contenedor con aceleración NVIDIA
+docker compose -f docker-compose.gpu.yml build
+docker compose -f docker-compose.gpu.yml up -d
+
+# 3. Acceder al contenedor interactivo
+docker exec -it mini_plus_rover bash
+```
+
+### 13.2. Verificaciones Obligatorias al Iniciar
+```python
+# Verificar disponibilidad de CUDA y reconocimiento de la RTX 5060
+python3 -c "import torch; assert torch.cuda.is_available(); print('GPU OK:', torch.cuda.get_device_name(0))"
+```
+
+### 13.3. Parámetros y Credenciales Locales
+* **Credenciales SDK (`src/sdk_server/.env`):** Configurar `SDK_API_TOKEN`, `BOT_SLUG` y `MISSION_SLUG` específicos del bot asignado para la prueba.
+* **Confirmar `ROVER_MODE`:** Confirmar que `docker-compose.gpu.yml` mantenga `ROVER_MODE: "manual"` para permitir la ejecución manual y profiling de nodos.
