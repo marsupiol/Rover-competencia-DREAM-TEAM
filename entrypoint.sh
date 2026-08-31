@@ -54,11 +54,10 @@ fi
 
 case "$ROVER_MODE" in
   full)
-    echo "[entrypoint] ROVER_MODE=full -> bridge + EKF + navegación + misión"
-    # mission1.launch.py ya incluye ekf.launch.py (IncludeLaunchDescription),
-    # así que NO lo lanzamos por separado acá: hacerlo duplicaba cada nodo del
-    # EKF (base_link_to_gps, ekf_filter_node_odom, ekf_filter_node_map,
-    # navsat_transform, ekf_heading_bridge) con el mismo nombre.
+    echo "================================================================================"
+    echo "[entrypoint] [ADVERTENCIA] ROVER_MODE=full — se lanzará mission1.launch.py automáticamente."
+    echo "[entrypoint] NO ejecutar mission_manager.launch.py a mano o correrán dos misiones en paralelo."
+    echo "================================================================================"
     ros2 launch er_bringup mission1.launch.py &
     PIDS+=("$!")
     ;;
@@ -73,10 +72,13 @@ case "$ROVER_MODE" in
     PIDS+=("$!")
     ;;
   manual)
-    echo "[entrypoint] ROVER_MODE=manual -> no se arranca nada automáticamente. Usá 'docker exec -it mini_plus_rover bash' para control total."
+    echo "================================================================================"
+    echo "[entrypoint] ROVER_MODE=manual -> Contenedor en espera para control interactivo."
+    echo "[entrypoint] Usá 'docker exec -it mini_plus_rover bash' para lanzar nodos manualmente."
+    echo "================================================================================"
     ;;
   *)
-    echo "[entrypoint] ROVER_MODE desconocido: $ROVER_MODE (usar full|ekf|bridge|manual)"
+    echo "[entrypoint] ERROR: ROVER_MODE desconocido: $ROVER_MODE (usar full|ekf|bridge|manual)"
     exit 1
     ;;
 esac
@@ -95,8 +97,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "${#PIDS[@]}" -gt 0 ]; then
-  wait -n "${PIDS[@]}"
-  EXIT_CODE=$?
+  EXIT_CODE=0
+  wait -n "${PIDS[@]}" || EXIT_CODE=$?
   echo "[entrypoint] Un proceso del stack terminó (exit $EXIT_CODE). Cerrando contenedor."
   exit "$EXIT_CODE"
 else

@@ -7,7 +7,7 @@ services:
     container_name: mini_plus_rover
     environment:
       # full | ekf | bridge | manual (ver comentarios en entrypoint.sh)
-      ROVER_MODE: "full"
+      ROVER_MODE: "manual"
       CHROME_EXECUTABLE_PATH: "/usr/bin/google-chrome-stable"
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "all"

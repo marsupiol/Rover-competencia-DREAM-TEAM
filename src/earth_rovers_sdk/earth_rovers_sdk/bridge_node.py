@@ -61,12 +61,14 @@ ODOM_TWIST_COVARIANCE = [
 ]
 
 # IMU MPU-6050 (Fusión Inercial)
-# Varianzas infladas para absorber la vibración estructural de los 4 motores DC
-# y el jitter introducido por la latencia de la red 4G/LTE.
+# Covarianza de orientación calibrada (Brief 3 / Tramo 3.1 & Brief 13): 0.025 rad^2 (sigma = 9.07 deg = 0.158 rad).
+# NOTA TÉCNICA: 0.025 rad^2 es adecuado para terreno nominal/plano pero sigue siendo optimista
+# en pendientes mientras no haya tilt compensation activa en el cálculo del compás del SDK,
+# ya que en pendientes de 10°-18° el error de proyección magnética puede alcanzar hasta 28° de desvío.
 IMU_ORIENTATION_COVARIANCE = [
-    0.01, 0.0,  0.0,
-    0.0,  0.01, 0.0,
-    0.0,  0.0,  0.01, # Magnetómetro absoluto: El ancla principal de nuestro yaw
+    0.025, 0.0,   0.0,
+    0.0,   0.025, 0.0,
+    0.0,   0.0,   0.025, # Magnetómetro absoluto + brújula SDK
 ]
 IMU_ANGULAR_VELOCITY_COVARIANCE = [
     0.01, 0.0,  0.0,
@@ -169,11 +171,16 @@ class EarthRoverBridge(Node):
         # this param is provided as a convenience / fallback).
         self.declare_parameter("magnetic_declination_radians", 0.0)
 
-        # Parámetros del Filtro Complementario Roll/Pitch (Brief 5 / E.1)
+        # Parámetros del Filtro Complementario Roll/Pitch e Inercial (Brief 5 / E.1 & Brief 15 / O.4)
         self.declare_parameter("tilt_filter_alpha", 0.20)
         self.declare_parameter("gyro_bias_x", 0.0)
         self.declare_parameter("gyro_bias_y", 0.0)
         self.declare_parameter("gyro_bias_z", 0.0)
+        self.declare_parameter("accel_bias_x", 0.0)
+        self.declare_parameter("accel_bias_y", 0.0)
+        self.declare_parameter("accel_bias_z", 0.0)
+        self.declare_parameter("gyro_bias_file", "")
+        self.declare_parameter("accel_bias_file", "")
         self.declare_parameter("gyro_drift_noise_density", 0.005)
 
         self._odom_pose_covariance = self.get_parameter(
@@ -203,9 +210,15 @@ class EarthRoverBridge(Node):
         self._gyro_bias_x = float(self.get_parameter("gyro_bias_x").value)
         self._gyro_bias_y = float(self.get_parameter("gyro_bias_y").value)
         self._gyro_bias_z = float(self.get_parameter("gyro_bias_z").value)
+        self._accel_bias_x = float(self.get_parameter("accel_bias_x").value)
+        self._accel_bias_y = float(self.get_parameter("accel_bias_y").value)
+        self._accel_bias_z = float(self.get_parameter("accel_bias_z").value)
         self._gyro_drift_noise_density = float(
             self.get_parameter("gyro_drift_noise_density").value
         )
+
+        # Cargar archivos de calibración JSON si existen (Brief 15 / O.4)
+        self._load_inertial_calibration_files()
 
         self._latest_cmd = None
         self._last_cmd_at = 0.0
@@ -237,6 +250,61 @@ class EarthRoverBridge(Node):
         threading.Thread(target=self._telemetry_loop, daemon=True).start()
 
         self.get_logger().info(f"Bridging Earth Rovers SDK at {self.sdk_url}")
+
+    def _load_inertial_calibration_files(self):
+        """Carga archivos de calibración de sesgo gyro_bias.json y accel_bias.json (Brief 15 / O.4)."""
+        import os
+        # 1. Calibración de Giróscopo
+        gyro_file = str(self.get_parameter("gyro_bias_file").value).strip()
+        if not gyro_file:
+            default_gyro = os.path.join(os.getcwd(), "config", "gyro_bias.json")
+            if os.path.isfile(default_gyro):
+                gyro_file = default_gyro
+
+        if gyro_file and os.path.isfile(gyro_file):
+            try:
+                with open(gyro_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._gyro_bias_x = float(data.get("gyro_bias_x", self._gyro_bias_x))
+                self._gyro_bias_y = float(data.get("gyro_bias_y", self._gyro_bias_y))
+                self._gyro_bias_z = float(data.get("gyro_bias_z", self._gyro_bias_z))
+                self.get_logger().info(
+                    f"Calibración de Giróscopo CARGADA desde '{gyro_file}': "
+                    f"bias=({self._gyro_bias_x:.6f}, {self._gyro_bias_y:.6f}, {self._gyro_bias_z:.6f}) rad/s"
+                )
+            except Exception as e:
+                self.get_logger().error(f"Error leyendo '{gyro_file}': {e}. Usando parámetros ROS.")
+        else:
+            self.get_logger().info(
+                f"Sin archivo gyro_bias.json; usando bias inercial: "
+                f"({self._gyro_bias_x:.6f}, {self._gyro_bias_y:.6f}, {self._gyro_bias_z:.6f}) rad/s"
+            )
+
+        # 2. Calibración de Acelerómetro
+        accel_file = str(self.get_parameter("accel_bias_file").value).strip()
+        if not accel_file:
+            default_accel = os.path.join(os.getcwd(), "config", "accel_bias.json")
+            if os.path.isfile(default_accel):
+                accel_file = default_accel
+
+        if accel_file and os.path.isfile(accel_file):
+            try:
+                with open(accel_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._accel_bias_x = float(data.get("accel_bias_x", self._accel_bias_x))
+                self._accel_bias_y = float(data.get("accel_bias_y", self._accel_bias_y))
+                self._accel_bias_z = float(data.get("accel_bias_z", self._accel_bias_z))
+                self.get_logger().info(
+                    f"Calibración de Acelerómetro CARGADA desde '{accel_file}': "
+                    f"bias=({self._accel_bias_x:.6f}, {self._accel_bias_y:.6f}, {self._accel_bias_z:.6f}) g"
+                )
+            except Exception as e:
+                self.get_logger().error(f"Error leyendo '{accel_file}': {e}. Usando parámetros ROS.")
+        else:
+            self.get_logger().info(
+                f"Sin archivo accel_bias.json; usando bias inercial: "
+                f"({self._accel_bias_x:.6f}, {self._accel_bias_y:.6f}, {self._accel_bias_z:.6f}) g"
+            )
 
     def _on_cmd_vel(self, msg: Twist):
         with self._cmd_lock:
@@ -519,14 +587,14 @@ class EarthRoverBridge(Node):
                     dt_tilt = 2.0
                 self._last_tilt_update_time = now_mono
 
-                # 1. Cálculo individual por muestra de aceleración
+                # 1. Cálculo individual por muestra de aceleración corregida por bias
                 mags_a = []
                 rolls_a = []
                 pitches_a = []
                 for s in accels:
-                    ax_s = float(s[0])
-                    ay_s = float(s[1])
-                    az_s = float(s[2])
+                    ax_s = float(s[0]) - self._accel_bias_x
+                    ay_s = float(s[1]) - self._accel_bias_y
+                    az_s = float(s[2]) - self._accel_bias_z
                     norm_s = math.sqrt(ax_s**2 + ay_s**2 + az_s**2)
                     mags_a.append(norm_s)
                     rolls_a.append(math.atan2(ay_s, az_s))
@@ -640,9 +708,9 @@ class EarthRoverBridge(Node):
 
             if accels:
                 num_samples = len(accels)
-                avg_ax = sum(float(sample[0]) for sample in accels) / num_samples * GRAVITY_M_S2
-                avg_ay = sum(float(sample[1]) for sample in accels) / num_samples * GRAVITY_M_S2
-                avg_az = sum(float(sample[2]) for sample in accels) / num_samples * GRAVITY_M_S2
+                avg_ax = sum(float(sample[0]) for sample in accels) / num_samples * GRAVITY_M_S2 - (self._accel_bias_x * GRAVITY_M_S2)
+                avg_ay = sum(float(sample[1]) for sample in accels) / num_samples * GRAVITY_M_S2 - (self._accel_bias_y * GRAVITY_M_S2)
+                avg_az = sum(float(sample[2]) for sample in accels) / num_samples * GRAVITY_M_S2 - (self._accel_bias_z * GRAVITY_M_S2)
                 imu.linear_acceleration.x = avg_ax
                 imu.linear_acceleration.y = avg_ay
                 imu.linear_acceleration.z = avg_az
@@ -652,9 +720,9 @@ class EarthRoverBridge(Node):
                 avg_gx = sum(float(g[0]) for g in gyros) / num_gyros
                 avg_gy = sum(float(g[1]) for g in gyros) / num_gyros
                 avg_gz = sum(float(g[2]) for g in gyros) / num_gyros
-                imu.angular_velocity.x = math.radians(avg_gx)
-                imu.angular_velocity.y = math.radians(avg_gy)
-                imu.angular_velocity.z = math.radians(avg_gz)
+                imu.angular_velocity.x = math.radians(avg_gx) - self._gyro_bias_x
+                imu.angular_velocity.y = math.radians(avg_gy) - self._gyro_bias_y
+                imu.angular_velocity.z = math.radians(avg_gz) - self._gyro_bias_z
 
             imu.orientation.x = 0.0
             imu.orientation.y = 0.0
