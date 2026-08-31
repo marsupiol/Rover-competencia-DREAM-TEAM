@@ -27,7 +27,6 @@ class GPSWaypointController(Node):
         self.declare_parameter("approach_align_distance_m", 8.0)
         self.declare_parameter("forward_speed", 0.35)
         self.declare_parameter("turn_speed", 0.25)
-        self.declare_parameter("angular_speed", 0.80)
         self.declare_parameter("drive_correction_gain", 0.002)
         self.declare_parameter("max_drive_angular", 0.10)
         self.declare_parameter("invert_angular", True)
@@ -47,6 +46,9 @@ class GPSWaypointController(Node):
         self.declare_parameter("max_total_drive_angular", 0.8)
         self.declare_parameter("publish_control_debug", True)
         self.declare_parameter("safe_velocity_limit_topic", "earth_rover/safe_velocity_limit")
+        self.declare_parameter("heading_max_stale_s", 2.0)
+        self.declare_parameter("geodesic_fallback_speed", 0.20)
+        self.declare_parameter("require_velocity_governor", True)
 
         # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
 
@@ -63,7 +65,6 @@ class GPSWaypointController(Node):
         # --- Dinámica de Conducción y Giro ---
         self.forward_speed = float(self.get_parameter("forward_speed").value)
         self.turn_speed = float(self.get_parameter("turn_speed").value)
-        self.angular_speed = float(self.get_parameter("angular_speed").value)
 
         # --- Dinámica de Conducción en Curva ---
         self.drive_correction_gain = float(self.get_parameter("drive_correction_gain").value)
@@ -89,6 +90,9 @@ class GPSWaypointController(Node):
         self.reached_publish_period_s = float(self.get_parameter("reached_publish_period_s").value)
         self.loop_hz = float(self.get_parameter("control_loop_hz").value)
         self.publish_control_debug = bool(self.get_parameter("publish_control_debug").value)
+        self.heading_max_stale_s = float(self.get_parameter("heading_max_stale_s").value)
+        self.geodesic_fallback_speed = float(self.get_parameter("geodesic_fallback_speed").value)
+        self.require_velocity_governor = bool(self.get_parameter("require_velocity_governor").value)
 
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
@@ -169,7 +173,9 @@ class GPSWaypointController(Node):
         # 6. Bucle de Control Principal
         self.timer = self.create_timer(1.0 / self.loop_hz, self._control_loop)
         self.get_logger().info(
-            f"Controlador Híbrido Iniciado | Loop: {self.loop_hz} Hz | Burst: {self.turn_burst_s}s | Filter Alpha: {self.heading_filter_alpha}"
+            f"Controlador Híbrido Iniciado | Loop: {self.loop_hz} Hz | Burst: {self.turn_burst_s}s | "
+            f"Require Governor: {self.require_velocity_governor} | Path Following: {self.path_following_enabled} | "
+            f"Nominal Speed: {self.forward_speed:.2f} m/s | Fallback Speed: {self.geodesic_fallback_speed:.2f} m/s"
         )
 
     # --- CALLBACKS DE SENSORES Y PERCEPCIÓN ---
@@ -312,6 +318,12 @@ class GPSWaypointController(Node):
         age_s = (self.get_clock().now() - self._gps_last_update).nanoseconds / 1e9
         return age_s <= self.gps_max_stale_s
 
+    def _heading_is_fresh(self) -> bool:
+        if self._heading_last_rx is None:
+            return False
+        age_s = (self.get_clock().now() - self._heading_last_rx).nanoseconds / 1e9
+        return age_s <= self.heading_max_stale_s
+
     def _path_is_fresh(self) -> bool:
         if not self.path_following_enabled or self._path_last_update is None:
             return False
@@ -397,8 +409,19 @@ class GPSWaypointController(Node):
 
         # Guarda de seguridad 4: GPS Stale Guard
         if not self._gps_is_fresh():
-            self.cmd_pub.publish(Twist())
+            self._stop_robot()
             self.get_logger().warn("GPS stale: frenando y esperando.", throttle_duration_sec=2.0)
+            return
+
+        # Guarda de seguridad 5: Heading Stale Guard (Brief 14 / N.2)
+        # Un heading obsoleto es más peligroso que ningún heading: induce correcciones activas
+        # hacia rumbos falsos o desalineados, haciendo girar al rover en la dirección incorrecta.
+        if not self._heading_is_fresh():
+            self._stop_robot()
+            self.get_logger().warn(
+                "Heading stale o no recibido: frenando y esperando por seguridad.",
+                throttle_duration_sec=2.0,
+            )
             return
 
         distance = self.haversine_distance(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
@@ -543,14 +566,45 @@ class GPSWaypointController(Node):
             self._align_phase_started_at = None
             self._burst_turn_sign = 0
             
-            # Gobernador de velocidad dinámico basado en tiempo de ciclo real (Brief 8 / H.2)
-            if (
-                self._safe_velocity_limit_last_rx is not None
-                and (now - self._safe_velocity_limit_last_rx).nanoseconds / 1e9 <= 3.0
-            ):
-                effective_speed = max(0.0, min(self.forward_speed, self._safe_velocity_limit))
+            # Gobernador de velocidad dinámico fail-safe (Brief 14 / N.1 & Brief 15 / O.2)
+            if self._safe_velocity_limit_last_rx is None:
+                if self.require_velocity_governor:
+                    # Caso 1a: Esperado pero nunca recibido (arranque, planner no listo aún) -> velocidad 0
+                    effective_speed = 0.0
+                    self.get_logger().warn(
+                        "Gobernador: Sin límite de velocidad recibido aún (require_velocity_governor=true). Deteniendo rover por seguridad (v=0.0).",
+                        throttle_duration_sec=2.0,
+                    )
+                else:
+                    # Caso 1b: Modo geodésico puro deliberado (sin gobernador esperado) -> velocidad reducida conservadora
+                    effective_speed = max(0.0, min(self.geodesic_fallback_speed, self.forward_speed))
+                    self.get_logger().info(
+                        f"Gobernador no requerido (require_velocity_governor=false). Navegando a velocidad geodésica conservadora (v={effective_speed:.2f}m/s).",
+                        throttle_duration_sec=5.0,
+                    )
             else:
-                effective_speed = self.forward_speed
+                age_safe_vel = (now - self._safe_velocity_limit_last_rx).nanoseconds / 1e9
+                if age_safe_vel <= 3.0:
+                    # Caso 2: Recibido y vigente -> usar valor dinámico
+                    effective_speed = max(0.0, min(self.forward_speed, self._safe_velocity_limit))
+                else:
+                    # Caso 3: Recibido pero expirado (>3.0s)
+                    if self.path_following_enabled:
+                        # Si depende del planner BEV y éste dejó de publicar -> fail-safe parada (v=0.0)
+                        effective_speed = 0.0
+                        self.get_logger().warn(
+                            f"Gobernador EXPIRADO (edad={age_safe_vel:.1f}s > 3.0s) con path following activo. "
+                            "Deteniendo rover por seguridad (v=0.0).",
+                            throttle_duration_sec=2.0,
+                        )
+                    else:
+                        # Navegación geodésica pura (sin planner BEV) -> velocidad reducida conservadora
+                        effective_speed = max(0.0, min(self.geodesic_fallback_speed, self.forward_speed))
+                        self.get_logger().warn(
+                            f"Gobernador EXPIRADO (edad={age_safe_vel:.1f}s > 3.0s) en modo geodésico puro. "
+                            f"Limitando a velocidad conservadora (v={effective_speed:.2f}m/s).",
+                            throttle_duration_sec=2.0,
+                        )
 
             twist.linear.x = effective_speed
             # Corrección suave sobre la marcha (Proporcional débil)

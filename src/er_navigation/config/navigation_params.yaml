@@ -33,3 +33,9 @@ gps_waypoint_controller:
     path_max_stale_s: 8.0             # Antigüedad máxima de trayectoria planificada antes de fallback a GPS (segundos)
     lookahead_distance_m: 1.0         # Distancia de persecución sobre la trayectoria (metros)
     recovery_turn_speed: 0.3          # Velocidad angular de búsqueda en modo RECOVERY cuando no hay camino válido (rad/s)
+
+    # --- Gobernador Dinámico de Velocidad (Brief 14 / N.1 & Brief 15 / O.2) ---
+    require_velocity_governor: true   # Si true, requiere tópico safe_velocity_limit del planner BEV
+    safe_velocity_limit_topic: "earth_rover/safe_velocity_limit"
+    heading_max_stale_s: 2.0          # Antigüedad máxima permitida para datos de heading antes de frenar (segundos)
+    geodesic_fallback_speed: 0.20     # Velocidad lineal reducida de seguridad en navegación geodésica pura (m/s)
