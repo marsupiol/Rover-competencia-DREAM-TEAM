@@ -25,8 +25,18 @@ class GPSWaypointController(Node):
         self.declare_parameter("align_threshold_deg", 15.0)
         self.declare_parameter("coarse_align_threshold_deg", 45.0)
         self.declare_parameter("approach_align_distance_m", 8.0)
-        self.declare_parameter("forward_speed", 0.35)
-        self.declare_parameter("turn_speed", 0.25)
+        
+        # Parámetros de acelerador normalizado [0.0, 1.0] (Brief 18 / R.1) con aliases de migración
+        self.declare_parameter("forward_throttle", 0.40)
+        self.declare_parameter("forward_speed", -1.0)        # alias de migración
+        self.declare_parameter("turn_throttle", 0.70)
+        self.declare_parameter("turn_speed", -1.0)           # alias de migración
+        self.declare_parameter("recovery_turn_throttle", 0.30)
+        self.declare_parameter("recovery_turn_speed", -1.0)  # alias de migración
+        self.declare_parameter("geodesic_fallback_throttle", 0.20)
+        self.declare_parameter("geodesic_fallback_speed", -1.0) # alias de migración
+        self.declare_parameter("max_linear_speed_mps", 1.111)
+
         self.declare_parameter("drive_correction_gain", 0.002)
         self.declare_parameter("max_drive_angular", 0.10)
         self.declare_parameter("invert_angular", True)
@@ -42,12 +52,10 @@ class GPSWaypointController(Node):
         self.declare_parameter("path_max_stale_s", 1.0)
         self.declare_parameter("lookahead_distance_m", 1.0)
         self.declare_parameter("path_following_enabled", True)
-        self.declare_parameter("recovery_turn_speed", 0.3)
         self.declare_parameter("max_total_drive_angular", 0.8)
         self.declare_parameter("publish_control_debug", True)
         self.declare_parameter("safe_velocity_limit_topic", "earth_rover/safe_velocity_limit")
         self.declare_parameter("heading_max_stale_s", 2.0)
-        self.declare_parameter("geodesic_fallback_speed", 0.20)
         self.declare_parameter("require_velocity_governor", True)
 
         # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
@@ -62,9 +70,28 @@ class GPSWaypointController(Node):
         self.align_threshold = float(self.get_parameter("align_threshold_deg").value)
         self.coarse_align_threshold = float(self.get_parameter("coarse_align_threshold_deg").value)
 
-        # --- Dinámica de Conducción y Giro ---
-        self.forward_speed = float(self.get_parameter("forward_speed").value)
-        self.turn_speed = float(self.get_parameter("turn_speed").value)
+        # --- Dinámica de Conducción y Giro (Acelerador normalizado [0.0, 1.0]) ---
+        f_spd = float(self.get_parameter("forward_speed").value)
+        f_thr = float(self.get_parameter("forward_throttle").value)
+        self.forward_throttle = f_spd if f_spd >= 0.0 else f_thr
+        self.forward_speed = self.forward_throttle  # alias retrocompatibilidad interna
+
+        t_spd = float(self.get_parameter("turn_speed").value)
+        t_thr = float(self.get_parameter("turn_throttle").value)
+        self.turn_throttle = t_spd if t_spd >= 0.0 else t_thr
+        self.turn_speed = self.turn_throttle
+
+        r_spd = float(self.get_parameter("recovery_turn_speed").value)
+        r_thr = float(self.get_parameter("recovery_turn_throttle").value)
+        self.recovery_turn_throttle = r_spd if r_spd >= 0.0 else r_thr
+        self.recovery_turn_speed = self.recovery_turn_throttle
+
+        g_spd = float(self.get_parameter("geodesic_fallback_speed").value)
+        g_thr = float(self.get_parameter("geodesic_fallback_throttle").value)
+        self.geodesic_fallback_throttle = g_spd if g_spd >= 0.0 else g_thr
+        self.geodesic_fallback_speed = self.geodesic_fallback_throttle
+
+        self.max_linear_speed_mps = float(self.get_parameter("max_linear_speed_mps").value)
 
         # --- Dinámica de Conducción en Curva ---
         self.drive_correction_gain = float(self.get_parameter("drive_correction_gain").value)
@@ -79,7 +106,6 @@ class GPSWaypointController(Node):
         self.path_max_stale_s = float(self.get_parameter("path_max_stale_s").value)
         self.lookahead_distance_m = float(self.get_parameter("lookahead_distance_m").value)
         self.path_following_enabled = bool(self.get_parameter("path_following_enabled").value)
-        self.recovery_turn_speed = float(self.get_parameter("recovery_turn_speed").value)
 
         # --- Tiempos de Ráfaga y Filtros ---
         self.turn_burst_s = float(self.get_parameter("turn_burst_s").value)
@@ -91,7 +117,6 @@ class GPSWaypointController(Node):
         self.loop_hz = float(self.get_parameter("control_loop_hz").value)
         self.publish_control_debug = bool(self.get_parameter("publish_control_debug").value)
         self.heading_max_stale_s = float(self.get_parameter("heading_max_stale_s").value)
-        self.geodesic_fallback_speed = float(self.get_parameter("geodesic_fallback_speed").value)
         self.require_velocity_governor = bool(self.get_parameter("require_velocity_governor").value)
 
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
@@ -151,8 +176,8 @@ class GPSWaypointController(Node):
         self.target_lat = None
         self.target_lon = None
 
-        # Gobernador de Velocidad (H.2)
-        self._safe_velocity_limit: float = self.forward_speed
+        # Gobernador de Velocidad (H.2 / R.1)
+        self._safe_velocity_limit: float = self.max_linear_speed_mps
         self._safe_velocity_limit_last_rx = None
 
         # Seguimiento de Trayectorias Planificadas (BEV)
@@ -170,12 +195,22 @@ class GPSWaypointController(Node):
         self._burst_turn_sign = 0
         self._navigation_paused = False
 
+        # Instrumentación de Ciclo de Trabajo (Brief 18 / R.3.1)
+        self._duty_drive_s: float = 0.0
+        self._duty_turn_s: float = 0.0
+        self._duty_pause_s: float = 0.0
+        self._duty_recovery_s: float = 0.0
+        self._duty_total_s: float = 0.0
+        self._last_duty_tick_at = None
+        self._last_duty_log_at = None
+
         # 6. Bucle de Control Principal
         self.timer = self.create_timer(1.0 / self.loop_hz, self._control_loop)
         self.get_logger().info(
             f"Controlador Híbrido Iniciado | Loop: {self.loop_hz} Hz | Burst: {self.turn_burst_s}s | "
             f"Require Governor: {self.require_velocity_governor} | Path Following: {self.path_following_enabled} | "
-            f"Nominal Speed: {self.forward_speed:.2f} m/s | Fallback Speed: {self.geodesic_fallback_speed:.2f} m/s"
+            f"Forward Throttle: {self.forward_throttle:.2f} (max {self.max_linear_speed_mps:.2f} m/s) | "
+            f"Fallback Throttle: {self.geodesic_fallback_throttle:.2f}"
         )
 
     # --- CALLBACKS DE SENSORES Y PERCEPCIÓN ---
@@ -403,6 +438,36 @@ class GPSWaypointController(Node):
                 self._publish_reached(now)
             return
 
+    def _speed_to_throttle(self, v_mps: float) -> float:
+        """Convierte una velocidad física (m/s) a fracción de acelerador normalizado [0.0, 1.0].
+        
+        Provisionalmente utiliza la relación lineal (throttle = v_mps / max_linear_speed_mps).
+        A calibrar en hardware con la curva real del Mini+ (Brief 18 / R.1.2 y R.1.3).
+        """
+        if v_mps <= 0.0:
+            return 0.0
+        return float(min(1.0, max(0.0, v_mps / max(self.max_linear_speed_mps, 0.01))))
+
+    def _control_loop(self):
+        now = self.get_clock().now()
+
+        # Guarda de seguridad 1: Pausa externa de navegación
+        if self._navigation_paused:
+            self._stop_robot()
+            return
+
+        # Guarda de seguridad 2: Esperando confirmación de waypoint por el SDK
+        if self._awaiting_next_target:
+            self._stop_robot()
+            if self._last_reached_publish_at is None:
+                elapsed = self.reached_publish_period_s
+            else:
+                elapsed = (now - self._last_reached_publish_at).nanoseconds / 1e9
+            # Re-publicar REACHED si el manager tardó en procesar
+            if elapsed >= self.reached_publish_period_s:
+                self._publish_reached(now)
+            return
+
         # Guarda de seguridad 3: Datos insuficientes
         if not self.active_goal or self.current_lat is None or self.current_lon is None:
             return
@@ -414,8 +479,6 @@ class GPSWaypointController(Node):
             return
 
         # Guarda de seguridad 5: Heading Stale Guard (Brief 14 / N.2)
-        # Un heading obsoleto es más peligroso que ningún heading: induce correcciones activas
-        # hacia rumbos falsos o desalineados, haciendo girar al rover en la dirección incorrecta.
         if not self._heading_is_fresh():
             self._stop_robot()
             self.get_logger().warn(
@@ -458,8 +521,17 @@ class GPSWaypointController(Node):
                 # Modo RECOVERY: el planner no encontró camino válido
                 twist = Twist()
                 twist.linear.x = 0.0
-                twist.angular.z = self._apply_angular_sign(self.recovery_turn_speed)
+                twist.angular.z = self._apply_angular_sign(self.recovery_turn_throttle)
                 self.cmd_pub.publish(twist)
+                
+                # Duty cycle tracking
+                if self._last_duty_tick_at is not None:
+                    dt_duty = (now - self._last_duty_tick_at).nanoseconds / 1e9
+                    if 0.0 < dt_duty < 2.0:
+                        self._duty_recovery_s += dt_duty
+                        self._duty_total_s += dt_duty
+                self._last_duty_tick_at = now
+
                 self.get_logger().warn(
                     "Planner: sin camino válido (recovery turn activo).",
                     throttle_duration_sec=2.0,
@@ -491,6 +563,10 @@ class GPSWaypointController(Node):
                         if self._path_last_update is not None
                         else None
                     )
+                    pct_drive = (self._duty_drive_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+                    pct_turn = (self._duty_turn_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+                    pct_pause = (self._duty_pause_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+                    pct_rec = (self._duty_recovery_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
                     debug_payload = {
                         "timestamp_sec": now_sec,
                         "mode": "RECOVERY",
@@ -499,11 +575,20 @@ class GPSWaypointController(Node):
                         "current_heading": float(self.current_heading) if self.current_heading is not None else None,
                         "heading_rx_sec": heading_rx_sec,
                         "cmd_linear_x": 0.0,
+                        "safe_velocity_limit_mps": float(self._safe_velocity_limit),
+                        "safe_throttle_limit": 0.0,
                         "cmd_angular_z": float(twist.angular.z),
                         "align_phase": self._align_phase,
                         "gps_age_s": gps_age,
                         "path_age_s": path_age,
                         "distance_m": float(distance),
+                        "duty_cycle": {
+                            "drive_pct": round(pct_drive, 1),
+                            "turn_pct": round(pct_turn, 1),
+                            "pause_pct": round(pct_pause, 1),
+                            "recovery_pct": round(pct_rec, 1),
+                            "total_active_s": round(self._duty_total_s, 2),
+                        },
                     }
                     dbg_msg = String()
                     dbg_msg.data = json.dumps(debug_payload)
@@ -536,77 +621,89 @@ class GPSWaypointController(Node):
                 if self._align_phase_started_at is None or elapsed >= self.pause_after_turn_s:
                     self._burst_turn_sign = 1 if heading_error > 0.0 else -1
                     self._begin_align_phase("TURN", now)
-                    twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_speed)
+                    twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_throttle)
             else: # Fase TURN
-                twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_speed)
+                twist.angular.z = self._apply_angular_sign(self._burst_turn_sign * self.turn_throttle)
                 
                 # --- INYECCIÓN DE CONTROL DINÁMICO ---
-                # Calculamos el burst on-the-fly según la gravedad del error
                 abs_err = abs(heading_error)
                 if abs_err > 30.0:
                     dynamic_burst = 0.65  # Giro rápido y agresivo para grandes desviaciones
                 elif abs_err > 15.0:
                     dynamic_burst = 0.40  # Giro medio para acercamiento
                 else:
-                    dynamic_burst = 0.22  # Micro-toque de francotirador para no pasarse del umbral
+                    dynamic_burst = 0.22  # Micro-toque de precisión para no pasarse del umbral
                 
-                # Evaluamos el corte contra nuestro burst dynamic, no el estático
                 if elapsed >= dynamic_burst:
                     self._begin_align_phase("PAUSE", now)
                     twist.angular.z = 0.0
+
+            # Duty cycle tracking
+            if self._last_duty_tick_at is not None:
+                dt_duty = (now - self._last_duty_tick_at).nanoseconds / 1e9
+                if 0.0 < dt_duty < 2.0:
+                    if self._align_phase == "TURN":
+                        self._duty_turn_s += dt_duty
+                    else:
+                        self._duty_pause_s += dt_duty
+                    self._duty_total_s += dt_duty
+            self._last_duty_tick_at = now
 
             self.get_logger().info(
                 f"[ALIGN] dist={distance:.1f}m, head_err={heading_error:+.1f}°, "
                 f"cmd_v={twist.linear.x:.2f}, cmd_w={twist.angular.z:+.2f}, align_phase={self._align_phase}",
                 throttle_duration_sec=1.0,
             )
+            safe_throttle_limit = self._speed_to_throttle(self._safe_velocity_limit)
         else:
             mode = "DRIVE"
             self._align_phase = "PAUSE"
             self._align_phase_started_at = None
             self._burst_turn_sign = 0
             
-            # Gobernador de velocidad dinámico fail-safe (Brief 14 / N.1 & Brief 15 / O.2)
+            # Gobernador de velocidad dinámico fail-safe (Brief 14 / N.1, Brief 15 / O.2, Brief 18 / R.1)
+            safe_throttle_limit = self._speed_to_throttle(self._safe_velocity_limit)
+
             if self._safe_velocity_limit_last_rx is None:
                 if self.require_velocity_governor:
-                    # Caso 1a: Esperado pero nunca recibido (arranque, planner no listo aún) -> velocidad 0
-                    effective_speed = 0.0
+                    # Caso 1a: Esperado pero nunca recibido (arranque, planner no listo aún) -> acelerador 0
+                    effective_throttle = 0.0
                     self.get_logger().warn(
-                        "Gobernador: Sin límite de velocidad recibido aún (require_velocity_governor=true). Deteniendo rover por seguridad (v=0.0).",
+                        "Gobernador: Sin límite de velocidad recibido aún (require_velocity_governor=true). Deteniendo rover por seguridad (thr=0.0).",
                         throttle_duration_sec=2.0,
                     )
                 else:
-                    # Caso 1b: Modo geodésico puro deliberado (sin gobernador esperado) -> velocidad reducida conservadora
-                    effective_speed = max(0.0, min(self.geodesic_fallback_speed, self.forward_speed))
+                    # Caso 1b: Modo geodésico puro deliberado (sin gobernador esperado) -> acelerador reducido conservador
+                    effective_throttle = max(0.0, min(self.geodesic_fallback_throttle, self.forward_throttle))
                     self.get_logger().info(
-                        f"Gobernador no requerido (require_velocity_governor=false). Navegando a velocidad geodésica conservadora (v={effective_speed:.2f}m/s).",
+                        f"Gobernador no requerido (require_velocity_governor=false). Navegando a acelerador geodésico conservador (thr={effective_throttle:.2f}).",
                         throttle_duration_sec=5.0,
                     )
             else:
                 age_safe_vel = (now - self._safe_velocity_limit_last_rx).nanoseconds / 1e9
                 if age_safe_vel <= 3.0:
-                    # Caso 2: Recibido y vigente -> usar valor dinámico
-                    effective_speed = max(0.0, min(self.forward_speed, self._safe_velocity_limit))
+                    # Caso 2: Recibido y vigente -> usar valor dinámico convertido a acelerador
+                    effective_throttle = max(0.0, min(self.forward_throttle, safe_throttle_limit))
                 else:
                     # Caso 3: Recibido pero expirado (>3.0s)
                     if self.path_following_enabled:
-                        # Si depende del planner BEV y éste dejó de publicar -> fail-safe parada (v=0.0)
-                        effective_speed = 0.0
+                        # Si depende del planner BEV y éste dejó de publicar -> fail-safe parada (thr=0.0)
+                        effective_throttle = 0.0
                         self.get_logger().warn(
                             f"Gobernador EXPIRADO (edad={age_safe_vel:.1f}s > 3.0s) con path following activo. "
-                            "Deteniendo rover por seguridad (v=0.0).",
+                            "Deteniendo rover por seguridad (thr=0.0).",
                             throttle_duration_sec=2.0,
                         )
                     else:
-                        # Navegación geodésica pura (sin planner BEV) -> velocidad reducida conservadora
-                        effective_speed = max(0.0, min(self.geodesic_fallback_speed, self.forward_speed))
+                        # Navegación geodésica pura (sin planner BEV) -> acelerador reducido conservador
+                        effective_throttle = max(0.0, min(self.geodesic_fallback_throttle, self.forward_throttle))
                         self.get_logger().warn(
                             f"Gobernador EXPIRADO (edad={age_safe_vel:.1f}s > 3.0s) en modo geodésico puro. "
-                            f"Limitando a velocidad conservadora (v={effective_speed:.2f}m/s).",
+                            f"Limitando a acelerador conservador (thr={effective_throttle:.2f}).",
                             throttle_duration_sec=2.0,
                         )
 
-            twist.linear.x = effective_speed
+            twist.linear.x = effective_throttle
             # Corrección suave sobre la marcha (Proporcional débil)
             correction = self.drive_correction_gain * heading_error
             clamped_angular = max(-self.max_drive_angular, min(self.max_drive_angular, correction))
@@ -614,32 +711,39 @@ class GPSWaypointController(Node):
                 max(-self.max_total_drive_angular, min(self.max_total_drive_angular, clamped_angular))
             )
 
+            # Duty cycle tracking
+            if self._last_duty_tick_at is not None:
+                dt_duty = (now - self._last_duty_tick_at).nanoseconds / 1e9
+                if 0.0 < dt_duty < 2.0:
+                    self._duty_drive_s += dt_duty
+                    self._duty_total_s += dt_duty
+            self._last_duty_tick_at = now
+
             self.get_logger().info(
                 f"[DRIVE] dist={distance:.1f}m, head_err={heading_error:+.1f}°, "
-                f"cmd_v={twist.linear.x:.2f} (safe_lim={self._safe_velocity_limit:.2f}), "
+                f"cmd_thr={twist.linear.x:.2f} (safe_lim_mps={self._safe_velocity_limit:.2f}, safe_thr={safe_throttle_limit:.2f}), "
                 f"cmd_w={twist.angular.z:+.2f}, align_phase={self._align_phase}",
                 throttle_duration_sec=1.0,
             )
 
         now_stamp = (now.nanoseconds) / 1e9
         self.get_logger().info(
-            f"[TRACE][CTRL] stamp={now_stamp:.3f}s | mode={mode} | v={twist.linear.x:.2f} | w={twist.angular.z:+.2f} | dist={distance:.1f}m | err={heading_error:+.1f}°"
+            f"[TRACE][CTRL] stamp={now_stamp:.3f}s | mode={mode} | thr={twist.linear.x:.2f} | w={twist.angular.z:+.2f} | dist={distance:.1f}m | err={heading_error:+.1f}°"
         )
 
         self.cmd_pub.publish(twist)
 
         # Telemetría interna para Depuración
-        raw_h = self._raw_heading if self._raw_heading is not None else float("nan")
         status = (
             f"[{mode}] dist={distance:.1f}m, "
             f"head_err={heading_error:+.1f}°, "
-            f"cmd_v={twist.linear.x:.2f}, cmd_w={twist.angular.z:+.2f}"
+            f"cmd_thr={twist.linear.x:.2f}, cmd_w={twist.angular.z:+.2f}"
         )
         out = String()
         out.data = status
         self.status_pub.publish(out)
 
-        # Publicación de Telemetría para Identificación de Sistema (Fase 5.B)
+        # Publicación de Telemetría para Identificación de Sistema (Fase 5.B / Brief 18 / R.3.1)
         if self.publish_control_debug:
             now_sec = now.nanoseconds / 1e9
             heading_rx_sec = (
@@ -657,6 +761,11 @@ class GPSWaypointController(Node):
                 if self._path_last_update is not None
                 else None
             )
+            pct_drive = (self._duty_drive_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+            pct_turn = (self._duty_turn_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+            pct_pause = (self._duty_pause_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+            pct_rec = (self._duty_recovery_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+            
             debug_payload = {
                 "timestamp_sec": now_sec,
                 "mode": mode,
@@ -665,16 +774,36 @@ class GPSWaypointController(Node):
                 "current_heading": float(self.current_heading) if self.current_heading is not None else None,
                 "heading_rx_sec": heading_rx_sec,
                 "cmd_linear_x": float(twist.linear.x),
-                "safe_velocity_limit": float(self._safe_velocity_limit),
+                "safe_velocity_limit_mps": float(self._safe_velocity_limit),
+                "safe_throttle_limit": float(safe_throttle_limit),
                 "cmd_angular_z": float(twist.angular.z),
                 "align_phase": self._align_phase,
                 "gps_age_s": gps_age,
                 "path_age_s": path_age,
                 "distance_m": float(distance),
+                "duty_cycle": {
+                    "drive_pct": round(pct_drive, 1),
+                    "turn_pct": round(pct_turn, 1),
+                    "pause_pct": round(pct_pause, 1),
+                    "recovery_pct": round(pct_rec, 1),
+                    "total_active_s": round(self._duty_total_s, 2),
+                },
             }
             dbg_msg = String()
             dbg_msg.data = json.dumps(debug_payload)
             self.control_debug_pub.publish(dbg_msg)
+
+        # Log periódico del ciclo de trabajo cada 10 segundos
+        if self._last_duty_log_at is None or (now - self._last_duty_log_at).nanoseconds / 1e9 >= 10.0:
+            self._last_duty_log_at = now
+            if self._duty_total_s > 0.0:
+                pct_drive = self._duty_drive_s / self._duty_total_s * 100.0
+                pct_turn = self._duty_turn_s / self._duty_total_s * 100.0
+                pct_pause = self._duty_pause_s / self._duty_total_s * 100.0
+                pct_rec = self._duty_recovery_s / self._duty_total_s * 100.0
+                self.get_logger().info(
+                    f"[DUTY_CYCLE] DRIVE={pct_drive:.1f}% | TURN={pct_turn:.1f}% | PAUSE={pct_pause:.1f}% | RECOVERY={pct_rec:.1f}% (total={self._duty_total_s:.1f}s)"
+                )
 
 
 def main(args=None):

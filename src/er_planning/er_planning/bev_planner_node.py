@@ -804,12 +804,14 @@ class BEVPlannerNode(Node):
         v_limit_msg.data = v_safe
         self.safe_vel_pub.publish(v_limit_msg)
 
+        alive_paths = int(planned.metadata.get("filtered_paths", len(planned.filtered_paths) if planned.filtered_paths is not None else 0))
         diag_data = {
             "t_plan_p95_ms": round(t_plan_p95_s * 1000.0, 1),
             "infer_nn_ms": round(infer_ms, 1),
             "bev_proj_ms": round(bev_ms, 1),
             "plan_genie_ms": round(plan_ms, 1),
             "total_ms": round(total_latency_ms, 1),
+            "alive_paths": alive_paths,
             "v_safe_limit_mps": round(v_safe, 3),
             "forward_range_m": round(float(self.forward_range), 2),
             "dynamic_traffic_safe": dynamic_traffic_safe,
@@ -822,7 +824,7 @@ class BEVPlannerNode(Node):
         self.get_logger().info(
             f"[LATENCY] frame_total={total_latency_ms:.1f}ms (P95={t_plan_p95_s*1000.0:.1f}ms) | "
             f"infer_nn={infer_ms:.1f}ms | bev_proj={bev_ms:.1f}ms | plan_genie={plan_ms:.1f}ms | "
-            f"v_safe={v_safe:.2f}m/s | valid={is_valid} points={len(path_msg.poses)}"
+            f"alive_paths={alive_paths} | v_safe={v_safe:.2f}m/s | valid={is_valid} points={len(path_msg.poses)}"
         )
 
     def destroy_node(self):
