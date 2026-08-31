@@ -178,14 +178,19 @@ Controlador motriz híbrido reactivo con mitigación de jitter 4G (Burst & Wait)
   - `earth_rover/navigation_pause` (`std_msgs/msg/Bool`, RELIABLE): Pausa comandada por el gestor de misión.
   - `earth_rover/waypoint_status` (`std_msgs/msg/String`, RELIABLE): Estado de misión.
 - **Publica:**
-  - `cmd_vel` (`geometry_msgs/msg/Twist`, RELIABLE): Velocidad lineal y angular comandada.
+  - `cmd_vel` (`geometry_msgs/msg/Twist`, RELIABLE): Fracciones normalizadas de acelerador lineal (`linear.x` $\in [-1.0, 1.0]$) y angular (`angular.z` $\in [-1.0, 1.0]$) para el bridge del SDK.
   - `earth_rover/waypoint_status` (`std_msgs/msg/String`, RELIABLE): Notificación `"REACHED"` al alcanzar la meta.
+  - `earth_rover/control_debug` (`std_msgs/msg/String`, BEST_EFFORT): Telemetría en tiempo real y ciclo de trabajo (`drive_pct`, `turn_pct`, `pause_pct`, `recovery_pct`).
 - **Parámetros Clave:**
+  - `forward_throttle` (`float`, default: `0.40`): Fracción normalizada de acelerador lineal en avance (`DRIVE`).
+  - `turn_throttle` (`float`, default: `0.70`): Fracción normalizada de acelerador angular en alineación (`ALIGN`).
+  - `recovery_turn_throttle` (`float`, default: `0.30`): Fracción de acelerador angular de búsqueda en `RECOVERY` cuando no hay camino libre.
+  - `geodesic_fallback_throttle` (`float`, default: `0.20`): Acelerador conservador en navegación geodésica pura.
+  - `max_linear_speed_mps` (`float`, default: `1.111`): Velocidad física máxima de referencia (m/s) para conversión de $v_{\text{safe}}$.
   - `gps_max_stale_s` (`float`, default: `2.0`): Tiempo máximo tolerado sin recibir GPS antes de frenar por seguridad.
   - `path_following_enabled` (`bool`, default: `true`): Activa el seguimiento de `earth_rover/planned_path`.
   - `path_max_stale_s` (`float`, default: `1.0`): Tiempo de expiración del path BEV antes de caer en fallback a GPS puro.
   - `lookahead_distance_m` (`float`, default: `1.0`): Distancia de anticipación euclídea sobre el path.
-  - `recovery_turn_speed` (`float`, default: `0.3`): Velocidad angular de escaneo cuando el planner reporta bloqueo total.
   - `goal_tolerance_m` (`float`, default: `13.0`): Radio geodésico de llegada al checkpoint.
   - `align_threshold_deg` (`float`, default: `18.0`): Umbral de error angular para pasar de `ALIGN` a `DRIVE`.
   - `turn_burst_s` (`float`, default: `0.25`) y `pause_after_turn_s` (`float`, default: `0.8`): Parámetros Burst & Wait anti-latencia.
@@ -637,16 +642,18 @@ Se dispone de un modelo cinemático URDF y un mundo sintético SDF en el paquete
 Para validar matemáticamente algoritmos, transformaciones geométricas, gobernadores y fusiones sensoriales sin requerir hardware físico ni GPU:
 
 ```bash
-# Ejecutar suite completa de tests unitarios y de integración offline
-pytest src/er_planning/test/test_offline_suite.py src/er_planning/test/test_dual_channel_persistent_map.py -v
+# Ejecutar suite completa de tests unitarios y de integración offline (24 tests)
+python3 -m pytest src/er_planning/test -v
 ```
 
-### Cobertura de la Suite (19 tests):
-1. **Filtro Complementario Roll/Pitch:** Convergencia en reposo, seguimiento en rampas dinámicas, integración inercial con compuerta cerrada y continuidad sin saltos en transiciones.
-2. **Gobernador Dinámico de Velocidad:** Validación estricta de la tabla de frenado cuadrático, corte por piso de velocidad ($0.15\text{ m/s}$), reacción a picos P95 y latencias extremas.
-3. **Controlador Motriz Fail-Safe:** Verificación de estados del gobernador con `require_velocity_governor` y timeout de rumbo desactualizado (`heading_max_stale_s`).
-4. **Geometría BEV e Isotropía:** Validación de dimensiones de celdas idénticas en ejes longitudinal y lateral ($0.03\text{ m/px}$), y derivación de huella de colisión (`footprint_px`).
-5. **Canal Semántico Dual y Mapa Persistente:** Verificación de contrato Bayesiano de 5 casos, decaimiento temporal sobre veredas OSM y persistencia de evidencia.
+### Cobertura de la Suite (24 tests):
+1. **Filtro Complementario Roll/Pitch (5 tests):** Convergencia en reposo, seguimiento en rampas dinámicas, integración inercial con compuerta cerrada y continuidad sin saltos en transiciones.
+2. **Gobernador Dinámico de Velocidad (4 tests):** Validación estricta de la tabla de frenado cuadrático, corte por piso de velocidad ($0.15\text{ m/s}$), reacción a picos P95 y latencias extremas.
+3. **Controlador Motriz y Conversión a Acelerador (3 tests):** Verificación de estados del gobernador en acelerador normalizado, función `speed_to_throttle` (cero, sub-máximo, saturación a fondo, negativos) y timeout de rumbo desactualizado (`heading_max_stale_s`).
+4. **Guarda de Retención GPS en Mission Manager (1 test):** Validación ante micro-cortes transitorios de GNSS ($< 10\text{ s}$ retiene coordenadas con warning, $> 10\text{ s}$ rechaza de forma estricta).
+5. **Geometría BEV e Isotropía (4 tests):** Isotropía a $0.03\text{ m/px}$, huella de colisión (`footprint_px`), compensación sintética de inclinación y canal de confianza.
+6. **Fusión Semántica Dual y Mapa Persistente (4 tests):** Contrato Bayesiano de 5 casos, decaimiento temporal sobre veredas OSM, equivalencia sin capa semántica y neutralidad de celdas.
+7. **Progresión Temporal de Evidencia (3 tests):** Aciertos consecutivos, aciertos intercalados con decaimiento temporal y recuperación tras fallos.
 
 ---
 

@@ -249,7 +249,7 @@ flowchart TD
    - Evalúa las 600 curvas contra la grilla de costos locales con huella dilada (`footprint_px = ceil(0.30 / 0.03) = 10\text{ px}`). En un escenario despejado, sobreviven al filtro de colisión típicamente $\approx 277$ curvas.
    - Aplica agrupamiento direccional K-Means (`max_clusters = 4`) y fusión de los mejores candidatos (`best_k = 12`).
    - *Hallazgo de escalamiento:* La latencia de GeNIE escala con la cantidad de caminos sobrevivientes; por lo tanto, el planner evalúa más rápido en entornos con obstáculos que en áreas completamente despejadas.
-5. **Gobernador Dinámico de Velocidad P95:** Registra la latencia total del ciclo en una ventana móvil de 30 muestras, calcula el percentil 95 ($t_{\text{plan,P95}}$) y resuelve la velocidad máxima segura $v_{\text{safe}}$ garantizando parada dentro del horizonte visible ($2.40\text{ m}$) con margen de seguridad $1.5$. Si $v_{\text{safe}} < 0.15\text{ m/s}$, aplica corte a $0.0$ (*Stop & Wait*). Publica el límite en `earth_rover/safe_velocity_limit`.
+5. **Gobernador Dinámico de Velocidad P95:** Registra la latencia total del ciclo en una ventana móvil de 30 muestras, calcula el percentil 95 ($t_{\text{plan,P95}}$) y resuelve la velocidad máxima segura $v_{\text{safe}}$ garantizando parada dentro del horizonte visible configurado ($d_{\text{horizon}} = \text{forward\_range\_m} = 4.00\text{ m}$) con margen de seguridad $1.5$. Si $v_{\text{safe}} < 0.15\text{ m/s}$, aplica corte a $0.0$ (*Stop & Wait*). Publica el límite en `earth_rover/safe_velocity_limit`.
 
 ---
 
@@ -371,13 +371,13 @@ Es la capa más baja de la jerarquía de decisión: no decide "hacia dónde ir" 
 
 ### Los valores reales que rigen hoy (del YAML, sin clamps)
 
-Con el hallazgo confirmado —el código ya no clampea nada—, estos son los números que gobiernan el rover en producción:
+Con el hallazgo confirmado —el código ya no clampea nada—, estos son los números que gobiernan el rover en producción (fracciones de acelerador normalizado $[-1.0, 1.0]$ compatibles con la API `POST /control` del SDK):
 - `goal_tolerance_m`: `13.0`
 - `align_threshold_deg`: `18.0` (umbral fino, cerca de la meta)
 - `coarse_align_threshold_deg`: `25.0` (umbral grueso, lejos)
 - `approach_align_distance_m`: `8.0` (el punto donde pasa de uno a otro)
-- `forward_speed`: `0.40`
-- `turn_speed`: `0.70`
+- `forward_throttle`: `0.40` (40% de acelerador lineal en `DRIVE`)
+- `turn_throttle`: `0.70` (70% de acelerador angular de giro en `ALIGN`)
 - `control_loop_hz`: `3.0`
 - `turn_burst_s`: `0.25`
 - `pause_after_turn_s`: `0.80`
@@ -387,7 +387,9 @@ Con el hallazgo confirmado —el código ya no clampea nada—, estos son los n�
 - `heading_max_stale_s`: `2.0`
 - `path_max_stale_s`: `8.0`
 - `require_velocity_governor`: `true`
-- `geodesic_fallback_speed`: `0.20`
+- `geodesic_fallback_throttle`: `0.20` (20% de acelerador lineal en navegación geodésica pura)
+- `recovery_turn_throttle`: `0.30` (30% de acelerador angular en modo `RECOVERY`)
+- `max_linear_speed_mps`: `1.111` (velocidad física de referencia a acelerador pleno $1.0$, $4.0\text{ km/h}$)
 
 ---
 
@@ -408,11 +410,13 @@ Cada ciclo (3 Hz) evalúa en este orden estricto, saliendo apenas una condición
 El diseño anterior operaba en modo *Fail-Open* (si el planificador fallaba, el rover avanzaba a máxima velocidad hacia el GPS). El diseño actual es **estrictamente Fail-Safe**:
 
 1. **Seguimiento de Trayectoria BEV:** Si hay un camino válido y fresco (`path_max_stale_s = 8.0`), sigue los waypoints con lookahead dinámico (`lookahead_distance_m = 1.0`).
-2. **Recovery Mode Activo:** Si el camino está fresco pero no es válido (`planner_valid = False`), entra en `RECOVERY` rotando en el lugar (`recovery_turn_speed = 0.3\text{ rad/s}`) para despejar el campo visual sin avanzar hacia el obstáculo.
-3. **Gobernador de Velocidad Dinámico:**
-   - **Caso 1 (Nunca recibido):** Si `require_velocity_governor: true`, $v_{\text{eff}} = 0.0\text{ m/s}$ (detención por arranque o caída temprana del planner). Si `require_velocity_governor: false` (modo geodésico puro deliberado), $v_{\text{eff}} = \min(v_{\text{fallback}}, v_{\text{fwd}}) = 0.20\text{ m/s}$.
-   - **Caso 2 (Vigente $\le 3.0\text{ s}$):** $v_{\text{eff}} = \min(v_{\text{fwd}}, v_{\text{safe}})$.
-   - **Caso 3 (Expirado $> 3.0\text{ s}$):** Si `path_following_enabled: true`, detención total $v_{\text{eff}} = 0.0\text{ m/s}$. En navegación geodésica pura, limita a $v_{\text{eff}} = 0.20\text{ m/s}$.
+2. **Recovery Mode Activo:** Si el camino está fresco pero no es válido (`planner_valid = False`), entra en `RECOVERY` rotando en el lugar (`recovery_turn_throttle = 0.30`, 30% de acelerador angular) para despejar el campo visual sin avanzar hacia el obstáculo.
+3. **Gobernador de Velocidad Dinámico y Conversión a Acelerador (Brief 18 / R.1):**
+   - El límite cinemático $v_{\text{safe}}$ (m/s) se convierte a fracción de acelerador normalizado mediante $T_{\text{safe}} = \min(1.0, \max(0.0, v_{\text{safe}} / v_{\text{max}}))$ con $v_{\text{max}} = 1.111\text{ m/s}$.
+   - **Caso 1 (Nunca recibido):** Si `require_velocity_governor: true`, $T_{\text{eff}} = 0.0$ (detención por arranque o caída temprana del planner). Si `require_velocity_governor: false` (modo geodésico puro deliberado), $T_{\text{eff}} = \min(T_{\text{fallback}}, T_{\text{fwd}}) = 0.20$.
+   - **Caso 2 (Vigente $\le 3.0\text{ s}$):** $T_{\text{eff}} = \min(T_{\text{fwd}}, T_{\text{safe}})$.
+   - **Caso 3 (Expirado $> 3.0\text{ s}$):** Si `path_following_enabled: true`, detención total $T_{\text{eff}} = 0.0$. En navegación geodésica pura, limita a $T_{\text{eff}} = 0.20$.
+4. **Telemetría de Ciclo de Trabajo (Brief 18 / R.3.1):** Publica en `earth_rover/control_debug` los porcentajes acumulados de tiempo en `DRIVE`, `TURN` (ráfagas de giro), `PAUSE` (esperas post-giro) y `RECOVERY`.
 
 ---
 
@@ -501,24 +505,31 @@ El filtro complementario implementa una compuerta dual basada en la magnitud med
 La distancia requerida de parada ($d_{\text{stop}}$) con desaceleración constante $a_{\text{brake}} = 1.5\text{ m/s}^2$ y tiempo total de retardo $b = t_{\text{plan,P95}} + t_{\text{rtt}} + t_{\text{delay}}$ es:
 $$d_{\text{stop}} = v \cdot b + \frac{v^2}{2 \cdot a_{\text{brake}}}$$
 
-Exigiendo un margen de seguridad multiplicativo $\text{margin} = 1.5$ sobre el horizonte visible $d_{\text{horizon}} = 2.40\text{ m}$:
+Exigiendo un margen de seguridad multiplicativo $\text{margin} = 1.5$ sobre el horizonte visible longitudinal configurado ($d_{\text{horizon}} = \text{forward\_range\_m} = 4.00\text{ m}$):
 $$v \cdot b + \frac{v^2}{2 \cdot a_{\text{brake}}} \le \frac{d_{\text{horizon}}}{\text{margin}} \iff \frac{1}{2 \cdot a_{\text{brake}}} v^2 + b \cdot v - \frac{d_{\text{horizon}}}{\text{margin}} = 0$$
 
 Resolviendo para la raíz positiva:
 $$v_{\text{safe}} = a_{\text{brake}} \cdot \left( \sqrt{b^2 + \frac{2 \cdot d_{\text{horizon}}}{a_{\text{brake}} \cdot \text{margin}}} - b \right)$$
 
-### Tabla de Comportamiento Nominal ($d = 2.40\text{ m}, \text{margin} = 1.5, a = 1.5\text{ m/s}^2, t_{\text{rtt}} = 0.10\text{ s}, t_{\text{delay}} = 0.041\text{ s}$)
+> [!NOTE]
+> **Derivación de Parámetros:** El valor $d_{\text{horizon}}$ se deriva automáticamente en código a partir de `self.forward_range` (`forward_range_m`, $4.00\text{ m}$ por defecto). Si la configuración de la grilla métrica BEV se modifica, el horizonte del gobernador cambia en consonancia de forma automática. Asimismo, los retardos corresponden a las mediciones reales del testbed de México: $t_{\text{rtt}}(\text{P95}) = 0.061\text{ s}$ y $t_{\text{delay}} = 0.080\text{ s}$ (retardo de transporte DDS + HTTP + WebRTC + inercia de actuadores).
 
-| $t_{\text{plan}}$ (ms) | $b$ (s) | $v_{\text{safe}}$ Teórico (m/s) | $v_{\text{safe}}$ Efectivo (m/s) | Estado Operativo |
-| :---: | :---: | :---: | :---: | :--- |
-| **280 ms** | 0.421 s | 1.65 m/s | **0.40 m/s** (tope nominal) | Operación fluida en GPU |
-| **1000 ms** | 1.141 s | 1.07 m/s | **0.40 m/s** | Umbral de tráfico dinámico |
-| **2000 ms** | 2.141 s | 0.68 m/s | **0.40 m/s** | Latencia degradada |
-| **8130 ms** | 8.271 s | 0.19 m/s | **0.19 m/s** | Modo arrastre de seguridad |
-| **11200 ms** | 11.341 s | 0.14 m/s | **0.00 m/s** (piso $<0.15$) | Parada de seguridad (*Stop & Wait*) |
+### Tabla de Comportamiento Nominal y Mapeo a Acelerador ($d = 4.00\text{ m}, \text{margin} = 1.5, a = 1.5\text{ m/s}^2, t_{\text{rtt}} = 0.061\text{ s}, t_{\text{delay}} = 0.080\text{ s}$, $v_{\text{max}} = 1.111\text{ m/s}$)
+
+| $t_{\text{plan}}$ (ms) | $b$ (s) | $v_{\text{safe}}$ Cinemático (m/s) | $T_{\text{safe}}$ Acelerador | $T_{\text{eff}}$ Efectivo (`forward_throttle=0.40`) | Estado Operativo |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| **240 ms** (GPU P95) | 0.381 s | 2.36 m/s | **1.00** | **0.40** (40% crucero nominal) | Operación nominal fluida en GPU |
+| **280 ms** | 0.421 s | 2.27 m/s | **1.00** | **0.40** | Operación nominal GPU |
+| **1000 ms** | 1.141 s | 1.59 m/s | **1.00** | **0.40** | Umbral de tráfico dinámico |
+| **2000 ms** | 2.141 s | 1.07 m/s | **0.96** | **0.40** | Latencia degradada |
+| **5000 ms** | 5.141 s | 0.50 m/s | **0.45** | **0.40** | Latencia severamente degradada |
+| **6392 ms** (~6.4 s) | 6.533 s | 0.44 m/s | **0.40** | **0.40** | **Umbral de activación de reducción** |
+| **8130 ms** | 8.271 s | 0.32 m/s | **0.29** | **0.29** | Modo arrastre de seguridad |
+| **11200 ms** | 11.341 s | 0.23 m/s | **0.21** | **0.21** | Modo arrastre crítico |
+| **17587 ms** (~17.6 s) | 17.728 s | 0.15 m/s | **0.13** | **0.00** (corte $<0.15\text{ m/s}$) | Parada de seguridad (*Stop & Wait*) |
 
 > [!NOTE]
-> **Alerta de Tráfico Dinámico:** Si $t_{\text{plan,P95}} > 1.0\text{ s}$, el nodo emite una advertencia de diagnóstico pues a tasas inferiores a 1 Hz no es posible garantizar la evasión de peatones o vehículos en movimiento rápido.
+> **Consistencia Dimensional (Brief 18 / R.1):** $v_{\text{safe}}$ se calcula rigurosamente en $\text{m/s}$ según la física de frenado y retardo de transporte. El controlador `gps_waypoint_controller` convierte este límite a fracción de acelerador normalizado mediante $T_{\text{safe}} = \min(1.0, \max(0.0, v_{\text{safe}} / v_{\text{max}}))$ con $v_{\text{max}} = 1.111\text{ m/s}$, clampeando de forma homogénea contra `forward_throttle` (ambos en espacio normalizado $[0.0, 1.0]$).
 
 ---
 
@@ -528,6 +539,9 @@ $$v_{\text{safe}} = a_{\text{brake}} \cdot \left( \sqrt{b^2 + \frac{2 \cdot d_{\
 2. **Dependencia de Sensor de Guiñada Único:** `/wheel_odom` utiliza el mismo rumbo de brújula que alimenta `/imu/data`; por ende, no existe una fuente de orientación independiente para desacoplar perturbaciones magnéticas en el EKF.
 3. **Compensación Dinámica de Inclinación:** La rotación homográfica por roll/pitch no está activada en producción para evitar introducir ruido óptico adicional hasta calibrar la cámara.
 4. **Telemetría de RPMs sin Explotar:** El SDK reporta `rpms` de tracción pero actualmente no se integran para estimación de patinamiento lateral.
-5. **Configuración de Grilla BEV:** El ajuste de resolución de celda ($0.05\text{ m/px}$) permanece congelado a la espera de las mediciones de latencia en la máquina de la RTX 5060.
-6. **Optimización de GeNIE:** El frente de poda y reescritura de `third_party/genie` se encuentra suspendido a la espera del profiling formal en hardware final.
+5. **Configuración de Grilla BEV Confirmada (Cerrado en Brief 17):** Se confirma la configuración $4.00\text{ m} \times 4.00\text{ m}$ a $0.03\text{ m/px}$ ($134 \times 134$ celdas) tras mediciones en RTX 5060 (~240 ms de ciclo, horizonte seguro con factor $2.3\times$ a máxima velocidad física). Las alternativas A y E quedan archivadas como referencia histórica.
+6. **Frente de GeNIE Cerrado (Cerrado en Brief 17):** Con `plan_genie` en ~60–105 ms (ciclo global ~187–240 ms, 4.2–5.3 Hz en RTX 5060), la optimización no se justifica para la maratón. Se documenta el hallazgo del escalado invertido (más caminos vivos en terreno despejado $\to$ mayor tiempo de filtrado/evaluación) como característica intrínseca del algoritmo.
+7. **Gobernador en Acelerador Normalizado (Brief 18 / R.1):** Con la configuración actual (`forward_throttle = 0.40` y $d_{\text{horizon}} = 4.00\text{ m}$), el gobernador opera como salvaguarda de seguridad ($T_{\text{safe}} = 1.0 \implies T_{\text{eff}} = 0.40$) y reduce el acelerador únicamente ante degradaciones de latencia $> 6.4\text{ s}$.
+8. **Supuesto de Desaceleración $a_{\text{brake}} = 1.5\text{ m/s}^2$ No Verificado (Brief 18 / R.2):** El valor $1.5\text{ m/s}^2$ es un supuesto teórico del que dependen la ecuación de frenado y el horizonte de seguridad. Requiere protocolo de medición empírico en hormigón seco y baja adherencia (mojado/gravilla) antes de autorizar incrementos agresivos de velocidad de avance.
+9. **Línea Base de Proyección BEV (`bev_proj`) (Brief 17 / Q.6 & Brief 18 / R.4):** Se registra la línea base de $44.48\text{ ms}$ (P95: $54.79\text{ ms}$) en RTX 5060 como referencia para la futura implementación de la tabla de rayos precomputada (LUT fisheye) una vez calibrada la cámara.
 
