@@ -24,6 +24,7 @@ class MissionManagerNode(Node):
         self.declare_parameter("proximity_dwell_s", 15.0)
         self.declare_parameter("min_navigation_time_s", 8.0)
         self.declare_parameter("pre_post_stop_s", 2.5)
+        self.declare_parameter("gps_retention_max_age_s", 10.0)
 
         self.sdk_url = self.get_parameter("sdk_url").value.rstrip("/")
         self.checkpoint_post_retries = int(self.get_parameter("checkpoint_post_retries").value)
@@ -36,6 +37,9 @@ class MissionManagerNode(Node):
         self.proximity_dwell_s = float(self.get_parameter("proximity_dwell_s").value)
         self.min_navigation_time_s = float(self.get_parameter("min_navigation_time_s").value)
         self.pre_post_stop_s = float(self.get_parameter("pre_post_stop_s").value)
+        self.gps_retention_max_age_s = float(
+            self.get_parameter("gps_retention_max_age_s").value
+        )
 
         sensor_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -60,6 +64,8 @@ class MissionManagerNode(Node):
 
         self.current_lat = None
         self.current_lon = None
+        self._last_valid_gps = None
+        self._last_valid_gps_time = None
 
         self.checkpoints = []
         self.current_checkpoint_idx = 0
@@ -104,8 +110,39 @@ class MissionManagerNode(Node):
         self.get_logger().info("Navegación reanudada: Objetivo republicado y control cedido al controlador.")
 
     def _on_gps(self, msg: NavSatFix):
+        if math.isnan(msg.latitude) or math.isnan(msg.longitude):
+            self.current_lat = None
+            self.current_lon = None
+            return
         self.current_lat = msg.latitude
         self.current_lon = msg.longitude
+        self._last_valid_gps = (msg.latitude, msg.longitude)
+        self._last_valid_gps_time = self.get_clock().now()
+
+    def _get_effective_gps(self):
+        """Retorna (lat, lon, age_s) o (None, None, None) aplicando guarda de retención.
+        
+        Si current_lat/lon están disponibles de una muestra reciente, los usa directamente (age_s = 0.0).
+        Si son None (corte transitorio), utiliza la última coordenada válida (_last_valid_gps)
+        siempre que tenga menos de gps_retention_max_age_s (10.0 s).
+        
+        Justificación del umbral de 10 s (Brief 19 / S.2): A la velocidad de avance crucero actual
+        (forward_throttle=0.40, aproximadamente 0.44 m/s si la relación es lineal), 10 s corresponden
+        a ~4.4 m de desplazamiento. Con una tolerancia de checkpoint de 13.0 m (disparo de proximidad a 14.5 m),
+        el error de posición acumulado queda holgadamente dentro del margen.
+        Si forward_throttle se incrementa en el futuro, este umbral debe recalibrarse.
+        """
+        if self.current_lat is not None and self.current_lon is not None:
+            return self.current_lat, self.current_lon, 0.0
+
+        if self._last_valid_gps is not None and self._last_valid_gps_time is not None:
+            now = self.get_clock().now()
+            age_s = (now - self._last_valid_gps_time).nanoseconds / 1e9
+            if age_s <= self.gps_retention_max_age_s:
+                lat, lon = self._last_valid_gps
+                return lat, lon, age_s
+
+        return None, None, None
 
     def _on_waypoint_status(self, msg: String):
         if msg.data == "REACHED":
@@ -303,12 +340,18 @@ class MissionManagerNode(Node):
     def _distance_to_current_checkpoint(self):
         if self.current_checkpoint_idx >= len(self.checkpoints):
             return None
-        if self.current_lat is None or self.current_lon is None:
+        lat, lon, age_s = self._get_effective_gps()
+        if lat is None or lon is None:
             return None
+        if age_s > 0.0:
+            self.get_logger().warning(
+                f"Calculando distancia con coordenada GPS retenida ({lat:.6f}, {lon:.6f}, antigüedad={age_s:.1f}s <= {self.gps_retention_max_age_s:.1f}s)",
+                throttle_duration_sec=2.0,
+            )
         cp = self.checkpoints[self.current_checkpoint_idx]
-        lat = float(cp.get("latitude", cp.get("lat", 0)))
-        lon = float(cp.get("longitude", cp.get("lon", 0)))
-        return self._haversine_m(self.current_lat, self.current_lon, lat, lon)
+        cp_lat = float(cp.get("latitude", cp.get("lat", 0)))
+        cp_lon = float(cp.get("longitude", cp.get("lon", 0)))
+        return self._haversine_m(lat, lon, cp_lat, cp_lon)
 
     def _refresh_checkpoints_from_sdk(self):
         self.get_logger().info("Descargando mission checkpoints list...")
@@ -452,9 +495,17 @@ class MissionManagerNode(Node):
             return self.current_checkpoint_idx + 1
 
     def _notify_checkpoint_reached(self, sequence):
-        if self.current_lat is None or self.current_lon is None:
-            self.get_logger().error("Imposible publicar checkpoint sin GPS")
+        lat, lon, age_s = self._get_effective_gps()
+        if lat is None or lon is None:
+            self.get_logger().error(
+                f"Imposible publicar checkpoint {sequence} sin GPS (sin fix reciente ni retenido <= {self.gps_retention_max_age_s:.1f}s)"
+            )
             return False, None
+
+        if age_s > 0.0:
+            self.get_logger().warning(
+                f"Notificando checkpoint {sequence} usando coordenada GPS retenida ({lat:.6f}, {lon:.6f}, antigüedad={age_s:.1f}s <= {self.gps_retention_max_age_s:.1f}s)"
+            )
 
         now = self.get_clock().now()
         if self._last_post_attempt_at is not None:

@@ -7,3 +7,4 @@ mission_manager_node:
     proximity_dwell_s: 2.0
     min_navigation_time_s: 8.0
     pre_post_stop_s: 2.5
+    gps_retention_max_age_s: 10.0
