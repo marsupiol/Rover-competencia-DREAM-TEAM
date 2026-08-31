@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Mission Manager Node for Earth Rover Mission 1."""
 
-import requests
-import threading
 import json
 import math
 import threading
@@ -82,12 +80,18 @@ class MissionManagerNode(Node):
         self._mission_completed_by_sdk = False
         self.status_pub = self.create_publisher(String, "earth_rover/waypoint_status", 10)
 
+        # Sincronización concurrente para peticiones HTTP asíncronas (Brief 14 / N.3)
+        self._http_lock = threading.Lock()
+        self._http_request_in_flight = False
+        self._http_response_data = None
+        self._http_response_status = None
+
         self.timer = self.create_timer(1.0, self._state_machine_loop)
         self.get_logger().info("Mission Manager Node Initialized")
 
 
     def _abort_and_resume_navigation(self):
-        """Libera el candado de los motores si el SDK rechaza la llegada."""
+        """Libera el candado de los motores si el SDK rechaza la llegada y garantiza publicación del objetivo."""
         self.state = "NAVIGATING_CHECKPOINT"
         self._checkpoint_post_attempts = 0
         self._checkpoint_post_ok = False
@@ -95,11 +99,9 @@ class MissionManagerNode(Node):
         self._pending_confirmation_sequence = None
         self._near_checkpoint_since = None
         
-        # Publicar FALSE en la pausa para despertar al gps_waypoint_controller
-        resume = Bool()
-        resume.data = False
-        self.pause_pub.publish(resume)
-        self.get_logger().info("Navegación reanudada: Cediendo control al PID geodésico.")
+        # Garantizar que el objetivo actual siempre quede publicado en earth_rover/target_waypoint (Brief 14 / N.4)
+        self._publish_current_checkpoint_goal()
+        self.get_logger().info("Navegación reanudada: Objetivo republicado y control cedido al controlador.")
 
     def _on_gps(self, msg: NavSatFix):
         self.current_lat = msg.latitude
@@ -163,16 +165,21 @@ class MissionManagerNode(Node):
             self._check_proximity_to_checkpoint()
 
         if self.state == "AWAITING_HTTP_RESPONSE":
-            if getattr(self, '_http_request_in_flight', False):
-                return # Seguimos esperando al hilo
+            with self._http_lock:
+                if self._http_request_in_flight:
+                    return  # Seguimos esperando al hilo de red
                 
-            # El hilo terminó, extraemos los datos
-            data = self._http_response_data
-            
-            if self._http_response_status == 200:
-                msg = data.get("message", "Exito")
-                seq = data.get("next_checkpoint_sequence", "N/A")
-                comp = data.get("mission_completed", False)
+                # El hilo terminó de forma segura, extraemos los datos atómicamente
+                data = self._http_response_data
+                status = self._http_response_status
+                # Limpiar variables de estado para evitar reprocesamiento
+                self._http_response_data = None
+                self._http_response_status = None
+
+            if status == 200:
+                msg = data.get("message", "Exito") if isinstance(data, dict) else "Exito"
+                seq = data.get("next_checkpoint_sequence", "N/A") if isinstance(data, dict) else "N/A"
+                comp = data.get("mission_completed", False) if isinstance(data, dict) else False
                 self.get_logger().info(f"¡POST Exitoso! {msg}. Siguiente secuencia: {seq}. Misión completada: {comp}")
                 
                 self._checkpoint_post_ok = True
@@ -187,7 +194,7 @@ class MissionManagerNode(Node):
                     err = detail.get("error", "Error del SDK")
                     self.get_logger().warn(f"Rechazo del SDK: {err} | Distancia del servidor: {dist}m")
                 else:
-                    self.get_logger().error(f"Fallo en POST asíncrono. HTTP {self._http_response_status}: {data}")
+                    self.get_logger().error(f"Fallo en POST asíncrono. HTTP {status}: {data}")
                     
                 self.state = "AWAITING_SDK_CONFIRMATION"
             return
@@ -352,40 +359,6 @@ class MissionManagerNode(Node):
             self.get_logger().error(f"Error fetching checkpoints: {e}")
             return False
 
-
-    def _post_checkpoint_task(self):
-        """Tarea bloqueante que corre en el hilo secundario."""
-        try:
-            url = f"{self.sdk_url}/checkpoint-reached"
-            headers = {'Content-Type': 'application/json'}
-            # Payload vacío explícito '{}' como pide la especificación
-            res = requests.post(url, headers=headers, json={}, timeout=5.0)
-            data = res.json()
-
-            if res.status_code == 200 and "message" in data:
-                seq = data.get("next_checkpoint_sequence", "Desconocida")
-                completed = data.get("mission_completed", False)
-                self.get_logger().info(f"[API] ¡Éxito! Siguiente secuencia: {seq}. Misión completa: {completed}")
-                
-                # Despachamos el procesamiento de vuelta al hilo principal de ROS 2 de forma segura
-                self._handle_successful_checkpoint_response(seq, completed)
-
-            elif res.status_code in [400, 403, 404] and "detail" in data:
-                detail = data["detail"]
-                err_msg = detail.get("error", "Error desconocido")
-                dist = detail.get("proximate_distance_to_checkpoint", "N/A")
-                self.get_logger().warn(f"[API] Rechazo del SDK: {err_msg} | Distancia del server: {dist}m")
-                
-                self._handle_rejected_checkpoint_response(dist)
-
-            else:
-                self.get_logger().error(f"[API] Error inesperado HTTP {res.status_code}: {res.text}")
-                self._is_posting_checkpoint = False
-
-        except requests.exceptions.RequestException as e:
-            self.get_logger().error(f"[API] Error de red asíncrono: {e}")
-            self._is_posting_checkpoint = False
-
     def _check_proximity_to_checkpoint(self):
         # Antes esto solo corria DESPUES de que gps_waypoint_controller ya
         # habia declarado "Target reached" (frenado incluido). Ahora chequea
@@ -494,29 +467,35 @@ class MissionManagerNode(Node):
         
         self.get_logger().info(f"Iniciando POST asíncrono para checkpoint {sequence}...")
 
-        self._http_request_in_flight = True
-        self._http_response_data = None
-        self._http_response_status = None
+        with self._http_lock:
+            self._http_request_in_flight = True
+            self._http_response_data = None
+            self._http_response_status = None
 
         def http_worker():
+            status = 500
+            data = None
             try:
                 # Implementación exacta de: curl -X POST ... --header 'Content-Type: application/json' --data '{}'
                 url = f"{self.sdk_url}/checkpoint-reached"
                 headers = {'Content-Type': 'application/json'}
                 
                 res = requests.post(url, headers=headers, json={}, timeout=10.0)
-                self._http_response_status = res.status_code
+                status = res.status_code
                 
                 try:
-                    self._http_response_data = res.json()
+                    data = res.json()
                 except ValueError:
-                    self._http_response_data = {"detail": {"error": res.text}}
+                    data = {"detail": {"error": res.text}}
                     
             except Exception as e:
-                self._http_response_status = 500
-                self._http_response_data = {"detail": {"error": f"Error de red: {str(e)}" }}
+                status = 500
+                data = {"detail": {"error": f"Error de red: {str(e)}" }}
             finally:
-                self._http_request_in_flight = False
+                with self._http_lock:
+                    self._http_response_status = status
+                    self._http_response_data = data
+                    self._http_request_in_flight = False
 
         # Lanzar hilo en background para no asfixiar el middleware DDS de ROS 2
         threading.Thread(target=http_worker, daemon=True).start()
