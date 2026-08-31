@@ -86,8 +86,9 @@ navsat_transform:
     delay: 0.0
     magnetic_declination_radians: 0.0 
     
-    # --- CORRECCIÓN REP-105 ---
-    # Si tu IMU marca 0° en el Norte, debemos sumarle 90° (pi/2) para que coincida con el Este de ROS 2.
+    # --- CONVENCIÓN ENU REP-105 ---
+    # yaw_offset es 0.0 porque earth_rover_bridge ya convierte el heading de compás
+    # (0°=Norte, horario) a yaw ENU (0°=Este, antihorario) antes de publicarlo en /imu/data.
     yaw_offset: 0.0
     
     zero_altitude: true

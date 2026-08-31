@@ -18,6 +18,7 @@ import json
 import math
 import threading
 import time
+from collections import deque
 
 import cv2
 import rclpy
@@ -134,6 +135,15 @@ class EarthRoverBridge(Node):
         self.heading_pub = self.create_publisher(
             Float32, "earth_rover/heading_raw", image_qos
         )
+        self.heading_tilt_comp_pub = self.create_publisher(
+            Float32, "earth_rover/heading_tilt_comp", image_qos
+        )
+        self.tilt_gate_diag_pub = self.create_publisher(
+            String, "earth_rover/tilt_gate_diag", image_qos
+        )
+        self.vibration_pub = self.create_publisher(
+            Float32, "earth_rover/vibration", image_qos
+        )
 
         self.declare_parameter("publish_bridge_debug", True)
         self.publish_bridge_debug = bool(self.get_parameter("publish_bridge_debug").value)
@@ -159,6 +169,13 @@ class EarthRoverBridge(Node):
         # this param is provided as a convenience / fallback).
         self.declare_parameter("magnetic_declination_radians", 0.0)
 
+        # Parámetros del Filtro Complementario Roll/Pitch (Brief 5 / E.1)
+        self.declare_parameter("tilt_filter_alpha", 0.20)
+        self.declare_parameter("gyro_bias_x", 0.0)
+        self.declare_parameter("gyro_bias_y", 0.0)
+        self.declare_parameter("gyro_bias_z", 0.0)
+        self.declare_parameter("gyro_drift_noise_density", 0.005)
+
         self._odom_pose_covariance = self.get_parameter(
             "odom_pose_covariance"
         ).value
@@ -180,6 +197,15 @@ class EarthRoverBridge(Node):
         self._magnetic_declination_radians = float(
             self.get_parameter("magnetic_declination_radians").value
         )
+        self._tilt_filter_alpha = float(
+            self.get_parameter("tilt_filter_alpha").value
+        )
+        self._gyro_bias_x = float(self.get_parameter("gyro_bias_x").value)
+        self._gyro_bias_y = float(self.get_parameter("gyro_bias_y").value)
+        self._gyro_bias_z = float(self.get_parameter("gyro_bias_z").value)
+        self._gyro_drift_noise_density = float(
+            self.get_parameter("gyro_drift_noise_density").value
+        )
 
         self._latest_cmd = None
         self._last_cmd_at = 0.0
@@ -191,6 +217,15 @@ class EarthRoverBridge(Node):
         self._odom_y = 0.0
         self._last_odom_time = None
         self._last_yaw = None
+
+        # Estado del Filtro Complementario (E.1)
+        self._filtered_roll = 0.0
+        self._filtered_pitch = 0.0
+        self._tilt_uncertainty_rad = math.radians(1.0)
+        self._last_accel_valid_time = None
+        self._last_tilt_update_time = None
+        self._tilt_gate_history = deque(maxlen=30)
+
         self.create_subscription(Twist, "cmd_vel", self._on_cmd_vel, command_qos)
 
         self._session = requests.Session()
@@ -322,6 +357,7 @@ class EarthRoverBridge(Node):
 
     def _telemetry_loop(self):
         ws_url = self.sdk_url.replace("http", "ws", 1) + "/ws/data"
+        dump_count = 0
         while self._running and rclpy.ok():
             ws = None
             try:
@@ -330,6 +366,11 @@ class EarthRoverBridge(Node):
                 while self._running and rclpy.ok():
                     msg = json.loads(ws.recv())
                     if msg.get("type") in ("snapshot", "telemetry") and msg.get("data"):
+                        if dump_count < 5:
+                            dump_count += 1
+                            self.get_logger().info(
+                                f"[TELEMETRY_DUMP #{dump_count}]\n{json.dumps(msg['data'], indent=2)}"
+                            )
                         self._publish_telemetry(msg["data"])
             except Exception as e:
                 self.get_logger().warning(
@@ -429,7 +470,7 @@ class EarthRoverBridge(Node):
                 yaw = self._compass_heading_to_enu_yaw(heading_deg)
 
         # ---------------------------------------------------------
-        # 3. BATERÍA
+        # 3. BATERÍA Y VIBRACIÓN
         # ---------------------------------------------------------
         battery = data.get("battery")
         if battery is not None:
@@ -439,52 +480,192 @@ class EarthRoverBridge(Node):
             batt.present = True
             self.battery_pub.publish(batt)
 
+        vibration = data.get("vibration")
+        if vibration is not None:
+            try:
+                vib_msg = Float32()
+                vib_msg.data = float(vibration)
+                self.vibration_pub.publish(vib_msg)
+            except (TypeError, ValueError):
+                pass
+
         # ---------------------------------------------------------
-        # 4. IMU Y ODOMETRÍA DE RUEDAS
+        # 3b. ESTIMACIÓN ROLL/PITCH: FILTRO COMPLEMENTARIO (Brief 5 / E.1)
         # ---------------------------------------------------------
         accels = data.get("accels") or []
         gyros = data.get("gyros") or []
-        
-        # Verificamos que tengamos orientación absoluta para cumplir REP-105
-        if accels and yaw is not None:
-            # Iteramos sobre el array completo de 100 muestras
-            num_samples = len(accels)
-            # Frecuencia estimada: 100 muestras en 2 segundos = 50 Hz = 20ms por muestra
-            dt_sample_sec = 2.0 / num_samples 
+        mags = data.get("mags") or []
+
+        if mags and accels:
+            try:
+                mx = float(mags[-1][0])
+                my = float(mags[-1][1])
+                mz = float(mags[-1][2])
+
+                # Velocidad angular promediada y corregida por bias
+                num_gyros = len(gyros) if gyros else 1
+                avg_gx = sum(float(g[0]) for g in gyros) / num_gyros if gyros else 0.0
+                avg_gy = sum(float(g[1]) for g in gyros) / num_gyros if gyros else 0.0
+                omega_x = math.radians(avg_gx) - self._gyro_bias_x
+                omega_y = math.radians(avg_gy) - self._gyro_bias_y
+
+                now_mono = time.monotonic()
+                dt_tilt = (
+                    (now_mono - self._last_tilt_update_time)
+                    if self._last_tilt_update_time is not None
+                    else 2.0
+                )
+                if dt_tilt <= 0.0 or dt_tilt > 5.0:
+                    dt_tilt = 2.0
+                self._last_tilt_update_time = now_mono
+
+                # 1. Cálculo individual por muestra de aceleración
+                mags_a = []
+                rolls_a = []
+                pitches_a = []
+                for s in accels:
+                    ax_s = float(s[0])
+                    ay_s = float(s[1])
+                    az_s = float(s[2])
+                    norm_s = math.sqrt(ax_s**2 + ay_s**2 + az_s**2)
+                    mags_a.append(norm_s)
+                    rolls_a.append(math.atan2(ay_s, az_s))
+                    pitches_a.append(math.atan2(-ax_s, math.sqrt(ay_s**2 + az_s**2)))
+
+                num_samples = len(mags_a)
+                mean_norm = sum(mags_a) / num_samples
+                var_norm = sum((m - mean_norm) ** 2 for m in mags_a) / num_samples
+                std_norm = math.sqrt(var_norm)
+
+                gate_open = abs(mean_norm - 1.0) < 0.08 and std_norm < 0.06
+                self._tilt_gate_history.append(1 if gate_open else 0)
+
+                duty_cycle_pct = (
+                    sum(self._tilt_gate_history) / len(self._tilt_gate_history) * 100.0
+                    if self._tilt_gate_history
+                    else 0.0
+                )
+
+                # Ruido de proceso del gyro y ruido de medición del acelerómetro
+                q_gyro = self._gyro_drift_noise_density
+                sigma_acc = math.radians(0.85)  # ~0.015 rad de ruido base del acelerómetro en reposo
+                alpha = self._tilt_filter_alpha
+
+                if gate_open:
+                    rolls_a.sort()
+                    pitches_a.sort()
+                    roll_acc = rolls_a[num_samples // 2]
+                    pitch_acc = pitches_a[num_samples // 2]
+
+                    # Propagación por giróscopo + Corrección por acelerómetro
+                    roll_pred = self._filtered_roll + omega_x * dt_tilt
+                    pitch_pred = self._filtered_pitch + omega_y * dt_tilt
+                    self._filtered_roll = (1.0 - alpha) * roll_pred + alpha * roll_acc
+                    self._filtered_pitch = (1.0 - alpha) * pitch_pred + alpha * pitch_acc
+
+                    # Actualización de incertidumbre
+                    sigma_pred_sq = self._tilt_uncertainty_rad**2 + (q_gyro**2) * dt_tilt
+                    self._tilt_uncertainty_rad = math.sqrt(
+                        (1.0 - alpha)**2 * sigma_pred_sq + (alpha**2) * (sigma_acc**2)
+                    )
+                    self._last_accel_valid_time = now_mono
+                else:
+                    # Propagación pura por giróscopo (sin salto discontinuo)
+                    self._filtered_roll += omega_x * dt_tilt
+                    self._filtered_pitch += omega_y * dt_tilt
+
+                    # Incertidumbre acumulada en régimen de dead-reckoning angular
+                    self._tilt_uncertainty_rad = math.sqrt(
+                        self._tilt_uncertainty_rad**2 + (q_gyro**2) * dt_tilt
+                    )
+
+                time_since_accel_s = (
+                    (now_mono - self._last_accel_valid_time)
+                    if self._last_accel_valid_time is not None
+                    else 999.0
+                )
+
+                roll_to_use = self._filtered_roll
+                pitch_to_use = self._filtered_pitch
+
+                bx = mx * math.cos(pitch_to_use) + mz * math.sin(pitch_to_use)
+                by = (
+                    mx * math.sin(roll_to_use) * math.sin(pitch_to_use)
+                    + my * math.cos(roll_to_use)
+                    - mz * math.sin(roll_to_use) * math.cos(pitch_to_use)
+                )
+
+                heading_tilt_comp_rad = math.atan2(-by, bx)
+                heading_tilt_comp_deg = (
+                    math.degrees(heading_tilt_comp_rad) + 360.0
+                ) % 360.0
+
+                tilt_msg = Float32()
+                tilt_msg.data = heading_tilt_comp_deg
+                self.heading_tilt_comp_pub.publish(tilt_msg)
+
+                # Publicar diagnóstico enriquecido de inclinación (E.1.5)
+                diag_data = {
+                    "mean_norm_g": round(mean_norm, 4),
+                    "std_norm_g": round(std_norm, 4),
+                    "gate_open": gate_open,
+                    "duty_cycle_pct": round(duty_cycle_pct, 1),
+                    "time_since_accel_s": round(time_since_accel_s, 1),
+                    "filtered_roll_deg": round(math.degrees(self._filtered_roll), 2),
+                    "filtered_pitch_deg": round(math.degrees(self._filtered_pitch), 2),
+                    "tilt_uncertainty_deg": round(math.degrees(self._tilt_uncertainty_rad), 2),
+                    "heading_tilt_comp_deg": round(heading_tilt_comp_deg, 2),
+                }
+                diag_msg = String()
+                diag_msg.data = json.dumps(diag_data)
+                self.tilt_gate_diag_pub.publish(diag_msg)
+
+                if duty_cycle_pct < 30.0 and len(self._tilt_gate_history) >= 15:
+                    self.get_logger().warn(
+                        f"Tilt gate duty cycle bajo ({duty_cycle_pct:.1f}% < 30%). "
+                        f"Vibración continua (std_norm: {std_norm:.3f}g). Umbral requiere revisión.",
+                        throttle_duration_sec=15.0,
+                    )
+            except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                pass
+
+        # ---------------------------------------------------------
+        # 4. IMU Y ODOMETRÍA DE RUEDAS
+        # ---------------------------------------------------------
+        # Publicamos un único mensaje IMU por reporte de telemetría (frecuencia ~0.5 Hz)
+        if yaw is not None:
+            imu = Imu()
+            imu.header.stamp = now
+            imu.header.frame_id = "base_link"
+
+            if accels:
+                num_samples = len(accels)
+                avg_ax = sum(float(sample[0]) for sample in accels) / num_samples * GRAVITY_M_S2
+                avg_ay = sum(float(sample[1]) for sample in accels) / num_samples * GRAVITY_M_S2
+                avg_az = sum(float(sample[2]) for sample in accels) / num_samples * GRAVITY_M_S2
+                imu.linear_acceleration.x = avg_ax
+                imu.linear_acceleration.y = avg_ay
+                imu.linear_acceleration.z = avg_az
+
+            if gyros:
+                num_gyros = len(gyros)
+                avg_gx = sum(float(g[0]) for g in gyros) / num_gyros
+                avg_gy = sum(float(g[1]) for g in gyros) / num_gyros
+                avg_gz = sum(float(g[2]) for g in gyros) / num_gyros
+                imu.angular_velocity.x = math.radians(avg_gx)
+                imu.angular_velocity.y = math.radians(avg_gy)
+                imu.angular_velocity.z = math.radians(avg_gz)
+
+            imu.orientation.x = 0.0
+            imu.orientation.y = 0.0
+            imu.orientation.z = math.sin(yaw / 2.0)
+            imu.orientation.w = math.cos(yaw / 2.0)
+
+            imu.orientation_covariance = self._imu_orientation_covariance
+            imu.angular_velocity_covariance = self._imu_angular_velocity_covariance
+            imu.linear_acceleration_covariance = self._imu_linear_acceleration_covariance
             
-            # Timestamp del paquete actual (la muestra más reciente)
-            base_time_sec = now.sec + (now.nanosec / 1e9)
-
-            for i, sample in enumerate(accels):
-                imu = Imu()
-                # Interpolar hacia atrás en el tiempo: la muestra 0 ocurrió hace 2 segundos
-                time_offset = dt_sample_sec * (num_samples - 1 - i)
-                sample_time = base_time_sec - time_offset
-                
-                imu.header.stamp.sec = int(sample_time)
-                imu.header.stamp.nanosec = int((sample_time - int(sample_time)) * 1e9)
-                imu.header.frame_id = "base_link"
-                
-                imu.linear_acceleration.x = float(sample[0]) * GRAVITY_M_S2
-                imu.linear_acceleration.y = float(sample[1]) * GRAVITY_M_S2
-                imu.linear_acceleration.z = float(sample[2]) * GRAVITY_M_S2
-
-                # Reutilizamos el único giro y yaw disponible en este reporte de 2s
-                if gyros:
-                    imu.angular_velocity.x = math.radians(float(gyros[-1][0]))
-                    imu.angular_velocity.y = math.radians(float(gyros[-1][1]))
-                    imu.angular_velocity.z = math.radians(float(gyros[-1][2]))
-
-                imu.orientation.x = 0.0
-                imu.orientation.y = 0.0
-                imu.orientation.z = math.sin(yaw / 2.0)
-                imu.orientation.w = math.cos(yaw / 2.0)
-
-                imu.orientation_covariance = self._imu_orientation_covariance
-                imu.angular_velocity_covariance = self._imu_angular_velocity_covariance
-                imu.linear_acceleration_covariance = self._imu_linear_acceleration_covariance
-                
-                self.imu_pub.publish(imu)
+            self.imu_pub.publish(imu)
 
         speed = data.get("speed")
         speed_m_s = None
@@ -497,7 +678,9 @@ class EarthRoverBridge(Node):
         yaw_rate = None
         if gyros:
             try:
-                yaw_rate = math.radians(float(gyros[-1][2]))
+                num_gyros = len(gyros)
+                avg_gz = sum(float(g[2]) for g in gyros) / num_gyros
+                yaw_rate = math.radians(avg_gz)
             except (TypeError, ValueError, IndexError):
                 yaw_rate = None
 

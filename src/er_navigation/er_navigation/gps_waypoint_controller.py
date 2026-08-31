@@ -46,6 +46,7 @@ class GPSWaypointController(Node):
         self.declare_parameter("recovery_turn_speed", 0.3)
         self.declare_parameter("max_total_drive_angular", 0.8)
         self.declare_parameter("publish_control_debug", True)
+        self.declare_parameter("safe_velocity_limit_topic", "earth_rover/safe_velocity_limit")
 
         # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
 
@@ -129,6 +130,8 @@ class GPSWaypointController(Node):
         self.create_subscription(NavSatFix, "earth_rover/target_waypoint", self._on_target, reliable_qos)
         self.create_subscription(Bool, "earth_rover/navigation_pause", self._on_navigation_pause, reliable_qos)
         self.create_subscription(String, "earth_rover/waypoint_status", self._on_mission_status, reliable_qos)
+        safe_vel_topic = str(self.get_parameter("safe_velocity_limit_topic").value)
+        self.create_subscription(Float32, safe_vel_topic, self._on_safe_vel_limit, sensor_qos)
 
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", reliable_qos)
         self.status_pub = self.create_publisher(String, "earth_rover/waypoint_status", reliable_qos)
@@ -143,6 +146,10 @@ class GPSWaypointController(Node):
         self._heading_last_rx = None
         self.target_lat = None
         self.target_lon = None
+
+        # Gobernador de Velocidad (H.2)
+        self._safe_velocity_limit: float = self.forward_speed
+        self._safe_velocity_limit_last_rx = None
 
         # Seguimiento de Trayectorias Planificadas (BEV)
         self._path_poses: list[tuple[float, float]] = []
@@ -199,6 +206,10 @@ class GPSWaypointController(Node):
     def _on_path_valid(self, msg: Bool):
         self._path_valid = bool(msg.data)
         self._path_last_update = self.get_clock().now()
+
+    def _on_safe_vel_limit(self, msg: Float32):
+        self._safe_velocity_limit = float(msg.data)
+        self._safe_velocity_limit_last_rx = self.get_clock().now()
 
     # --- CALLBACKS DE MÁQUINA DE ESTADOS ---
     def _on_target(self, msg: NavSatFix):
@@ -532,7 +543,16 @@ class GPSWaypointController(Node):
             self._align_phase_started_at = None
             self._burst_turn_sign = 0
             
-            twist.linear.x = self.forward_speed
+            # Gobernador de velocidad dinámico basado en tiempo de ciclo real (Brief 8 / H.2)
+            if (
+                self._safe_velocity_limit_last_rx is not None
+                and (now - self._safe_velocity_limit_last_rx).nanoseconds / 1e9 <= 3.0
+            ):
+                effective_speed = max(0.0, min(self.forward_speed, self._safe_velocity_limit))
+            else:
+                effective_speed = self.forward_speed
+
+            twist.linear.x = effective_speed
             # Corrección suave sobre la marcha (Proporcional débil)
             correction = self.drive_correction_gain * heading_error
             clamped_angular = max(-self.max_drive_angular, min(self.max_drive_angular, correction))
@@ -542,7 +562,8 @@ class GPSWaypointController(Node):
 
             self.get_logger().info(
                 f"[DRIVE] dist={distance:.1f}m, head_err={heading_error:+.1f}°, "
-                f"cmd_v={twist.linear.x:.2f}, cmd_w={twist.angular.z:+.2f}, align_phase={self._align_phase}",
+                f"cmd_v={twist.linear.x:.2f} (safe_lim={self._safe_velocity_limit:.2f}), "
+                f"cmd_w={twist.angular.z:+.2f}, align_phase={self._align_phase}",
                 throttle_duration_sec=1.0,
             )
 
@@ -590,6 +611,7 @@ class GPSWaypointController(Node):
                 "current_heading": float(self.current_heading) if self.current_heading is not None else None,
                 "heading_rx_sec": heading_rx_sec,
                 "cmd_linear_x": float(twist.linear.x),
+                "safe_velocity_limit": float(self._safe_velocity_limit),
                 "cmd_angular_z": float(twist.angular.z),
                 "align_phase": self._align_phase,
                 "gps_age_s": gps_age,

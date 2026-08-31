@@ -12,8 +12,8 @@ Arquitectura:
   (REP-103: +X adelante, +Y izquierda), la visualización de depuración y el estado de validez.
 """
 
-from __future__ import annotations
-
+import collections
+import json
 import math
 import threading
 import time
@@ -29,7 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import Image, NavSatFix
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 import tf2_ros
 
 
@@ -108,7 +108,12 @@ class BEVPlannerNode(Node):
         self.declare_parameter("num_goals", 30)
         self.declare_parameter("num_mid_points_per_goal", 20)
         self.declare_parameter("path_num_samples", 100)
-        self.declare_parameter("footprint_px", 10)  # TODO: confirmar dimensión real del Mini+
+        # Parámetros físicos del vehículo para derivación geométrica de footprint
+        self.declare_parameter("robot_length_m", 0.250)
+        self.declare_parameter("robot_width_m", 0.190)
+        self.declare_parameter("footprint_safety_margin", 1.05)
+        # Si footprint_px <= 0, se deriva dinámicamente en código; si > 0, actúa como override manual
+        self.declare_parameter("footprint_px", 0)
         self.declare_parameter("threshold_cost", 0.50)
         self.declare_parameter("threshold_points_ratio", 0.05)
         self.declare_parameter("number_of_points_to_filter", 60)
@@ -121,6 +126,14 @@ class BEVPlannerNode(Node):
         self.declare_parameter("include_goal_in_path_bank", False)
         self.declare_parameter("include_random_goals", True)
 
+        # Parámetros del Gobernador Dinámico de Velocidad (Brief 8 / H.2)
+        self.declare_parameter("safe_velocity_limit_topic", "earth_rover/safe_velocity_limit")
+        self.declare_parameter("planner_diagnostics_topic", "earth_rover/planner_diagnostics")
+        self.declare_parameter("brake_accel_mps2", 1.5)
+        self.declare_parameter("horizon_safety_margin", 1.5)
+        self.declare_parameter("rtt_delay_s", 0.061)
+        self.declare_parameter("transport_delay_s", 0.080)
+
         # Extracción
         image_topic = str(self.get_parameter("image_topic").value)
         gps_topic = str(self.get_parameter("gps_topic").value)
@@ -131,6 +144,13 @@ class BEVPlannerNode(Node):
         valid_topic = str(self.get_parameter("valid_topic").value)
         local_bev_grid_topic = str(self.get_parameter("local_bev_grid_topic").value)
         self.publish_visualization = bool(self.get_parameter("publish_visualization").value)
+
+        safe_velocity_limit_topic = str(self.get_parameter("safe_velocity_limit_topic").value)
+        planner_diagnostics_topic = str(self.get_parameter("planner_diagnostics_topic").value)
+        self.brake_accel = float(self.get_parameter("brake_accel_mps2").value)
+        self.horizon_safety_margin = float(self.get_parameter("horizon_safety_margin").value)
+        self.rtt_delay = float(self.get_parameter("rtt_delay_s").value)
+        self.transport_delay = float(self.get_parameter("transport_delay_s").value)
 
         global_path_topic = str(self.get_parameter("global_path_topic").value)
         global_planner_valid_topic = str(self.get_parameter("global_planner_valid_topic").value)
@@ -195,14 +215,48 @@ class BEVPlannerNode(Node):
         seed_val = self.get_parameter("random_seed").value
         random_seed = int(seed_val) if seed_val is not None else None
 
+        bev_h = max(1, int(np.ceil(float(self.forward_range) / float(self.bev_resolution))))
+        bev_w = max(1, int(np.ceil((2.0 * float(self.side_range)) / float(self.bev_resolution))))
+
+        # F.1.3: Validación estricta de isotropía geométrica de GeNIE
+        if bev_h != bev_w:
+            raise ValueError(
+                f"Incoherencia de isotropía en BEVPlannerNode: bev_h ({bev_h}) != bev_w ({bev_w}). "
+                f"GeNIE asume una grilla euclidiana uniforme e isótropa (grid_size escalar). "
+                f"Ajuste forward_range ({self.forward_range}m) y 2*side_range ({2*self.side_range}m) "
+                "para que sean exactamente iguales."
+            )
+
+        # F.3: Derivación dinámica del footprint_px
+        user_footprint = int(self.get_parameter("footprint_px").value)
+        grid_n = int(self.get_parameter("grid_size").value)
+        if user_footprint > 0:
+            footprint_derived = user_footprint
+            self.get_logger().info(f"Footprint manual configurado por parámetro: {footprint_derived} px.")
+        else:
+            robot_l = float(self.get_parameter("robot_length_m").value)
+            robot_w = float(self.get_parameter("robot_width_m").value)
+            margin = float(self.get_parameter("footprint_safety_margin").value)
+            # Nota de derivación (G.4): Aplicamos ceil estrictamente al producto final
+            # para evitar inflación de área por doble redondeo intermedio:
+            # (D_circ / res) * (grid_n / bev_h) * margin
+            footprint_derived = int(
+                math.ceil((d_circ / float(self.bev_resolution)) * (float(grid_n) / float(bev_h)) * margin)
+            )
+            self.get_logger().info(
+                f"Footprint derivado dinámicamente: {footprint_derived} px "
+                f"(Mini+: {robot_l:.3f}m x {robot_w:.3f}m, D_circ={d_circ:.3f}m, "
+                f"BEV {bev_h}x{bev_w} @ {self.bev_resolution}m/px -> Grid {grid_n}x{grid_n}, Margen={margin:.2f})."
+            )
+
         self._planner_cfg = PlannerConfig(
-            grid_size=int(self.get_parameter("grid_size").value),
+            grid_size=grid_n,
             unknown_cost=float(self.get_parameter("unknown_cost").value),
             smooth_kernel=int(self.get_parameter("smooth_kernel").value),
             num_goals=int(self.get_parameter("num_goals").value),
             num_mid_points_per_goal=int(self.get_parameter("num_mid_points_per_goal").value),
             path_num_samples=int(self.get_parameter("path_num_samples").value),
-            footprint_px=int(self.get_parameter("footprint_px").value),
+            footprint_px=footprint_derived,
             threshold_cost=float(self.get_parameter("threshold_cost").value),
             threshold_points_ratio=float(self.get_parameter("threshold_points_ratio").value),
             number_of_points_to_filter=int(self.get_parameter("number_of_points_to_filter").value),
@@ -214,12 +268,11 @@ class BEVPlannerNode(Node):
             random_seed=random_seed,
             include_goal_in_path_bank=bool(self.get_parameter("include_goal_in_path_bank").value),
             include_random_goals=bool(self.get_parameter("include_random_goals").value),
+            render_visualization=self.publish_visualization,
         )
 
-        # Precomputar el banco de caminos fijos (GeNIE) si no depende de la meta dinámica
+        # Precomputar el banco de caminos fijos (GeNIE) si no depende de la meta dinámica (G.5)
         if not self._planner_cfg.include_goal_in_path_bank:
-            bev_h = max(1, int(np.ceil(float(self.forward_range) / float(self.bev_resolution))))
-            bev_w = max(1, int(np.ceil((2.0 * float(self.side_range)) / float(self.bev_resolution))))
             start0 = (bev_h - 1, bev_w // 2)
             planner_start = _resize_pixel(start0, (bev_h, bev_w), int(self._planner_cfg.grid_size))
             self.get_logger().info(
@@ -236,10 +289,17 @@ class BEVPlannerNode(Node):
                 random_seed=self._planner_cfg.random_seed,
             )
             self.get_logger().info(
-                f"Banco GeNIE precomputado: {len(self._candidate_path_bank)} caminos válidos cargados en memoria."
+                f"Banco GeNIE precomputado: {len(self._candidate_path_bank)} caminos válidos cargados en memoria "
+                f"(BEV: {bev_h}x{bev_w} @ {self.bev_resolution}m/px | Grid: {grid_n}x{grid_n} | "
+                f"Robot Start: {planner_start} | Footprint: {footprint_derived}px)."
             )
         else:
             self._candidate_path_bank = None
+            self.get_logger().warn(
+                "ADVERTENCIA CRÍTICA DE LATENCIA: candidate_path_bank es None porque include_goal_in_path_bank=True. "
+                "Las trayectorias polinomiales se recomputarán en cada frame (+4000ms de penalización en CPU). "
+                "Para operación en tiempo real, configure include_goal_in_path_bank=False."
+            )
 
         try:
             self._predictor = TraversabilityPredictor(
@@ -287,11 +347,16 @@ class BEVPlannerNode(Node):
         self.path_pub = self.create_publisher(Path, planned_path_topic, reliable_qos)
         self.valid_pub = self.create_publisher(Bool, valid_topic, sensor_qos)
         self.local_grid_pub = self.create_publisher(OccupancyGrid, local_bev_grid_topic, sensor_qos)
+        self.safe_vel_pub = self.create_publisher(Float32, safe_velocity_limit_topic, sensor_qos)
+        self.planner_diag_pub = self.create_publisher(String, planner_diagnostics_topic, sensor_qos)
         self.vis_pub = (
             self.create_publisher(Image, visualization_topic, sensor_qos)
             if self.publish_visualization
             else None
         )
+
+        # Historial de tiempos de ciclo para el gobernador dinámico de velocidad (H.2)
+        self._cycle_times_ms: collections.deque[float] = collections.deque(maxlen=10)
 
         # ----------------------------------------------------------------------
         # 4. Estado de Navegación y Sincronización del Hilo de Planificación
@@ -307,6 +372,7 @@ class BEVPlannerNode(Node):
         self._global_path_poses: list[tuple[float, float]] = []
         self._global_path_valid: bool = False
         self._global_path_last_update: Time | None = None
+        self._global_valid_last_update: Time | None = None
 
         self._frame_lock = threading.Lock()
         self._latest_rgb: np.ndarray | None = None
@@ -356,7 +422,7 @@ class BEVPlannerNode(Node):
     def _on_global_valid(self, msg: Bool):
         with self._global_lock:
             self._global_path_valid = bool(msg.data)
-            self._global_path_last_update = self.get_clock().now()
+            self._global_valid_last_update = self.get_clock().now()
 
     def _global_path_is_fresh(self) -> bool:
         with self._global_lock:
@@ -404,6 +470,7 @@ class BEVPlannerNode(Node):
         while not self._stop_event.is_set():
             with self._frame_lock:
                 frame = self._latest_rgb
+                frame_stamp = self._latest_stamp
                 self._latest_rgb = None  # Consumir frame para evitar re-procesamiento
 
             if frame is None:
@@ -416,7 +483,7 @@ class BEVPlannerNode(Node):
 
             last_start = time.monotonic()
             try:
-                self._run_planning(frame)
+                self._run_planning(frame, frame_stamp)
             except Exception as exc:
                 self.get_logger().error(f"Fallo en iteración de planificación BEV: {exc}", throttle_duration_sec=5.0)
 
@@ -568,7 +635,7 @@ class BEVPlannerNode(Node):
 
         return float(goal_x_genie), float(goal_y_genie)
 
-    def _run_planning(self, rgb: np.ndarray):
+    def _run_planning(self, rgb: np.ndarray, frame_stamp=None):
         t_start = time.perf_counter()
 
         # 1. Inferencia neuronal de transitabilidad sobre la imagen frontal
@@ -598,13 +665,10 @@ class BEVPlannerNode(Node):
         )
         grid_2d = cost_bev[::-1, ::-1].T
 
-        with self._frame_lock:
-            latest_stamp = self._latest_stamp
-
         local_grid_msg = OccupancyGrid()
-        if latest_stamp is not None:
-            local_grid_msg.header.stamp = latest_stamp
-            stamp_sec = float(latest_stamp.sec) + float(latest_stamp.nanosec) * 1e-9
+        if frame_stamp is not None:
+            local_grid_msg.header.stamp = frame_stamp
+            stamp_sec = float(frame_stamp.sec) + float(frame_stamp.nanosec) * 1e-9
         else:
             local_grid_msg.header.stamp = self.get_clock().now().to_msg()
             stamp_sec = float(local_grid_msg.header.stamp.sec) + float(local_grid_msg.header.stamp.nanosec) * 1e-9
@@ -620,12 +684,19 @@ class BEVPlannerNode(Node):
         local_grid_msg.data = grid_2d.flatten().tolist()
         self.local_grid_pub.publish(local_grid_msg)
 
-        # 3. Cálculo de la meta relativa (x_right, y_forward)
-        if (
-            self._global_path_is_fresh()
-            and self._global_path_valid
-            and len(self._global_path_poses) >= 2
-        ):
+        # 3. Cálculo de la meta relativa (x_right, y_forward) con lectura atómica bajo _global_lock
+        use_subgoal = False
+        with self._global_lock:
+            if (
+                self.use_global_path_guidance
+                and self._global_path_last_update is not None
+                and (self.get_clock().now() - self._global_path_last_update).nanoseconds / 1e9 <= self.global_path_max_stale_s
+                and self._global_path_valid
+                and len(self._global_path_poses) >= 2
+            ):
+                use_subgoal = True
+
+        if use_subgoal:
             sub_goal = self._compute_global_subgoal_base_link()
             goal_x_m, goal_y_m = (
                 sub_goal if sub_goal is not None else self._compute_relative_goal()
@@ -701,10 +772,57 @@ class BEVPlannerNode(Node):
         plan_ms = (t_after_plan - t_after_bev) * 1000.0
         total_latency_ms = (t_end - t_start) * 1000.0
 
+        # 8. Gobernador Dinámico de Velocidad basado en Latencia Real P95 (Brief 9 / I.2)
+        self._cycle_times_ms.append(total_latency_ms)
+        # Usamos el percentil 95 de la ventana móvil para reaccionar inmediatamente a picos de latencia
+        t_plan_p95_s = float(np.percentile(list(self._cycle_times_ms), 95)) / 1000.0
+
+        b_term = t_plan_p95_s + self.rtt_delay + self.transport_delay
+        discrim = (b_term ** 2) + (2.0 * float(self.forward_range)) / (self.horizon_safety_margin * self.brake_accel)
+        if discrim > 0.0:
+            v_safe = self.brake_accel * (math.sqrt(discrim) - b_term)
+        else:
+            v_safe = 0.0
+
+        # Piso de velocidad efectiva de arranque de tracción (0.15 m/s): si v_safe cae por debajo,
+        # detenerse por seguridad (Stop & Wait) en vez de comandar velocidades inoperantes
+        min_effective_speed = 0.15
+        if v_safe < min_effective_speed:
+            v_safe = 0.0
+        v_safe = float(v_safe)
+
+        # Guarda de evasión dinámica de peatones/tráfico (I.2.2)
+        dynamic_traffic_safe = bool(t_plan_p95_s <= 1.0)
+        if not dynamic_traffic_safe:
+            self.get_logger().warn(
+                f"Latencia de ciclo alta ({t_plan_p95_s:.2f}s > 1.0s). "
+                "Evasión de obstáculos dinámicos/peatones no garantizada a esta tasa.",
+                throttle_duration_sec=5.0,
+            )
+
+        v_limit_msg = Float32()
+        v_limit_msg.data = v_safe
+        self.safe_vel_pub.publish(v_limit_msg)
+
+        diag_data = {
+            "t_plan_p95_ms": round(t_plan_p95_s * 1000.0, 1),
+            "infer_nn_ms": round(infer_ms, 1),
+            "bev_proj_ms": round(bev_ms, 1),
+            "plan_genie_ms": round(plan_ms, 1),
+            "total_ms": round(total_latency_ms, 1),
+            "v_safe_limit_mps": round(v_safe, 3),
+            "forward_range_m": round(float(self.forward_range), 2),
+            "dynamic_traffic_safe": dynamic_traffic_safe,
+            "valid": is_valid,
+        }
+        diag_msg = String()
+        diag_msg.data = json.dumps(diag_data)
+        self.planner_diag_pub.publish(diag_msg)
+
         self.get_logger().info(
-            f"[LATENCY] frame_total={total_latency_ms:.1f}ms | "
+            f"[LATENCY] frame_total={total_latency_ms:.1f}ms (P95={t_plan_p95_s*1000.0:.1f}ms) | "
             f"infer_nn={infer_ms:.1f}ms | bev_proj={bev_ms:.1f}ms | plan_genie={plan_ms:.1f}ms | "
-            f"valid={is_valid} points={len(path_msg.poses)}"
+            f"v_safe={v_safe:.2f}m/s | valid={is_valid} points={len(path_msg.poses)}"
         )
 
     def destroy_node(self):

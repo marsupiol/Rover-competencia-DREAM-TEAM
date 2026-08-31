@@ -11,7 +11,7 @@ bev_planner_node:
     visualization_topic: "earth_rover/planner_visualization"
     valid_topic: "earth_rover/planner_valid"
     local_bev_grid_topic: "earth_rover/local_bev_grid"
-    publish_visualization: true
+    publish_visualization: false
 
     # Integración y Guía por Planificador Global (Fase 4)
     global_path_topic: "earth_rover/global_path"
@@ -76,9 +76,14 @@ bev_planner_node:
     # Muestras por longitud de arco a lo largo de cada trayectoria (N puntos = path_num_samples + 1)
     path_num_samples: 100
 
-    # Tamaño en píxeles de la huella cuadrada (footprint) del vehículo en la grilla del planner
-    # TODO: confirmar dimensión real del Mini+ (ancho/largo de huella física del chasis)
-    footprint_px: 10
+    # Parámetros físicos del vehículo para derivación automática de footprint
+    robot_length_m: 0.250
+    robot_width_m: 0.190
+    footprint_safety_margin: 1.05
+
+    # Tamaño en píxeles de la huella (footprint) del vehículo en la grilla del planner (240x240)
+    # Si footprint_px = 0, se deriva dinámicamente en código con D_circ = sqrt(L^2 + W^2) * margin
+    footprint_px: 0
 
     # Umbral de costo de peligro a partir del cual una celda se considera colisión
     threshold_cost: 0.50
