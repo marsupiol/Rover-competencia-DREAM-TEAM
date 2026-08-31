@@ -122,7 +122,7 @@ def test_complementary_filter_gate_transition_continuity():
 # ==============================================================================
 # M.5.2 — Tests del Gobernador Dinámico de Velocidad
 # ==============================================================================
-def compute_v_safe(t_plan_s, t_rtt=0.061, t_delay=0.080, d_horizon=2.40, a_brake=1.5, margin=1.5, min_effective_speed=0.15):
+def compute_v_safe(t_plan_s, t_rtt=0.061, t_delay=0.080, d_horizon=4.00, a_brake=1.5, margin=1.5, min_effective_speed=0.15):
     b_term = max(0.0, float(t_plan_s)) + t_rtt + t_delay
     discrim = (b_term ** 2) + (2.0 * float(d_horizon)) / (margin * a_brake)
     if discrim > 0.0:
@@ -137,20 +137,21 @@ def compute_v_safe(t_plan_s, t_rtt=0.061, t_delay=0.080, d_horizon=2.40, a_brake
 
 def test_velocity_governor_table_values():
     """Verificar valores de la tabla teórica de frenado corregida."""
-    # Para d_horizon=2.40m, margin=1.5, a_brake=1.5, t_rtt=0.061, t_delay=0.080 (b = t_plan + 0.141):
-    # 0.28s -> 1.65 m/s, 1.0s -> 1.07 m/s, 2.0s -> 0.68 m/s, 4.5s -> 0.33 m/s, 8.13s -> 0.19 m/s
-    assert math.isclose(compute_v_safe(0.28), 1.65, abs_tol=0.02)
-    assert math.isclose(compute_v_safe(1.00), 1.07, abs_tol=0.02)
-    assert math.isclose(compute_v_safe(2.00), 0.68, abs_tol=0.02)
-    assert math.isclose(compute_v_safe(4.50), 0.33, abs_tol=0.02)
-    assert math.isclose(compute_v_safe(8.13), 0.19, abs_tol=0.02)
+    # Para d_horizon=4.00m (forward_range), margin=1.5, a_brake=1.5, t_rtt=0.061, t_delay=0.080 (b = t_plan + 0.141):
+    # 0.28s -> 2.27 m/s, 1.0s -> 1.59 m/s, 2.0s -> 1.07 m/s, 6.4s -> 0.40 m/s, 8.13s -> 0.32 m/s, 11.2s -> 0.23 m/s
+    assert math.isclose(compute_v_safe(0.28), 2.27, abs_tol=0.02)
+    assert math.isclose(compute_v_safe(1.00), 1.59, abs_tol=0.02)
+    assert math.isclose(compute_v_safe(2.00), 1.07, abs_tol=0.02)
+    assert math.isclose(compute_v_safe(6.40), 0.40, abs_tol=0.02)
+    assert math.isclose(compute_v_safe(8.13), 0.32, abs_tol=0.02)
+    assert math.isclose(compute_v_safe(11.20), 0.23, abs_tol=0.02)
 
 
 def test_velocity_governor_floor_cutoff():
     """Si v_safe cae por debajo de 0.15 m/s, debe retornar 0.0 m/s (Stop & Wait)."""
-    # A t_plan = 12.0s, v_safe continuo sería ~0.129 m/s < 0.15 m/s
-    assert compute_v_safe(12.0) == 0.0
-    assert compute_v_safe(20.0) == 0.0
+    # Para d_horizon=4.00m, a t_plan = 18.0s, v_safe continuo sería ~0.146 m/s < 0.15 m/s -> 0.0 m/s
+    assert compute_v_safe(18.0) == 0.0
+    assert compute_v_safe(25.0) == 0.0
 
 
 def test_velocity_governor_p95_spike_reaction():
@@ -164,7 +165,7 @@ def test_velocity_governor_p95_spike_reaction():
 
     assert p95_lat_s > mean_lat_s
     assert v_safe_p95 < v_safe_mean
-    assert v_safe_p95 <= 0.55
+    assert v_safe_p95 <= 0.85
 
 
 def test_velocity_governor_degenerate_latencies():
@@ -175,42 +176,55 @@ def test_velocity_governor_degenerate_latencies():
     assert v_neg == v_zero
 
 
-def test_fail_safe_velocity_governor_states():
-    """Verificar los casos del gobernador fail-safe con require_velocity_governor (Brief 14 / N.1 & Brief 15 / O.2)."""
-    forward_speed = 0.35
-    geodesic_fallback = 0.20
+def speed_to_throttle(v_mps: float, max_linear_speed_mps: float = 1.111) -> float:
+    """Convierte una velocidad física (m/s) a acelerador normalizado [0.0, 1.0]."""
+    if v_mps <= 0.0:
+        return 0.0
+    return float(min(1.0, max(0.0, v_mps / max(max_linear_speed_mps, 0.01))))
 
-    def resolve_effective_speed(safe_limit_last_rx, safe_limit_val, age_s, path_following_enabled, require_governor=True):
+
+def test_fail_safe_velocity_governor_states():
+    """Verificar los casos del gobernador fail-safe con acelerador normalizado (Brief 14/15/18)."""
+    forward_throttle = 0.40
+    geodesic_fallback_throttle = 0.20
+
+    def resolve_effective_throttle(safe_limit_last_rx, safe_limit_mps, age_s, path_following_enabled, require_governor=True):
+        safe_throttle_limit = speed_to_throttle(safe_limit_mps)
         if safe_limit_last_rx is None:
             if require_governor:
-                # Caso 1a: Esperado pero nunca recibido -> 0.0 m/s
+                # Caso 1a: Esperado pero nunca recibido -> acelerador 0.0
                 return 0.0
             else:
-                # Caso 1b: No requerido (modo geodésico puro) -> velocidad conservadora
-                return max(0.0, min(geodesic_fallback, forward_speed))
+                # Caso 1b: No requerido (modo geodésico puro) -> acelerador conservador
+                return max(0.0, min(geodesic_fallback_throttle, forward_throttle))
         if age_s <= 3.0:
-            # Caso 2: Recibido y vigente
-            return max(0.0, min(forward_speed, safe_limit_val))
+            # Caso 2: Recibido y vigente -> clampear en dominio acelerador
+            return max(0.0, min(forward_throttle, safe_throttle_limit))
         # Caso 3: Expirado (>3.0s)
         if path_following_enabled:
             return 0.0
-        return max(0.0, min(geodesic_fallback, forward_speed))
+        return max(0.0, min(geodesic_fallback_throttle, forward_throttle))
 
     # 1a. Nunca recibido y require_governor=True -> 0.0
-    assert resolve_effective_speed(None, 0.0, 0.0, True, require_governor=True) == 0.0
-    assert resolve_effective_speed(None, 0.0, 0.0, False, require_governor=True) == 0.0
+    assert resolve_effective_throttle(None, 0.0, 0.0, True, require_governor=True) == 0.0
+    assert resolve_effective_throttle(None, 0.0, 0.0, False, require_governor=True) == 0.0
 
-    # 1b. Nunca recibido y require_governor=False (modo geodésico puro) -> 0.20 m/s
-    assert math.isclose(resolve_effective_speed(None, 0.0, 0.0, False, require_governor=False), 0.20)
+    # 1b. Nunca recibido y require_governor=False (modo geodésico puro) -> 0.20
+    assert math.isclose(resolve_effective_throttle(None, 0.0, 0.0, False, require_governor=False), 0.20)
 
-    # 2. Recibido y vigente (0.5s de antigüedad, límite 0.28 m/s) -> 0.28
-    assert math.isclose(resolve_effective_speed(True, 0.28, 0.5, True), 0.28)
+    # 2. Recibido y vigente:
+    # 2a. Operación nominal GPU: v_safe = 2.29 m/s -> safe_throttle = 1.0 -> effective = forward_throttle (0.40)
+    assert math.isclose(resolve_effective_throttle(True, 2.29, 0.5, True), 0.40)
+    # 2b. Degradado: v_safe = 0.30 m/s -> safe_throttle = 0.30/1.111 = 0.270 -> effective = 0.270 < 0.40
+    assert math.isclose(resolve_effective_throttle(True, 0.30, 0.5, True), 0.30 / 1.111, abs_tol=1e-3)
+    # 2c. Stop & Wait: v_safe = 0.0 m/s -> safe_throttle = 0.0 -> effective = 0.0
+    assert resolve_effective_throttle(True, 0.0, 0.5, True) == 0.0
 
     # 3. Recibido pero expirado (4.0s) con path following activo -> 0.0
-    assert resolve_effective_speed(True, 0.28, 4.0, True) == 0.0
+    assert resolve_effective_throttle(True, 2.29, 4.0, True) == 0.0
 
     # 4. Recibido pero expirado (4.0s) en modo geodésico puro -> 0.20
-    assert math.isclose(resolve_effective_speed(True, 0.28, 4.0, False), 0.20)
+    assert math.isclose(resolve_effective_throttle(True, 2.29, 4.0, False), 0.20)
 
 
 def test_heading_stale_guard():
@@ -343,3 +357,66 @@ def test_confidence_channel_interpolation():
 
     # Celda 2: 50% observada -> cost = 0.20 + 0.5 * (0.10 - 0.20) = 0.15
     assert math.isclose(float(cost_map[0, 2]), 0.15, abs_tol=1e-5)
+
+
+# ==============================================================================
+# S.1.4 — Test de Conversión Cinemática v_safe -> Acelerador Normalizado
+# ==============================================================================
+def test_speed_to_throttle_conversion():
+    """Verificar la función de mapeo dimensional speed_to_throttle (Brief 18 / R.1.3 & Brief 19 / S.1.4)."""
+    v_max = 1.111
+
+    # 1. Velocidad cero -> 0.0
+    assert speed_to_throttle(0.0, max_linear_speed_mps=v_max) == 0.0
+
+    # 2. Velocidad nominal por debajo del máximo (ej. 0.44 m/s) -> fracción lineal
+    t_mid = speed_to_throttle(0.4444, max_linear_speed_mps=v_max)
+    assert math.isclose(t_mid, 0.4444 / 1.111, abs_tol=1e-4)
+    assert 0.0 < t_mid < 1.0
+
+    # 3. Velocidad exactamente en el máximo nominal (1.111 m/s) -> 1.0
+    assert math.isclose(speed_to_throttle(1.111, max_linear_speed_mps=v_max), 1.0, abs_tol=1e-5)
+
+    # 4. Velocidad por encima del máximo (ej. v_safe teórica en GPU = 2.36 m/s) -> saturación estricta en 1.0
+    assert speed_to_throttle(2.36, max_linear_speed_mps=v_max) == 1.0
+    assert speed_to_throttle(10.0, max_linear_speed_mps=v_max) == 1.0
+
+    # 5. Velocidad negativa -> 0.0
+    assert speed_to_throttle(-0.5, max_linear_speed_mps=v_max) == 0.0
+    assert speed_to_throttle(-10.0, max_linear_speed_mps=v_max) == 0.0
+
+
+# ==============================================================================
+# S.2 — Test de la Guarda de Retención de GPS en Mission Manager
+# ==============================================================================
+def test_gps_retention_guard():
+    """Verificar la guarda de retención de GPS ante micro-cortes transitorios (Brief 19 / S.2)."""
+    def resolve_effective_gps(current_gps, last_valid_gps, last_valid_time_s, now_s, max_retention_s=10.0):
+        if current_gps is not None:
+            lat, lon = current_gps
+            return lat, lon, 0.0
+
+        if last_valid_gps is not None and last_valid_time_s is not None:
+            age_s = now_s - last_valid_time_s
+            if age_s <= max_retention_s:
+                lat, lon = last_valid_gps
+                return lat, lon, age_s
+
+        return None, None, None
+
+    # Caso 1: GPS válido presente (lat=19.4326, lon=-99.1332)
+    lat, lon, age = resolve_effective_gps((19.4326, -99.1332), (19.4320, -99.1330), 100.0, 105.0)
+    assert lat == 19.4326 and lon == -99.1332 and age == 0.0
+
+    # Caso 2: GPS ausente (corte transitorio), última muestra válida a los 5.0 s (age < 10.0 s)
+    lat, lon, age = resolve_effective_gps(None, (19.4326, -99.1332), 100.0, 105.0, max_retention_s=10.0)
+    assert lat == 19.4326 and lon == -99.1332
+    assert math.isclose(age, 5.0, abs_tol=1e-5)
+
+    # Caso 3: GPS ausente, última muestra válida a los 15.0 s (age > 10.0 s) -> Rechazo
+    lat, lon, age = resolve_effective_gps(None, (19.4326, -99.1332), 100.0, 115.0, max_retention_s=10.0)
+    assert lat is None and lon is None and age is None
+
+    # Caso 4: GPS ausente y nunca se recibió coordenada previa -> Rechazo
+    lat, lon, age = resolve_effective_gps(None, None, None, 105.0, max_retention_s=10.0)
+    assert lat is None and lon is None and age is None
