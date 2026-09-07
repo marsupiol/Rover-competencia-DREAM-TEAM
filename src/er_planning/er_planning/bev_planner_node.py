@@ -59,6 +59,28 @@ def genie_xy_to_ros_base_link(x_right_m: float, y_forward_m: float) -> tuple[flo
     return x_ros, y_ros
 
 
+def compute_footprint_px(
+    robot_l: float,
+    robot_w: float,
+    bev_resolution: float,
+    grid_n: int,
+    bev_h: int,
+    margin: float = 1.05,
+) -> tuple[int, float]:
+    """Deriva analíticamente el radio de huella en píxeles (footprint_px) para la grilla GeNIE.
+
+    Aplica D_circ = sqrt(L^2 + W^2) y escala con la relación grid_n / bev_h y margen de seguridad,
+    aplicando ceil estrictamente al producto final para evitar sobreinflación por redondeos intermedios.
+
+    Retorna (footprint_px, d_circ).
+    """
+    d_circ = math.sqrt(robot_l ** 2 + robot_w ** 2)
+    footprint_px = int(
+        math.ceil((d_circ / float(bev_resolution)) * (float(grid_n) / float(bev_h)) * margin)
+    )
+    return footprint_px, d_circ
+
+
 class BEVPlannerNode(Node):
     def __init__(self):
         super().__init__("bev_planner_node")
@@ -240,8 +262,13 @@ class BEVPlannerNode(Node):
             # Nota de derivación (G.4): Aplicamos ceil estrictamente al producto final
             # para evitar inflación de área por doble redondeo intermedio:
             # (D_circ / res) * (grid_n / bev_h) * margin
-            footprint_derived = int(
-                math.ceil((d_circ / float(self.bev_resolution)) * (float(grid_n) / float(bev_h)) * margin)
+            footprint_derived, d_circ = compute_footprint_px(
+                robot_l=robot_l,
+                robot_w=robot_w,
+                bev_resolution=float(self.bev_resolution),
+                grid_n=grid_n,
+                bev_h=bev_h,
+                margin=margin,
             )
             self.get_logger().info(
                 f"Footprint derivado dinámicamente: {footprint_derived} px "
@@ -268,7 +295,6 @@ class BEVPlannerNode(Node):
             random_seed=random_seed,
             include_goal_in_path_bank=bool(self.get_parameter("include_goal_in_path_bank").value),
             include_random_goals=bool(self.get_parameter("include_random_goals").value),
-            render_visualization=self.publish_visualization,
         )
 
         # Precomputar el banco de caminos fijos (GeNIE) si no depende de la meta dinámica (G.5)
@@ -843,7 +869,10 @@ def main(args=None):
     finally:
         node.destroy_node()
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

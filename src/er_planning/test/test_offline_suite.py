@@ -260,6 +260,50 @@ def test_derived_footprint_px_calculations():
     assert derive_footprint_px(0.250, 0.190, 0.03, 240, 80, 1.05) == 33
     assert derive_footprint_px(0.250, 0.190, 0.05, 240, 56, 1.05) == 29
     assert derive_footprint_px(0.250, 0.190, 0.03, 160, 80, 1.05) == 22
+    # Configuración oficial Earth Rover Mini+ (Brief 6 / Brief 20):
+    # 4.0m range @ 0.03 m/px -> bev_h = 134, grid_size = 240, margin = 1.05 -> footprint_px = 20
+    assert derive_footprint_px(0.250, 0.190, 0.03, 240, 134, 1.05) == 20
+
+
+def test_bev_planner_standalone_compute_footprint_px():
+    """Verificar función standalone compute_footprint_px exportada por bev_planner_node (T.1.4/T.1.5)."""
+    from er_planning.bev_planner_node import compute_footprint_px
+
+    fp, d_circ = compute_footprint_px(0.250, 0.190, 0.03, 240, 134, 1.05)
+    assert math.isclose(d_circ, 0.314, abs_tol=0.001)
+    assert fp == 20
+
+
+def test_bev_planner_node_smoke_instantiation():
+    """Smoke test (Brief 20 / T.1.5): Instanciar BEVPlannerNode completo y verificar construcción sin NameError."""
+    import rclpy
+    from unittest.mock import patch, MagicMock
+    from er_planning.bev_planner_node import BEVPlannerNode
+
+    if not rclpy.ok():
+        rclpy.init()
+
+    with patch("rover_traversability.predictor.TraversabilityPredictor") as mock_tp:
+        mock_inst = MagicMock()
+        mock_inst.device = "cpu"
+        mock_tp.return_value = mock_inst
+
+        node = BEVPlannerNode()
+        try:
+            assert node._planner_cfg.footprint_px == 20
+            assert node._planner_cfg.grid_size == 240
+            assert node._candidate_path_bank is not None
+            assert len(node._candidate_path_bank) == 277
+            assert math.isclose(node.forward_range, 4.0)
+            assert math.isclose(node.side_range, 2.0)
+            assert math.isclose(node.bev_resolution, 0.03)
+        finally:
+            node.destroy_node()
+            if rclpy.ok():
+                try:
+                    rclpy.shutdown()
+                except Exception:
+                    pass
 
 
 # ==============================================================================

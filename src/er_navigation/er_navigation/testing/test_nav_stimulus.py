@@ -108,6 +108,7 @@ class TestNavStimulus(Node):
         # Publicadores
         self.gps_pub = self.create_publisher(NavSatFix, "gps/filtered", sensor_qos)
         self.heading_pub = self.create_publisher(Float32, "earth_rover/heading", sensor_qos)
+        self.uncertainty_pub = self.create_publisher(Float32, "earth_rover/heading_uncertainty", sensor_qos)
         self.target_pub = self.create_publisher(NavSatFix, "earth_rover/target_waypoint", reliable_qos)
         self.path_pub = self.create_publisher(Path, "earth_rover/planned_path", sensor_qos)
         self.valid_pub = self.create_publisher(Bool, "earth_rover/planner_valid", sensor_qos)
@@ -207,6 +208,10 @@ class TestNavStimulus(Node):
         head_msg = Float32()
         head_msg.data = float(published_heading % 360.0)
         self.heading_pub.publish(head_msg)
+
+        u_msg = Float32()
+        u_msg.data = 3.0
+        self.uncertainty_pub.publish(u_msg)
 
         # 2b. Broadcast TF (map -> base_link) para localización sintética
         if self.broadcast_tf:

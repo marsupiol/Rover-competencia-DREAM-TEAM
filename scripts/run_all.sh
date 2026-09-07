@@ -33,7 +33,7 @@ if ! grep -qE "^MISSION_SLUG=" "$ROOT_DIR/src/sdk_server/.env"; then
 fi
 
 echo "=== 2. Iniciando SDK ==="
-source "$ROOT_DIR/.venv/bin/activate"
+[ -f "$ROOT_DIR/.venv/bin/activate" ] && source "$ROOT_DIR/.venv/bin/activate"
 cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR/src/sdk_server:$PYTHONPATH"
 python3 "$ROOT_DIR/run_sdk.py" &

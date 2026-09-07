@@ -28,6 +28,7 @@ setup(
             'test_dual_heading_stimulus = er_navigation.testing.test_dual_heading_stimulus:main',
             'heading_diagnostic_monitor = er_navigation.testing.heading_diagnostic_monitor:main',
             'run_heading_conflict_experiment = er_navigation.testing.run_heading_conflict_experiment:main',
+            'diagnose_yaw_sign = er_navigation.testing.diagnose_yaw_sign:main',
         ],
     },
 )

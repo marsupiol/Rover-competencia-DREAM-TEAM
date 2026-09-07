@@ -106,6 +106,7 @@ class TestImagePublisher(Node):
         if self.max_loops > 0 and self._published_frames >= self.max_loops:
             self.get_logger().info(f"Se completó la publicación de {self._published_frames} frames.")
             self.timer.cancel()
+            raise SystemExit
 
 
 def main(args=None):
@@ -113,12 +114,15 @@ def main(args=None):
     node = TestImagePublisher()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         node.destroy_node()
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

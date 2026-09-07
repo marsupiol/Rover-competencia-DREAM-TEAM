@@ -249,7 +249,11 @@ def run_benchmark(mode: str, duration_s: float = 30.0) -> SimulationMetrics:
     finally:
         node.metrics.duration_s = time.time() - start_t
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
     return node.metrics
 
 
