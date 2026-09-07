@@ -10,7 +10,7 @@ Arquitectura de navegación autónoma, percepción visual profunda (SAM-TP), pla
 
 > [!WARNING]
 > **ESTADO DE LA CALIBRACIÓN DE CÁMARA (LIMITACIÓN PRINCIPAL DEL SISTEMA):**  
-> Los parámetros intrínsecos de la cámara ($f_x, f_y, c_x, c_y$) y extrínsecos ($h = 0.18\text{ m}$, $\text{pitch} = -8^\circ$) son actualmente **nominales y aproximados**, no calibrados en banco óptico sobre el chasis físico. La proyección métrica BEV y la cobertura lateral tienen un error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
+> Los parámetros intrínsecos de la cámara ($f_x, f_y, c_x, c_y$) y extrínsecos ($X = +0.110\text{ m}, h = 0.140\text{ m}, \text{pitch} = -8.0^\circ$, procedentes de las estimaciones a ojo del repositorio base: *"~14 cm above ground, ~11 cm forward, pitched ~8 degrees down"*) son actualmente **nominales y aproximados**, no calibrados en banco óptico sobre el chasis físico. La proyección métrica BEV y la cobertura lateral tienen un error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
 
 ```text
                                +-------------------------------------------------------------+
@@ -113,9 +113,10 @@ Conecta con el servidor SDK local vía HTTP REST, MJPEG y WebSockets para public
 - **Publica:**
   - `earth_rover/front/image_raw` (`sensor_msgs/msg/Image`, BEST_EFFORT): Frame BGR8 de la cámara frontal ($1024 \times 576$).
   - `/gps/fix` (`sensor_msgs/msg/NavSatFix`, RELIABLE): Coordenadas geodésicas crudas con covarianza escalada por HDOP.
-  - `/imu/data` (`sensor_msgs/msg/Imu`, RELIABLE): Aceleraciones y velocidades angulares MPU-6050 a 50 Hz interpolados.
+  - `/imu/data` (`sensor_msgs/msg/Imu`, RELIABLE): Aceleraciones y velocidades angulares MPU-6050 (1 muestra promediada por paquete de telemetría a ~0.5 Hz con timestamp actual de ROS).
   - `/wheel_odom` (`nav_msgs/msg/Odometry`, RELIABLE): Odometría calculada por cinemática de ruedas.
-  - `earth_rover/heading` (`std_msgs/msg/Float32`, BEST_EFFORT): Rumbo magnético ($0^\circ=\text{Norte}$, sentido horario).
+  - `earth_rover/heading` (`std_msgs/msg/Float32`, BEST_EFFORT): Rumbo de brújula ($0^\circ=\text{Norte}$, sentido horario).
+  - `earth_rover/heading_uncertainty` (`std_msgs/msg/Float32`, BEST_EFFORT): Incertidumbre de orientación estimada por el bridge inercial ($^\circ$).
   - `earth_rover/battery` (`sensor_msgs/msg/BatteryState`, BEST_EFFORT): Estado de carga de batería.
 - **Consume:**
   - `cmd_vel` (`geometry_msgs/msg/Twist`): Comandos de velocidad lineal y angular hacia el rover.
@@ -138,9 +139,9 @@ Conecta con el servidor SDK local vía HTTP REST, MJPEG y WebSockets para public
 - **`ekf_filter_node_map`**: Fusión global en el marco `map` con anclaje geográfico.
   - *Consume:* `/wheel_odom`, `/imu/data` y `/odometry/gps`.
   - *Publica:* `odometry/global` y transform `map -> odom`.
-- **`ekf_heading_bridge`**: Convierte el cuaternión fusionado de `odometry/global` a rumbo de brújula ($0^\circ=\text{Norte}$, horario).
-  - *Consume:* `odometry/global` (`nav_msgs/msg/Odometry`).
-  - *Publica:* `earth_rover/heading` (`std_msgs/msg/Float32`).
+- **`ekf_heading_bridge`**: Convierte el cuaternión fusionado de `odometry/global` a rumbo de brújula ($0^\circ=\text{Norte}$, horario) y propaga continuamente el rumbo mediante integración giroscópica de `/imu/data` (`gyro_z`) entre actualizaciones discretas del compás (~0.5 Hz), monitoreando la incertidumbre analítica.
+  - *Consume:* `odometry/global` (`nav_msgs/msg/Odometry`), `/imu/data` (`sensor_msgs/msg/Imu`).
+  - *Publica:* `earth_rover/heading` (`std_msgs/msg/Float32`, rumbo continuo), `earth_rover/heading_compass` (`std_msgs/msg/Float32`, brújula absoluta), `earth_rover/heading_uncertainty` (`std_msgs/msg/Float32`, incertidumbre en grados).
 
 ---
 
@@ -157,21 +158,23 @@ Cerebro de percepción y planificación de trayectorias locales libres de obstá
   - `earth_rover/planner_visualization` (`sensor_msgs/msg/Image`, BEST_EFFORT): Debug visual con overlay de costos y trayectorias.
   - `earth_rover/local_bev_grid` (`nav_msgs/msg/OccupancyGrid`, BEST_EFFORT): Grilla BEV local cruda en marco `base_link`.
 - **Parámetros Clave:**
-  - `local_bev_grid_topic` (`str`, default: `"earth_rover/local_bev_grid"`): Tópico para publicar la grilla BEV local.
+  - `local_bev_grid_topic` (`str`, default: `"earth_rover/local_bev_grid"`): Tópico de la grilla BEV local métrica ($134 \times 134$ celdas a $0.03\text{ m/px}$, $4.00\text{ m} \times 4.00\text{ m}$).
   - `resolution_m_per_px` (`float`, default: `0.03`): Resolución métrica de la grilla BEV ($3\text{ cm/px}$).
   - `forward_range_m` (`float`, default: `4.0`): Horizonte longitudinal local ($4\text{ m}$).
-  - `side_range_m` (`float`, default: `2.0`): Semiancho lateral local ($4\text{ m}$ de ancho total).
-  - `grid_size` (`int`, default: `240`): Dimensión de la grilla interna del planificador ($240 \times 240$).
+  - `side_range_m` (`float`, default: `2.0`): Semiancho lateral local ($2.0\text{ m}$ hacia cada lado, $4\text{ m}$ ancho total).
+  - `grid_size` (`int`, default: `240`): Dimensión discreta de la grilla interna del muestreador GeNIE ($240 \times 240$).
+  - `footprint_px` (`int`, default: `0`): Radio de huella en píxeles (si es `0`, `compute_footprint_px()` deriva dinámicamente $20\text{ px}$ para la grilla del planner $240 \times 240$ desde las dimensiones físicas del chasis: $D_{\text{circ}} = 0.314\text{ m}$, reescalado $240/134$ y margen $1.05$).
   - `threshold_cost` (`float`, default: `0.50`): Umbral de costo a partir del cual se considera obstáculo.
   - `use_clustering` (`bool`, default: `true`): Habilita K-Means adaptativo para seleccionar la rama hacia el waypoint.
 
 ---
 
 ### 3.4. `gps_waypoint_controller` (`er_navigation`)
-Controlador motriz híbrido reactivo con mitigación de jitter 4G (Burst & Wait), seguimiento de trayectorias BEV locales y fallback geodésico.
+Controlador motriz híbrido reactivo con mitigación de jitter 4G (Burst & Wait proporcional), seguimiento de trayectorias BEV locales acotadas y fallback geodésico.
 - **Consume:**
   - `gps/filtered` (`sensor_msgs/msg/NavSatFix`, BEST_EFFORT): Posición actual filtrada.
-  - `earth_rover/heading` (`std_msgs/msg/Float32`, BEST_EFFORT): Rumbo actual del rover.
+  - `earth_rover/heading` (`std_msgs/msg/Float32`, BEST_EFFORT): Rumbo actual del rover (inercial propagado).
+  - `earth_rover/heading_uncertainty` (`std_msgs/msg/Float32`, BEST_EFFORT): Incertidumbre analítica de rumbo en grados.
   - `earth_rover/target_waypoint` (`sensor_msgs/msg/NavSatFix`, RELIABLE): Coordenadas del waypoint objetivo.
   - `earth_rover/planned_path` (`nav_msgs/msg/Path`, BEST_EFFORT): Trayectoria generada por `bev_planner_node`.
   - `earth_rover/planner_valid` (`std_msgs/msg/Bool`, BEST_EFFORT): Validez del camino planificado.
@@ -184,16 +187,24 @@ Controlador motriz híbrido reactivo con mitigación de jitter 4G (Burst & Wait)
 - **Parámetros Clave:**
   - `forward_throttle` (`float`, default: `0.40`): Fracción normalizada de acelerador lineal en avance (`DRIVE`).
   - `turn_throttle` (`float`, default: `0.70`): Fracción normalizada de acelerador angular en alineación (`ALIGN`).
-  - `recovery_turn_throttle` (`float`, default: `0.30`): Fracción de acelerador angular de búsqueda en `RECOVERY` cuando no hay camino libre.
+  - `drive_correction_gain` (`float`, default: `0.01`): Ganancia proporcional para corrección angular en `DRIVE`.
+  - `max_drive_angular` (`float`, default: `0.45`): Límite de acelerador angular en `DRIVE` ($0.01 \times 45.0^\circ$, sin saturación prematura).
+  - `recovery_turn_throttle` (`float`, default: `0.30`): Fracción de acelerador angular en `RECOVERY` (bidireccional, gira hacia el rumbo geodésico).
+  - `recovery_max_duration_s` (`float`, default: `20.0`): Duración máxima del giro en `RECOVERY` antes de forzar reintento a `ALIGN`.
   - `geodesic_fallback_throttle` (`float`, default: `0.20`): Acelerador conservador en navegación geodésica pura.
   - `max_linear_speed_mps` (`float`, default: `1.111`): Velocidad física máxima de referencia (m/s) para conversión de $v_{\text{safe}}$.
   - `gps_max_stale_s` (`float`, default: `2.0`): Tiempo máximo tolerado sin recibir GPS antes de frenar por seguridad.
+  - `heading_max_stale_s` (`float`, default: `3.5`): Tiempo máximo tolerado sin recibir rumbo antes de frenar por seguridad.
   - `path_following_enabled` (`bool`, default: `true`): Activa el seguimiento de `earth_rover/planned_path`.
-  - `path_max_stale_s` (`float`, default: `1.0`): Tiempo de expiración del path BEV antes de caer en fallback a GPS puro.
+  - `path_max_stale_s` (`float`, default: `8.0`): Tiempo de expiración del path BEV antes de caer en fallback a GPS puro.
   - `lookahead_distance_m` (`float`, default: `1.0`): Distancia de anticipación euclídea sobre el path.
   - `goal_tolerance_m` (`float`, default: `13.0`): Radio geodésico de llegada al checkpoint.
-  - `align_threshold_deg` (`float`, default: `18.0`): Umbral de error angular para pasar de `ALIGN` a `DRIVE`.
-  - `turn_burst_s` (`float`, default: `0.25`) y `pause_after_turn_s` (`float`, default: `0.8`): Parámetros Burst & Wait anti-latencia.
+  - `align_threshold_deg` (`float`, default: `18.0`) y `coarse_align_threshold_deg` (`float`, default: `25.0`): Umbrales de alineación angular fino y grueso para conmutar a `DRIVE`.
+  - `drive_abort_threshold_deg` (`float`, default: `65.0`) y `drive_abort_dwell_s` (`float`, default: `1.5`): Histéresis asimétrica para abortar `DRIVE` hacia `ALIGN` ante desvío geodésico persistente.
+  - `max_bev_deviation_deg` (`float`, default: `45.0`): Desviación angular máxima que BEV puede comandar respecto al rumbo geodésico en `DRIVE`.
+  - `turn_burst_min_s` (`float`, default: `0.15`), `turn_burst_max_s` (`float`, default: `1.20`), `yaw_rate_deg_s` (`float`, default: `17.0`), `turn_burst_damping` (`float`, default: `0.6`): Ráfaga de giro proporcional al error angular ($t_{\text{burst}} = (|e| / 17.0) \cdot 0.6$).
+  - `pause_after_turn_s` (`float`, default: `0.5`): Pausa mínima tras pulso de giro para estabilización física.
+  - `heading_trust_threshold_deg` (`float`, default: `10.0`): Umbral de incertidumbre propagada que autoriza nueva ráfaga sin esperar al compás.
 
 ---
 
@@ -579,20 +590,20 @@ pip install hydra-core "scikit-learn<1.5" "scipy<1.15" huggingface-hub
 
 ## 8. Estado Actual y Limitaciones Conocidas
 
-1. **Estado de la Calibración Óptica (Limitación Principal):** Los parámetros intrínsecos ($f_x, f_y, c_x, c_y$) y extrínsecos ($h=0.18\text{ m}, \text{pitch}=-8^\circ$) son nominales. La proyección BEV tiene error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
-2. **Dependencia de Sensor de Rumbo Único:** No existe una segunda fuente de orientación absoluta independiente del compás magnético. La odometría cinemática `/wheel_odom` proyecta velocidades integrando el mismo rumbo de brújula que alimenta `/imu/data`; por ende, si la brújula sufre perturbaciones ferromagnéticas, ambas fuentes se desvían de forma correlacionada y el EKF no puede detectar la inconsistencia.
-3. **Gobernador Dinámico de Velocidad (Fail-Safe vs. Fail-Open):** El gobernador calcula la velocidad máxima segura $v_{\text{safe}}$ resolviendo la ecuación cuadrática de frenado según la latencia percentil 95 ($t_{\text{plan,P95}}$) de inferencia y planificación. El controlador motriz implementa una política estrictamente *Fail-Safe* con tres estados:
-   * **Nunca recibido (`None`):** Si `require_velocity_governor: true`, el rover permanece inmovilizado ($v = 0.0\text{ m/s}$) protegiendo el avance a ciegas. Si `require_velocity_governor: false` (modo geodésico puro deliberado), avanza a velocidad de fallback (`geodesic_fallback_speed: 0.20\text{ m/s}`).
-   * **Vigente ($\le 3.0\text{ s}$):** Velocidad acotada a $\min(v_{\text{fwd}}, v_{\text{safe}})$.
-   * **Expirado ($> 3.0\text{ s}$):** Si `path_following_enabled: true`, detención total ($v = 0.0\text{ m/s}$). En modo geodésico puro, navegación conservadora a $0.20\text{ m/s}$.
-4. **Filtro Complementario Roll/Pitch y Diagnóstico Inercial:** Reemplaza al watchdog que revertía roll/pitch a cero tras 6 segundos (el cual afirmaba falsamente estar en plano al subir rampas rugosas). Emplea doble compuerta estadística (media $|\|\mathbf{a}\| - 1.0| < 0.08\text{ g}$, dispersión $\sigma_m < 0.06\text{ g}$). Con compuerta cerrada, propaga por integración giroscópica expandiendo continuamente la covarianza analítica ($P_k = P_{k-1} + Q \cdot \Delta t$) y publica telemetría en `earth_rover/tilt_gate_diag`.
-5. **Archivos de Calibración Inercial (`gyro_bias.json` y `accel_bias.json`):** Al iniciar, `earth_rover_bridge` busca automáticamente archivos JSON en `config/`. Si existen, descuenta los sesgos medidos; si no existen, inicializa limpiamente en $0.0$ emitiendo logs informativos.
-6. **Rendimiento de Inferencia en CPU vs GPU:** En CPU (Ryzen 3 3200G), SAM-TP toma $\approx 4.5\text{ s}$ por ciclo, disparando el piso del gobernador a $v=0.0\text{ m/s}$ (*Stop & Wait*). La navegación fluida en tiempo real requiere aceleración GPU dedicada (RTX 5060).
-7. **Modos de Despliegue `ROVER_MODE`:** 
-   * `ROVER_MODE: "manual"` (por defecto en `docker-compose.gpu.yml`): Contenedor en espera para depuración interactiva y pruebas de profiling.
-   * `ROVER_MODE: "full"` (por defecto en `docker-compose.yml`): Lanza automáticamente `mission1.launch.py`.
-   > [!CAUTION]
-   > Con `ROVER_MODE: "full"`, **NUNCA** ejecutar `mission_manager.launch.py` manualmente dentro del contenedor, ya que se ejecutarán dos instancias completas del stack compitiendo por la GPU y el control del robot.
+1. **Calibración Óptica Pendiente:** Los parámetros intrínsecos ($f_x, f_y, c_x, c_y$) y extrínsecos ($X=+0.110\text{ m}, h=0.140\text{ m}, \text{pitch}=-8.0^\circ$) son estimaciones nominales a ojo procedentes del docstring del repositorio base (*"~14 cm above ground, ~11 cm forward of base origin, pitched ~8 degrees down"*). La proyección BEV tiene error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
+2. **Dependencia de Sensor de Rumbo Único:** No existe una segunda fuente de orientación absoluta independiente del compás magnético. La odometría cinemática `/wheel_odom` proyecta velocidades integrando el mismo rumbo de brújula que alimenta `/imu/data` ($V_{\text{yaw}}$ en `odom0` está deshabilitado); ante perturbaciones magnéticas, ambas fuentes se desvían de forma correlacionada y el EKF no puede detectar la inconsistencia.
+3. **Supuesto de Desaceleración $a_{\text{brake}} = 1.5\text{ m/s}^2$ No Verificado:** El valor $1.5\text{ m/s}^2$ es un supuesto teórico del que dependen la ecuación de frenado del gobernador y el horizonte de seguridad. Requiere protocolo de medición empírico en hormigón seco y baja adherencia (mojado/gravilla).
+4. **Mapeo Acelerador $\leftrightarrow$ Velocidad Lineal Sin Medir:** No se ha caracterizado empíricamente la curva real de velocidad física (m/s) en función de la fracción de acelerador comandada (`forward_throttle`), el estado de carga de la batería y la fricción del suelo.
+5. **Sesgos de IMU Sin Calibrar en Disco:** Los archivos `gyro_bias.json` y `accel_bias.json` no existen en producción. El nodo `earth_rover_bridge` opera con un fallback limpio a $0.0$, requiriendo captura estática de sesgos inerciales en reposo.
+6. **Telemetría de RPMs Sin Explotar:** El payload WebSocket del SDK reporta lecturas de `rpms` de tracción motriz, pero actualmente no se consumen debido a la falta de mapeo verificado de índices de rueda, convención de signo y cuantificación del deslizamiento cinemático lateral (*slip*).
+7. **Canal de Confianza No Cableado:** La formulación de costo combinada con canal de confianza del modelo de segmentación fue validada fuera de línea, pero actualmente no está cableada en el pipeline en tiempo real de `bev_planner_node`.
+8. **Tabla de Rayos Fisheye No Implementada:** El ray-casting homográfico BEV (`bev_proj`) toma ~44.5 ms en GPU; la sustitución por una tabla de consulta precomputada (LUT) para corregir distorsión fisheye de gran angular ($126^\circ$) está pendiente de la calibración de cámara.
+9. **Límite Angular `max_drive_angular = 0.45` Sin Validación de Derrape:** Configurado analíticamente como $\text{gain} \times \text{max\_deviation} = 0.01 \times 45.0^\circ = 0.45$ para eliminar la saturación previa a 15°; no ha sido medido dinámicamente con avance concurrente para evaluar el derrape lateral característico del rodado skid-steer.
+10. **Baja Exposición Operativa del Modo DRIVE en Campo:** Históricamente el régimen de avance sostenido `DRIVE` se ejecutó durante menos del 2% del tiempo de misión en pruebas reales debido a los bugs de alineación previos; gran parte del lazo de guiado dinámico se valida en banco y simulación.
+11. **Gobernador Dinámico de Velocidad (Fail-Safe):** Resuelve la ecuación cuadrática de frenado según la latencia percentil 95 ($t_{\text{plan,P95}}$). Con `require_velocity_governor: true`, inmoviliza el rover ($v=0.0\text{ m/s}$) si no se recibe límite o si expira (>3.0s con path following), y cancela también el giro angular.
+12. **Filtro Complementario Roll/Pitch y Diagnóstico Inercial:** Reemplaza al antiguo watchdog por una compuerta estadística dual (media $|\|\mathbf{a}\| - 1.0| < 0.08\text{ g}$, dispersión $\sigma_m < 0.06\text{ g}$) con propagación por integración giroscópica ($P_k = P_{k-1} + Q \cdot \Delta t$) y telemetría en `earth_rover/tilt_gate_diag`.
+13. **Rendimiento CPU vs GPU:** En CPU (Ryzen 3 3200G), SAM-TP toma $\approx 4.5\text{ s}$, disparando el corte del gobernador a $v=0.0\text{ m/s}$ (*Stop & Wait*). La operación fluida a 4.2–5.3 Hz requiere GPU (RTX 5060).
+14. **Modos de Despliegue `ROVER_MODE`:** `ROVER_MODE: "manual"` (por defecto en `docker-compose.gpu.yml`) para depuración y tests; `ROVER_MODE: "full"` (por defecto en `docker-compose.yml`) lanza `mission1.launch.py`.
 
 ---
 
@@ -601,11 +612,11 @@ pip install hydra-core "scikit-learn<1.5" "scipy<1.15" huggingface-hub
 ### 9.0. Changelog Reciente (Fixes Críticos y Mejoras de Infraestructura)
 
 - **Gobernador Dinámico de Velocidad P95 y Fail-Safe (`bev_planner_node` & `gps_waypoint_controller`):**
-  - Adaptación continua de velocidad segura según latencia P95 del ciclo, eliminación del fail-open inseguro y parámetro `require_velocity_governor` para evitar deadlocks en modos aislados.
+  - Adaptación continua de velocidad segura según latencia P95 del ciclo, eliminación del fail-open inseguro y parámetro `require_velocity_governor` para evitar deadlocks en modos aislados. Cancelación de giro angular ante parada de seguridad en DRIVE.
 - **Filtro Complementario Roll/Pitch con Compuerta Estadística (`bridge_node.py`):**
   - Sustitución del watchdog discontinuo por integración continua de giróscopo con compuerta de aceleración y tópico de diagnóstico `earth_rover/tilt_gate_diag`.
 - **Guarda de Expiración de Rumbo (`gps_waypoint_controller`):**
-  - Implementación de `heading_max_stale_s: 2.0` para abortar la navegación ante congelamiento de datos de brújula.
+  - Implementación de `heading_max_stale_s: 3.5` para abortar la navegación ante congelamiento de datos de brújula.
 - **Protección Atómica de Respuestas HTTP y Warm Start (`mission_manager_node`):**
   - Protección de variables de respuesta con `threading.Lock()` y restablecimiento inmediato de navegación hacia checkpoints en reanudaciones.
 - **Carga Automática de Calibración Inercial (`bridge_node.py`):**

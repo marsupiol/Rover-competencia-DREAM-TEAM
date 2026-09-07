@@ -141,8 +141,8 @@ El procesamiento de tramas WebSocket entrantes comprende cuatro etapas:
    Prioriza el indicador de estado de fijación (`fix_quality`). Ante ausencia del campo, valida un umbral mínimo de 4 satélites visibles. Si la solución es inválida o el indicador de dispersión geométrica (HDOP) supera 20, descarta la lectura y activa modo de navegación a estima (*Dead-Reckoning*).  
    La matriz de covarianza asociada se modula dinámicamente en función de $\text{HDOP}^2$, atenuando la influencia del sensor cuando la constelación geométrica es desfavorable.
 
-2. **Publicación de Orientación:**  
-   Publica el rumbo directo para consumo de control y el yaw convertido a formato ENU para la fusión en el EKF.
+2. **Publicación de Orientación y Cadencia del Compás:**  
+   El compás electrónico del hardware transmite a través de WebSockets en reportes discretos de telemetría a una cadencia de ~0.5 Hz (un paquete cada ~2.0 segundos). Publica el rumbo directo para consumo de control y el yaw convertido a formato ENU para la fusión en el EKF. Esta baja frecuencia de actualización absoluta es la motivación fundamental para incorporar un puente inercial continuo con seguimiento de incertidumbre (`ekf_heading_bridge`), impidiendo que el controlador deba detenerse a esperar el compás tras cada maniobra de giro.
 
 3. **Monitoreo de Batería:**  
    Publicación directa del estado de carga energética.
@@ -213,6 +213,19 @@ La inicialización del origen geodésico (*datum*) se realiza cargando `datum_re
 
 ---
 
+### Estimación y Propagación Continua de Rumbo (`ekf_heading_bridge`)
+
+El nodo `ekf_heading_bridge` resuelve la brecha de frecuencia entre el compás físico (~0.5 Hz) y los requerimientos del lazo de control:
+
+1. **Conversión de Formatos:** Extrae la orientación fusionada de `odometry/global` (publicada por `ekf_filter_node_map`), calcula el yaw ENU y lo convierte a rumbo de brújula clásico ($0^\circ = \text{Norte}$, sentido horario).
+2. **Propagación Inercial con Giróscopo (Brief 22 / V.3):** Dada la cadencia lenta del compás (~0.5 Hz, cada ~2 s), esperar una nueva muestra magnética inmovilizaría al rover entre ráfagas de giro. El nodo se suscribe a `/imu/data` e integra continuamente la velocidad angular $\omega_z$ (descontando el sesgo calibrado `gyro_bias_z`):
+   $$\text{yaw}(t) = \text{yaw}_{\text{compass}} - \int_{t_0}^t (\omega_z - b_z) \, dt$$
+   *(El signo negativo se debe a que un giro CCW en REP-103 disminuye el rumbo horario de brújula).*
+3. **Verificación Experimental en Hardware (Brief 23 / W.1):** El signo de la propagación inercial fue verificado empíricamente en el rover real con el script [`scripts/diagnose_yaw_sign.py`](file:///home/marian/ros2_ws/scripts/diagnose_yaw_sign.py). Una ráfaga controlada de $3.0\text{ s}$ a `turn_throttle = 0.70` produjo un giro medido de $51.4^\circ$ con una discrepancia de apenas $0.7^\circ$ entre compás e integración inercial, fijando la velocidad angular efectiva del rover en $\omega_{\text{yaw}} \approx 17.0^\circ/\text{s}$.
+4. **Seguimiento Analítico de Incertidumbre:** Al recibir una muestra del compás, la incertidumbre se inicializa en `base_compass_uncertainty_deg = 3.0`$^\circ$. Durante la propagación giroscópica, la covarianza crece con tasa de difusión $q = 0.5^\circ/\sqrt{\text{s}}$:
+   $$\sigma_{\text{yaw}}(t) = \sqrt{\sigma_{\text{base}}^2 + q^2 \cdot \Delta t}$$
+   Se publica en `earth_rover/heading_uncertainty`. Si $\sigma_{\text{yaw}} < 10.0^\circ$ (`heading_trust_threshold_deg`), el controlador de navegación autoriza la ejecución inmediata de la siguiente ráfaga motriz sin esperar al compás físico.
+
 ## 3. `bev_planner_node`
 
 > **Paquete:** `er_planning` *(Integración de modelos de `er_perception`)*  
@@ -246,7 +259,13 @@ flowchart TD
    - *Modo Fallback:* Si la ruta global expira o es inválida, computa el rumbo directo por trigonometría esférica (fórmula de Haversine).
 4. **Optimización de Trayectoria GeNIE (`_plan_on_bev`):** 
    - El banco contiene **600 trayectorias polinomiales precomputadas una única vez al inicio en `__init__`**.
-   - Evalúa las 600 curvas contra la grilla de costos locales con huella dilada (`footprint_px = ceil(0.30 / 0.03) = 10\text{ px}`). En un escenario despejado, sobreviven al filtro de colisión típicamente $\approx 277$ curvas.
+   - Evalúa las 600 curvas contra la grilla de costos locales con huella dilada. El parámetro `footprint_px` se deriva analíticamente en código mediante `compute_footprint_px()` (`footprint_px: 0` en `planner_params.yaml` activa la derivación dinámica) y no es una constante estática:
+     1. **Diámetro circunscrito ($D_{\text{circ}}$):** Para un chasis skid-steer de dimensiones rectangulares $L = 0.250\text{ m}$ y $W = 0.190\text{ m}$, el giro sobre su propio eje (*in-place turn*) barre una envolvente circular de diámetro $D_{\text{circ}} = \sqrt{L^2 + W^2} = \sqrt{0.250^2 + 0.190^2} = 0.3140\text{ m}$. Modelar la huella con esta área circular barrida garantiza no colisión bajo cualquier orientación angular del chasis durante rotaciones o maniobras cerradas.
+     2. **Conversión a píxeles métricos BEV:** A la resolución nativa de la grilla BEV ($\text{resolution} = 0.03\text{ m/px}$), el diámetro equivale a $D_{\text{circ}} / \text{res} = 0.3140 / 0.03 = 10.4667\text{ px}$.
+     3. **Reescalado a la grilla interna del planificador GeNIE:** La grilla de GeNIE opera a resolución discreta $\text{grid\_size} = 240 \times 240$, mientras que la grilla métrica BEV es de $\text{bev\_h} \times \text{bev\_w} = 134 \times 134$ celdas ($\lceil 4.0\text{ m} / 0.03\text{ m/px} \rceil = 134$). El factor de escala es $240 / 134 \approx 1.791$, llevando la huella a $10.4667 \times (240 / 134) \approx 18.7463\text{ px}$.
+     4. **Margen de seguridad y redondeo final:** Aplicando el factor de seguridad configurable `footprint_safety_margin: 1.05` y la función techo ($\lceil \cdot \rceil$) estrictamente sobre el producto final (para evitar la sobreinflación geométrica por redondeos intermedios):
+        $$\text{footprint\_px} = \lceil 18.7463 \times 1.05 \rceil = \lceil 19.6836 \rceil = 20\text{ px}$$
+     En un escenario despejado, tras la convolución y filtrado de colisión con esta huella de $20\text{ px}$, sobreviven al filtro típicamente $\approx 277$ curvas de las 600 iniciales.
    - Aplica agrupamiento direccional K-Means (`max_clusters = 4`) y fusión de los mejores candidatos (`best_k = 12`).
    - *Hallazgo de escalamiento:* La latencia de GeNIE escala con la cantidad de caminos sobrevivientes; por lo tanto, el planner evalúa más rápido en entornos con obstáculos que en áreas completamente despejadas.
 5. **Gobernador Dinámico de Velocidad P95:** Registra la latencia total del ciclo en una ventana móvil de 30 muestras, calcula el percentil 95 ($t_{\text{plan,P95}}$) y resuelve la velocidad máxima segura $v_{\text{safe}}$ garantizando parada dentro del horizonte visible configurado ($d_{\text{horizon}} = \text{forward\_range\_m} = 4.00\text{ m}$) con margen de seguridad $1.5$. Si $v_{\text{safe}} < 0.15\text{ m/s}$, aplica corte a $0.0$ (*Stop & Wait*). Publica el límite en `earth_rover/safe_velocity_limit`.
@@ -369,26 +388,43 @@ Es la capa más baja de la jerarquía de decisión: no decide "hacia dónde ir" 
 
 ---
 
-### Los valores reales que rigen hoy (del YAML, sin clamps)
+#### Los valores reales que rigen hoy (del YAML, sin clamps)
 
 Con el hallazgo confirmado —el código ya no clampea nada—, estos son los números que gobiernan el rover en producción (fracciones de acelerador normalizado $[-1.0, 1.0]$ compatibles con la API `POST /control` del SDK):
-- `goal_tolerance_m`: `13.0`
-- `align_threshold_deg`: `18.0` (umbral fino, cerca de la meta)
-- `coarse_align_threshold_deg`: `25.0` (umbral grueso, lejos)
-- `approach_align_distance_m`: `8.0` (el punto donde pasa de uno a otro)
+- `goal_tolerance_m`: `13.0` (radio de llegada al checkpoint)
+- `goal_dwell_s`: `1.0` (permanencia mínima en meta)
+- `approach_align_distance_m`: `8.0` (distancia donde conmuta a umbral fino de alineación)
+- `align_threshold_deg`: `18.0` (umbral fino de error angular para conmutar a `DRIVE` en aproximación)
+- `coarse_align_threshold_deg`: `25.0` (umbral grueso de error angular para conmutar a `DRIVE` a distancia)
+- `drive_abort_threshold_deg`: `65.0` (umbral de desvío geodésico para abortar `DRIVE` y volver a `ALIGN`)
+- `drive_abort_dwell_s`: `1.5` (persistencia mínima del desvío geodésico para confirmar aborto a `ALIGN`)
+- `max_bev_deviation_deg`: `45.0` (desviación angular máxima que BEV puede comandar respecto al rumbo geodésico)
 - `forward_throttle`: `0.40` (40% de acelerador lineal en `DRIVE`)
 - `turn_throttle`: `0.70` (70% de acelerador angular de giro en `ALIGN`)
-- `control_loop_hz`: `3.0`
-- `turn_burst_s`: `0.25`
-- `pause_after_turn_s`: `0.80`
-- `max_heading_jump_deg`: `150.0`
-- `heading_filter_alpha`: `0.35`
-- `gps_max_stale_s`: `2.0`
-- `heading_max_stale_s`: `2.0`
-- `path_max_stale_s`: `8.0`
-- `require_velocity_governor`: `true`
-- `geodesic_fallback_throttle`: `0.20` (20% de acelerador lineal en navegación geodésica pura)
+- `drive_correction_gain`: `0.01` (ganancia proporcional para corrección angular en avance `DRIVE`)
+- `max_drive_angular`: `0.45` (límite angular en `DRIVE` = $\text{gain} \times \text{max\_bev\_deviation\_deg} = 0.01 \times 45.0$)
+- `max_total_drive_angular`: `0.8` (límite de seguridad absoluto para acelerador angular en `DRIVE`)
+- `invert_angular`: `true` (inversión cinemática para coincidir con el robot físico)
+- `control_loop_hz`: `3.0` (frecuencia del lazo de control)
+- `turn_burst_s`: `0.25` (duración nominal de referencia para pulso de giro)
+- `turn_burst_min_s`: `0.15` (duración mínima de ráfaga proporcional)
+- `turn_burst_max_s`: `1.20` (duración máxima de ráfaga proporcional)
+- `yaw_rate_deg_s`: `17.0` (velocidad angular efectiva medida en hardware a `turn_throttle = 0.70`)
+- `turn_burst_damping`: `0.6` (factor de amortiguamiento de ráfaga proporcional)
+- `pause_after_turn_s`: `0.5` (pausa mínima tras pulso de giro para estabilización física)
+- `heading_trust_threshold_deg`: `10.0` (umbral de incertidumbre que autoriza ráfaga sin esperar compás)
+- `max_heading_jump_deg`: `150.0` (filtro de rechazo de saltos espurios de compás)
+- `heading_filter_alpha`: `0.35` (suavizado exponencial de rumbo)
+- `gps_max_stale_s`: `2.0` (antigüedad máxima de GPS antes de parada de seguridad)
+- `heading_max_stale_s`: `3.5` (antigüedad máxima de rumbo antes de parada de seguridad)
+- `heading_fresh_wait_timeout_s`: `2.5` (timeout de espera en pausa por un heading fresco)
+- `path_following_enabled`: `true` (habilita seguimiento de trayectoria BEV)
+- `path_max_stale_s`: `8.0` (antigüedad máxima de trayectoria planificada antes de fallback)
+- `lookahead_distance_m`: `1.0` (distancia de prospección sobre la trayectoria BEV)
 - `recovery_turn_throttle`: `0.30` (30% de acelerador angular en modo `RECOVERY`)
+- `recovery_max_duration_s`: `20.0` (duración máxima de rescate en `RECOVERY` antes de forzar reintento a `ALIGN`)
+- `require_velocity_governor`: `true` (exige límite dinámico de velocidad del planner BEV)
+- `geodesic_fallback_throttle`: `0.20` (20% de acelerador lineal en navegación geodésica pura)
 - `max_linear_speed_mps`: `1.111` (velocidad física de referencia a acelerador pleno $1.0$, $4.0\text{ km/h}$)
 
 ---
@@ -401,31 +437,59 @@ Cada ciclo (3 Hz) evalúa en este orden estricto, saliendo apenas una condición
 2. **Esperando confirmación del SDK (`_awaiting_next_target`):** Ya llegó a la meta; republica periódicamente `REACHED` sin avanzar mientras espera que el manager confirme el checkpoint.
 3. **Datos insuficientes:** Sin meta activa (`target_lat is None`) o sin GPS (`current_lat is None`), no emite movimiento.
 4. **GPS viejo (`_gps_is_fresh()` con `gps_max_stale_s = 2.0`):** Frena y espera sin navegar a ciegas.
-5. **Heading viejo (`_heading_is_fresh()` con `heading_max_stale_s = 2.0`):** Si los datos de brújula se congelan por más de 2 segundos (o son rechazados sucesivamente por la guarda de salto de $150^\circ$), frena de inmediato por seguridad. Un rumbo desactualizado es mucho más peligroso que la ausencia de dato, pues comandaría rotaciones y avances hacia direcciones arbitrarias.
+5. **Heading viejo (`_heading_is_fresh()` con `heading_max_stale_s = 3.5`):** Si los datos de rumbo se congelan por más de 3.5 segundos (o son rechazados sucesivamente por la guarda de salto de $150^\circ$), frena de inmediato por seguridad. Un rumbo desactualizado es mucho más peligroso que la ausencia de dato, pues comandaría rotaciones y avances hacia direcciones arbitrarias.
+6. **Fase de Alineación y Guard de Heading Fresco (FIX 2a):** Durante la fase de pausa en `ALIGN`, el controlador no comanda una nueva ráfaga motriz a menos que:
+   - Se haya recibido una muestra posterior del compás (`_compass_seq > _last_turn_heading_seq`), **O**
+   - La incertidumbre de la estimación inercial propagada sea baja (`heading_uncertainty_deg < 10.0^\circ`, `heading_trust_threshold_deg`), **O**
+   - Haya transcurrido el tiempo límite de espera (`elapsed >= heading_fresh_wait_timeout_s = 2.5\text{ s}`).
 
 ---
 
 ### La selección de fuente de rumbo y velocidad (Arquitectura Fail-Safe)
 
-El diseño anterior operaba en modo *Fail-Open* (si el planificador fallaba, el rover avanzaba a máxima velocidad hacia el GPS). El diseño actual es **estrictamente Fail-Safe**:
+> **Regla de Marcos y Desacople ALIGN vs DRIVE (Brief 24 / X.2 & X.3.2):**  
+> `heading_error` en modo `ALIGN` es **siempre un ángulo absoluto** (geodésico Haversine o hacia submeta global en frame map); `heading_error` en modo `DRIVE` puede ser **relativo al frame base_link** vía `bev_path`. **Nunca mezclar ambos marcos sin conversión explícita.**  
+> El controlador nunca consulta `_compute_path_heading_error_deg()` ni evalúa validez de `bev_path` durante `ALIGN`. La conmutación entre `ALIGN` y `DRIVE` se rige pura y exclusivamente por el error geodésico absoluto (`geodesic_heading_error`), eliminando cualquier lazo infinito inducido por curvaturas relativas de cámara.
 
-1. **Seguimiento de Trayectoria BEV:** Si hay un camino válido y fresco (`path_max_stale_s = 8.0`), sigue los waypoints con lookahead dinámico (`lookahead_distance_m = 1.0`).
-2. **Recovery Mode Activo:** Si el camino está fresco pero no es válido (`planner_valid = False`), entra en `RECOVERY` rotando en el lugar (`recovery_turn_throttle = 0.30`, 30% de acelerador angular) para despejar el campo visual sin avanzar hacia el obstáculo.
-3. **Gobernador de Velocidad Dinámico y Conversión a Acelerador (Brief 18 / R.1):**
+#### Razonamiento de las Decisiones de Control y Estado:
+
+- **Por qué ALIGN nunca usa `bev_path`:**  
+  La curvatura del BEV está expresada en el marco móvil `base_link`. Usarla como referencia de error de orientación absoluta generaba un lazo cerrado patológico donde el rover rotaba $360^\circ$ indefinidamente: en cada cuadro capturado, el algoritmo de percepción sugería la misma curva geométrica relativa, impidiendo que el error angular convergiera a cero.
+- **Por qué la histéresis DRIVE $\to$ ALIGN usa $65.0^\circ$ con dwell y no el umbral de entrada ($18^\circ$ / $25^\circ$):**  
+  Durante el avance en `DRIVE`, una maniobra reactiva legítima de evasión puede desviar el rumbo del rover respecto a la meta geodésica hasta `max_bev_deviation_deg = 45.0`$^\circ$. Si el umbral de aborto fuera simétrico ($25^\circ$), cualquier esquiva de obstáculos provocaría la cancelación instantánea de `DRIVE` y el regreso forzado a `ALIGN`, donde el rover volvería a apuntar de frente hacia el obstáculo recién evadido (*flapping* continuo). Se fijó `drive_abort_threshold_deg = 65.0`$^\circ$ (con margen de $20^\circ$ sobre la máxima desviación BEV) y una persistencia temporal mínima de `drive_abort_dwell_s = 1.5`$s$.
+- **Por qué `max_bev_deviation_deg = 45.0`$^\circ$ y `max_drive_angular = 0.45`:**  
+  La corrección angular en `DRIVE` se modela proporcionalmente como $\omega = K_p \cdot e_{\text{heading}}$ con $K_p = \text{drive\_correction\_gain} = 0.01$. Al multiplicar la ganancia por la desviación máxima admisible ($0.01 \times 45.0^\circ = 0.45$), el límite `max_drive_angular = 0.45` calza exactamente con el rango dinámico operativo completo, eliminando la saturación artificial previa (con $0.15$, el sistema saturaba a partir de $15^\circ$, perdiendo autoridad en dos tercios de la maniobra).
+- **Por qué el modo `RECOVERY` es *Sticky* y Bidireccional:**  
+  Cuando el planificador local no encuentra un camino libre (`planner_valid == False`), el rover entra en `RECOVERY`. Este estado es *sticky*: ignora el error geodésico y no conmuta a `ALIGN` hasta encontrar una ruta válida o alcanzar un tiempo límite (`recovery_max_duration_s = 20.0`$s$). La razón fundamental es que el objetivo geodésico puede encontrarse obstruido en línea recta por un obstáculo macizo; sin prioridad sobre `ALIGN`, el rover quedaría atrapado intentando alinearse obsesivamente hacia el bloqueo. Asimismo, el sentido de rotación en `RECOVERY` es bidireccional (`_recovery_turn_sign = 1` si `geodesic_heading_error >= 0.0` sino `-1`), barriendo el campo visual hacia el hemisferio más cercano a la meta geodésica.
+- **Por qué la falla o expiración del gobernador en `DRIVE` cancela también el giro angular:**  
+  Si el gobernador de velocidad expira ($>3.0\text{ s}$) o la percepción se degrada deteniendo el avance lineal ($T_{\text{eff}} \le 0.0$), el controlador fija estrictamente `twist.angular.z = 0.0`. Esto previene que el rover, al perder la visibilidad frontal de obstáculos, empiece a pivotar descontroladamente sobre su eje en modo ciego.
+- **Por qué `heading_max_stale_s = 3.5\text{ s}` está desacoplado de `heading_fresh_wait_timeout_s = 2.5\text{ s}`:**  
+  La brújula electrónica opera a baja cadencia nominal ($\approx 0.5\text{ Hz}$, periodo de muestreo $\approx 2.0\text{ s}$). Existen dos niveles funcionales de temporización con propósitos estrictamente diferentes:
+  1. *Espera de muestra durante ráfagas de alineación (`heading_fresh_wait_timeout_s = 2.5\text{ s}`):* Es el tiempo máximo que el estado `ALIGN` aguarda en reposo la llegada de una nueva muestra del compás para verificar el giro antes de autorizar la siguiente ráfaga motriz (en caso de que la propagación por giróscopo tenga incertidumbre elevada). Representa la cadencia normal de muestreo con margen de $0.5\text{ s}$ sobre el periodo típico de $2.0\text{ s}$.
+  2. *Watchdog global por caída total de flujo (`heading_max_stale_s = 3.5\text{ s}`):* Es la guarda de seguridad superior del lazo de control (`_control_loop`). Si no se recibe ningún dato de orientación durante más de $3.5\text{ s}$ (o si sucesivas lecturas son rechazadas por la compuerta de salto de $>150^\circ$), frena de emergencia al rover ($v=0, \omega=0$). Fijar este umbral en $3.5\text{ s}$ (con $1.5\text{ s}$ de holgura sobre el periodo nominal del compás y $1.0\text{ s}$ sobre el timeout de espera) previene disparos espurios del fail-safe ante jitter de red 4G, pero garantiza la inmovilización segura ante una congelación o pérdida total del flujo de rumbo.
+
+#### Mecánica de Ejecución Fail-Safe en `DRIVE` y `RECOVERY`:
+
+1. **Seguimiento de Trayectoria BEV Acotada (solo en DRIVE):**  
+   Si hay un camino válido y fresco (`path_max_stale_s = 8.0`), extrae el ángulo relativo en `base_link` y proyecta el rumbo deseado en el mundo. La desviación respecto al rumbo geodésico directo se acota rígidamente a $[-45.0^\circ, +45.0^\circ]$ (`max_bev_deviation_deg`), gobernando la dirección con `heading_source = "bev_clamped"`. Si no hay camino disponible, aplica fallback geodésico directo (`heading_source = "geodesic"`).
+2. **Recovery Mode Activo (solo en DRIVE):**  
+   Si el camino está fresco pero no es válido (`planner_valid = False`), entra en `RECOVERY` rotando en el lugar con acelerador angular `recovery_turn_throttle = 0.30` hacia el signo del objetivo geodésico, despejando el campo visual sin avanzar.
+3. **Gobernador de Velocidad Dinámico y Conversión a Acelerador (Brief 18 / R.1):**  
    - El límite cinemático $v_{\text{safe}}$ (m/s) se convierte a fracción de acelerador normalizado mediante $T_{\text{safe}} = \min(1.0, \max(0.0, v_{\text{safe}} / v_{\text{max}}))$ con $v_{\text{max}} = 1.111\text{ m/s}$.
-   - **Caso 1 (Nunca recibido):** Si `require_velocity_governor: true`, $T_{\text{eff}} = 0.0$ (detención por arranque o caída temprana del planner). Si `require_velocity_governor: false` (modo geodésico puro deliberado), $T_{\text{eff}} = \min(T_{\text{fallback}}, T_{\text{fwd}}) = 0.20$.
-   - **Caso 2 (Vigente $\le 3.0\text{ s}$):** $T_{\text{eff}} = \min(T_{\text{fwd}}, T_{\text{safe}})$.
-   - **Caso 3 (Expirado $> 3.0\text{ s}$):** Si `path_following_enabled: true`, detención total $T_{\text{eff}} = 0.0$. En navegación geodésica pura, limita a $T_{\text{eff}} = 0.20$.
-4. **Telemetría de Ciclo de Trabajo (Brief 18 / R.3.1):** Publica en `earth_rover/control_debug` los porcentajes acumulados de tiempo en `DRIVE`, `TURN` (ráfagas de giro), `PAUSE` (esperas post-giro) y `RECOVERY`.
+   - **Caso 1 (Nunca recibido):** Si `require_velocity_governor: true`, $T_{\text{eff}} = 0.0$ y $\omega = 0.0$ (detención total por seguridad). Si `require_velocity_governor: false` (modo geodésico puro), $T_{\text{eff}} = \min(T_{\text{fallback}}, T_{\text{fwd}}) = 0.20$.
+   - **Caso 2 (Vigente $\le 3.0\text{ s}$):** $T_{\text{eff}} = \min(T_{\text{fwd}}, T_{\text{safe}})$. Si $T_{\text{eff}} \le 0.0$, $\omega = 0.0$.
+   - **Caso 3 (Expirado $> 3.0\text{ s}$):** Si `path_following_enabled: true`, detención total $T_{\text{eff}} = 0.0$ y $\omega = 0.0$. En navegación geodésica pura, limita a $T_{\text{eff}} = 0.20$.
+4. **Telemetría de Ciclo de Trabajo (Brief 18 / R.3.1):** Publica en `earth_rover/control_debug` los porcentajes acumulados de tiempo en `DRIVE`, `TURN` (giro en ALIGN), `PAUSE` (esperas post-giro) y `RECOVERY`.
 
 ---
 
-### Burst & Wait Adaptativo y Detector de Rechazo del SDK
+### Ráfaga de Giro Proporcional (Burst & Wait) y Detector de Rechazo
 
-* **Ráfaga Dinámica según Error de Rumbo:**
-  - $\text{error} > 30^\circ \implies$ ráfaga de $0.65\text{ s}$ (giro agresivo).
-  - $\text{error} > 15^\circ \implies$ ráfaga de $0.40\text{ s}$ (giro medio).
-  - $\text{error} \le 15^\circ \implies$ ráfaga de $0.22\text{ s}$ (micro-ajuste fino).
+* **Ráfaga Proporcional al Error Angular (FIX 2b):**  
+  Las versiones previas utilizaban tramos fijos escalonados ($0.22\text{ s}$, $0.40\text{ s}$, $0.65\text{ s}$) que asumían una velocidad de giro muy superior a la real; en el hardware físico (`turn_throttle = 0.70`), la velocidad angular empírica es de apenas $\approx 17.0^\circ/\text{s}$, por lo que corregir $60^\circ$ requería entre 15 y 25 segundos inmóvil en ráfagas truncadas.  
+  El controlador actual calcula dinámicamente la duración del pulso de giro en función directa del error geodésico absoluto:
+  $$t_{\text{burst}} = \text{clamp}\left( \frac{|e_{\text{heading}}|}{\omega_{\text{yaw}}} \cdot \delta, \quad t_{\text{min}}, \quad t_{\text{max}} \right)$$
+  con $\omega_{\text{yaw}} = \text{yaw\_rate\_deg\_s} = 17.0^\circ/\text{s}$, amortiguamiento $\delta = \text{turn\_burst\_damping} = 0.6$, acotado en $[t_{\text{min}}, t_{\text{max}}] = [0.15\text{ s}, 1.20\text{ s}]$.
 * **Detector de Rechazo:** Si el manager despausa mientras `_awaiting_next_target` sigue activo (indicando que el backend del SDK rechazó el checkpoint por distancia insuficiente), el controlador reduce automáticamente su tolerancia a la mitad (`goal_tolerance *= 0.5`, piso en $0.5\text{ m}$), convergiendo hacia el centro del checkpoint.
 
 ---
@@ -535,13 +599,42 @@ $$v_{\text{safe}} = a_{\text{brake}} \cdot \left( \sqrt{b^2 + \frac{2 \cdot d_{\
 
 ## 10. Limitaciones Conocidas y Trabajo Pendiente
 
-1. **Calibración Óptica Pendiente:** Los parámetros intrínsecos de cámara ($f_x, f_y, c_x, c_y$) y extrínsecos ($h=0.18\text{ m}, \text{pitch}=-8^\circ$) son nominales. La proyección BEV tiene error no cuantificado hasta que se ejecute la calibración física con tablero ChArUco en el rover real.
-2. **Dependencia de Sensor de Guiñada Único:** `/wheel_odom` utiliza el mismo rumbo de brújula que alimenta `/imu/data`; por ende, no existe una fuente de orientación independiente para desacoplar perturbaciones magnéticas en el EKF.
-3. **Compensación Dinámica de Inclinación:** La rotación homográfica por roll/pitch no está activada en producción para evitar introducir ruido óptico adicional hasta calibrar la cámara.
-4. **Telemetría de RPMs sin Explotar:** El SDK reporta `rpms` de tracción pero actualmente no se integran para estimación de patinamiento lateral.
-5. **Configuración de Grilla BEV Confirmada (Cerrado en Brief 17):** Se confirma la configuración $4.00\text{ m} \times 4.00\text{ m}$ a $0.03\text{ m/px}$ ($134 \times 134$ celdas) tras mediciones en RTX 5060 (~240 ms de ciclo, horizonte seguro con factor $2.3\times$ a máxima velocidad física). Las alternativas A y E quedan archivadas como referencia histórica.
-6. **Frente de GeNIE Cerrado (Cerrado en Brief 17):** Con `plan_genie` en ~60–105 ms (ciclo global ~187–240 ms, 4.2–5.3 Hz en RTX 5060), la optimización no se justifica para la maratón. Se documenta el hallazgo del escalado invertido (más caminos vivos en terreno despejado $\to$ mayor tiempo de filtrado/evaluación) como característica intrínseca del algoritmo.
-7. **Gobernador en Acelerador Normalizado (Brief 18 / R.1):** Con la configuración actual (`forward_throttle = 0.40` y $d_{\text{horizon}} = 4.00\text{ m}$), el gobernador opera como salvaguarda de seguridad ($T_{\text{safe}} = 1.0 \implies T_{\text{eff}} = 0.40$) y reduce el acelerador únicamente ante degradaciones de latencia $> 6.4\text{ s}$.
-8. **Supuesto de Desaceleración $a_{\text{brake}} = 1.5\text{ m/s}^2$ No Verificado (Brief 18 / R.2):** El valor $1.5\text{ m/s}^2$ es un supuesto teórico del que dependen la ecuación de frenado y el horizonte de seguridad. Requiere protocolo de medición empírico en hormigón seco y baja adherencia (mojado/gravilla) antes de autorizar incrementos agresivos de velocidad de avance.
-9. **Línea Base de Proyección BEV (`bev_proj`) (Brief 17 / Q.6 & Brief 18 / R.4):** Se registra la línea base de $44.48\text{ ms}$ (P95: $54.79\text{ ms}$) en RTX 5060 como referencia para la futura implementación de la tabla de rayos precomputada (LUT fisheye) una vez calibrada la cámara.
+### 10.1. Estado de las Limitaciones Técnicas del Sistema
+
+1. **Calibración Óptica Nominal (Intrínsecos y Extrínsecos):**  
+   Los parámetros intrínsecos de la cámara ($f_x, f_y, c_x, c_y$) y extrínsecos ($X = +0.110\text{ m}, h = 0.140\text{ m}, \text{pitch} = -8.0^\circ$, guardados en `mini_T_base_camera.npy`) son estimaciones nominales a ojo procedentes del docstring del repositorio base (`rover_traversability/calibration.py`: *"T_base_camera: 4x4 pose of the camera in the rover base frame — the camera sits ~14 cm above ground, ~11 cm forward of base origin, pitched ~8 degrees down"*). La reproyección a plano de tierra BEV introduce deformaciones espaciales no cuantificadas en los bordes de la imagen ($126^\circ$ FOV) y errores de escala métrica hasta que se realice una calibración física con patrón ChArUco en el rover.
+2. **Dependencia de Sensor de Guiñada Único:**  
+   El estándar REP-105 asume independencia entre sensores de odometría y orientación absoluta. En este vehículo, `/wheel_odom` se proyecta trigonométricamente usando el mismo rumbo magnético que alimenta `/imu/data` ($V_{\text{yaw}}$ de `odom0` está inactivo); por ende, ante distorsiones magnéticas ambientales, ambas fuentes se desvían de forma idéntica e impiden que el filtro EKF detecte la anomalía.
+3. **Supuesto Teórico de Desaceleración ($a_{\text{brake}} = 1.5\text{ m/s}^2$):**  
+   La ecuación cuadrática del gobernador dinámico de velocidad y el cálculo del horizonte de frenado seguro asumen $a_{\text{brake}} = 1.5\text{ m/s}^2$. Este valor es un supuesto analítico no verificado experimentalmente sobre las superficies reales de rodado (hormigón liso, asfalto rugoso, tierra o humedad).
+4. **Curva de Mapeo Acelerador $\leftrightarrow$ Velocidad Lineal Sin Caracterizar:**  
+   La cinemática de control asume una respuesta lineal ideal $v = T \cdot v_{\text{max}}$ con $v_{\text{max}} = 1.111\text{ m/s}$. En la práctica, la respuesta de los motores DC con tracción skid-steer presenta zona muerta por fricción estática, saturación por carga y dependencia de la tensión de la batería.
+5. **Sesgos Inerciales de IMU Sin Calibrar en Disco:**  
+   El hardware del Mini+ no dispone en producción de los archivos `config/gyro_bias.json` ni `config/accel_bias.json`. El puente sensorial inicializa automáticamente con sesgo nulo ($0.0$), dependiendo de la compuerta estadística de roll/pitch para evitar divergencias acumuladas.
+6. **Telemetría de RPMs Sin Explotar:**  
+   El reporte de telemetría WebSocket contiene el vector `rpms` de las 4 ruedas, pero actualmente se descarta. No se ha implementado la integración de estas velocidades para estimación de velocidad lineal diferencial ni para detección de atascamiento o deslizamiento.
+7. **Canal de Confianza No Cableado en el Pipeline:**  
+   La formulación de costo que pondera la transitabilidad de SAM-TP junto a la confianza predictiva del modelo fue verificada analíticamente en pruebas unitarias aisladas, pero no se encuentra cableada en el flujo en vivo de `bev_planner_node`.
+8. **Tabla de Rayos Fisheye (LUT) No Implementada:**  
+   La proyección homográfica actual (`bev_proj`, ~44.5 ms en GPU RTX 5060) asume un modelo pinhole simple con distorsión no lineal sin compensar. La implementación de una Lookup Table (LUT) precomputada por ray-casting requiere conocer la distorsión radial real del lente gran angular.
+9. **Límite Angular `max_drive_angular = 0.45` Sin Validación de Derrape:**  
+   El límite actual se derivó analíticamente para evitar la saturación previa a $15^\circ$ ($0.01 \times 45.0^\circ = 0.45$). Sin embargo, comandar giros de hasta 45% de acelerador angular con avance simultáneo (`forward_throttle = 0.40`) puede inducir derrape lateral severo en skid-steer sobre superficies de alta fricción.
+10. **Baja Exposición Operativa del Modo DRIVE en Campo:**  
+    En las pruebas de campo históricas, debido al flapping de alineación y la lentitud de los giros previos, el modo de avance continuo `DRIVE` se ejecutó durante menos del 2% del tiempo total de misión. Toda la sintonización fina de seguimiento de senda reactiva se basa en simulación y banco de pruebas.
+
+---
+
+### 10.2. Matriz Consolidada de Mediciones y Calibraciones Pendientes en Hardware
+
+La siguiente tabla resume todas las pruebas empíricas que deben ejecutarse directamente sobre el robot físico para cerrar las limitaciones anteriores:
+
+| Medición / Calibración | Qué se mide | Cómo se mide | Qué desbloquea |
+| :--- | :--- | :--- | :--- |
+| **1. Calibración Óptica ChArUco** | Parámetros intrínsecos ($K$, coeficientes de distorsión radial/tangencial) y extrínsecos ($X = +0.110\text{ m}$, $h = 0.140\text{ m}$, $\text{pitch} = -8.0^\circ$, marco `base_link` $\to$ `front_camera`). | Captura de 30-50 cuadros de un tablero ChArUco rígido a distancias entre $0.5\text{ m}$ y $3.0\text{ m}$ con el rover estático; optimización OpenCV / ROS camera_calibration. | Generación de matriz LUT de proyección de rayos ópticos precisa (elimina errores métricos de proyección que escalan como $\Delta d \approx (d^2/h)\delta$, alcanzando $\approx 39\text{ cm}$ a $4\text{ m}$ para $h=0.140\text{ m}$, un 29% superior a lo previsto con $h=0.18\text{ m}$) y habilita la compensación homográfica dinámica por roll/pitch. |
+| **2. Desaceleración $a_{\text{brake}}$** | Tasa real de desaceleración máxima ante corte abrupto de acelerador ($T=0.0$) o contra-marcha ($T=-0.20$). | Acelerar a velocidad de régimen en tramo recto ($5\text{ m}$) en dos superficies: (a) hormigón seco y (b) superficie de baja adherencia (mojado/tierra). Frenar y medir distancia y tiempo con IMU y odometría visual. | Validación empírica del parámetro $a_{\text{brake}}$ en la ecuación cuadrática del gobernador, permitiendo elevar `forward_throttle` de $0.40$ a $0.60-0.70$ con garantía física de frenado. |
+| **3. Mapeo Acelerador $\leftrightarrow$ Velocidad** | Velocidad lineal real en régimen permanente $v_{\text{ss}}$ (m/s) para escalones de acelerador $T \in [0.10, 1.00]$ en pasos de $0.05$. | Corridas en línea recta de $10\text{ m}$ registrando posición geodésica RTK / odometría visual externa vs tiempo, con batería al 100%, 75% y 50%. | Construcción de una curva de calibración estática (LUT o función spline) que sustituya la equivalencia lineal $v = 1.111 \cdot T$, permitiendo control cinemático real en m/s. |
+| **4. Sesgos Estáticos de IMU** | Sesgo constante de giróscopo ($b_{gx}, b_{gy}, b_{gz}$) y acelerómetro ($b_{ax}, b_{ay}, b_{az}$) del chip MPU-6050. | Reposo absoluto del rover en superficie horizontal nivelada durante 120 segundos. Promediar lecturas con script de captura automática y volcar a `config/gyro_bias.json` y `config/accel_bias.json`. | Eliminación del drift de inclinación en el filtro complementario y reducción de la tasa de dispersión de incertidumbre giroscópica $q$ en `ekf_heading_bridge`. |
+| **5. Calibración Magnetométrica** | Elipsoide de distorsión por hierro dulce (*soft-iron*) y desplazamiento de centro por hierro duro (*hard-iron*) producido por los motores y chasis. | Giro completo de $360^\circ$ sobre plano horizontal registrando las componentes magnéticas del sensor; ajuste de elipsoide por mínimos cuadrados para obtener matriz de corrección $3 \times 3$ y vector de offset. | Supresión de rumbos espurios y anomalías locales de orientación en el compás, evitando errores de rumbo geodésico de hasta $15^\circ-30^\circ$. |
+| **6. Caracterización de RPMs y Slip** | Mapeo de índices de rueda ($0, 1, 2, 3$) a posición física (delantera-izq, delantera-der, trasera-izq, trasera-der), convención de signo de giro y factor de deslizamiento cinemático. | Elevar el rover en banco de prueba ("en el aire") y comandar giros de rueda independientes; luego bajar a piso y medir velocidad angular de rueda vs avance lineal real. | Integración del tópico `/wheel_odom` con encoders reales independientes en lugar de proyección con compás, permitiendo habilitar $V_{\text{yaw}}$ en el EKF. |
+| **7. Derrape en Avance Skid-Steer con `max_drive_angular = 0.45`** | Error de seguimiento angular, radio efectivo de curvatura y pérdida de tracción longitudinal al aplicar $\omega = 0.45$ simultáneamente con $T_{\text{fwd}} = 0.40$. | Comandar trayectoria circular continua y registrar la pose real vs la comandada; evaluar si el chasis sufre salto cinemático o arrastre de neumáticos. | Validar si el límite $0.45$ es seguro en giros dinámicos o si requiere una función de acoplamiento no lineal que reduzca la velocidad lineal en función de la curvatura ($T_{\text{fwd}}(\omega)$). |
 
