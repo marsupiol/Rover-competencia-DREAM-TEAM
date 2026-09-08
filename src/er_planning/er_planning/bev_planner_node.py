@@ -29,7 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import Image, NavSatFix
-from std_msgs.msg import Bool, Float32, String
+from std_msgs.msg import Bool, Float32, Int32, String
 import tf2_ros
 
 
@@ -96,6 +96,7 @@ class BEVPlannerNode(Node):
         self.declare_parameter("visualization_topic", "earth_rover/planner_visualization")
         self.declare_parameter("valid_topic", "earth_rover/planner_valid")
         self.declare_parameter("local_bev_grid_topic", "earth_rover/local_bev_grid")
+        self.declare_parameter("alive_paths_topic", "earth_rover/alive_paths")
         self.declare_parameter("publish_visualization", True)
 
         # Integración con Planificador Global (Fase 4)
@@ -165,6 +166,7 @@ class BEVPlannerNode(Node):
         visualization_topic = str(self.get_parameter("visualization_topic").value)
         valid_topic = str(self.get_parameter("valid_topic").value)
         local_bev_grid_topic = str(self.get_parameter("local_bev_grid_topic").value)
+        alive_paths_topic = str(self.get_parameter("alive_paths_topic").value)
         self.publish_visualization = bool(self.get_parameter("publish_visualization").value)
 
         safe_velocity_limit_topic = str(self.get_parameter("safe_velocity_limit_topic").value)
@@ -373,6 +375,7 @@ class BEVPlannerNode(Node):
         self.path_pub = self.create_publisher(Path, planned_path_topic, reliable_qos)
         self.valid_pub = self.create_publisher(Bool, valid_topic, sensor_qos)
         self.local_grid_pub = self.create_publisher(OccupancyGrid, local_bev_grid_topic, sensor_qos)
+        self.alive_paths_pub = self.create_publisher(Int32, alive_paths_topic, sensor_qos)
         self.safe_vel_pub = self.create_publisher(Float32, safe_velocity_limit_topic, sensor_qos)
         self.planner_diag_pub = self.create_publisher(String, planner_diagnostics_topic, sensor_qos)
         self.vis_pub = (
@@ -831,6 +834,9 @@ class BEVPlannerNode(Node):
         self.safe_vel_pub.publish(v_limit_msg)
 
         alive_paths = int(planned.metadata.get("filtered_paths", len(planned.filtered_paths) if planned.filtered_paths is not None else 0))
+        alive_msg = Int32()
+        alive_msg.data = alive_paths
+        self.alive_paths_pub.publish(alive_msg)
         diag_data = {
             "t_plan_p95_ms": round(t_plan_p95_s * 1000.0, 1),
             "infer_nn_ms": round(infer_ms, 1),

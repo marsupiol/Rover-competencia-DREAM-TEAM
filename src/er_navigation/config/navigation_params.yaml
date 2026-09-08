@@ -11,15 +11,26 @@ gps_waypoint_controller:
     drive_abort_threshold_deg: 65.0   # Umbral de desvío geodésico para abortar DRIVE y volver a ALIGN (grados)
     drive_abort_dwell_s: 1.5          # Persistencia mínima del desvío para confirmar aborto de DRIVE (segundos)
     max_bev_deviation_deg: 45.0       # Desviación angular máxima que BEV puede comandar respecto al rumbo geodésico (grados)
+    drive_pivot_threshold_deg: 30.0   # Por encima de este error respecto al rumbo
+                                      # deseado, el rover frena y pivota a turn_throttle
+                                      # en vez de girar lento mientras avanza.
 
     # --- Dinámica de Movimiento y Giro (Acelerador Normalizado [-1.0, 1.0]) ---
-    forward_throttle: 0.40             # Fracción normalizada de acelerador lineal en modo DRIVE (0.0 a 1.0)
+    forward_throttle: 0.20             # Fracción normalizada de acelerador lineal en modo DRIVE (0.0 a 1.0)
+                                       # NOTA DE SEGURIDAD (Brief 25 / Rollover Incident):
+                                       # Reducido preventivamente de 0.40 a 0.20 tras vuelco en campo por giro
+                                       # brusco contra obstáculo. Subir de vuelta a 0.40 únicamente tras
+                                       # validar en campo el acoplamiento lineal/angular y la reducción por congestión.
     turn_throttle: 0.70                # Fracción normalizada de acelerador angular de giro en modo ALIGN (0.0 a 1.0)
     drive_correction_gain: 0.01        # Ganancia proporcional para corrección angular durante el avance (modo DRIVE)
     max_drive_angular: 0.45   # = drive_correction_gain * max_bev_deviation_deg (0.01 * 45)
                               # Elimina saturación en el rango operativo completo.
-                              # PENDIENTE DE VALIDACIÓN: sin medición de derrape en
-                              # skid-steer con avance simultáneo. Ver briefs 18/23.
+    turn_slowdown_factor: 0.7          # FIX 1b: A demanda angular máxima, reduce el avance lineal hasta un 70%
+    min_drive_throttle_ratio: 0.3      # FIX 1b: Piso de avance: nunca baja del 30% del throttle nominal
+    motor_deadband_throttle: 0.15      # FIX A.2: Umbral estimado de arranque de motores.
+                                       # Por debajo de este valor el comando no produce
+                                       # movimiento. PENDIENTE DE MEDICIÓN: ver matriz de
+                                       # calibraciones de hardware (medición 3).
     max_total_drive_angular: 0.8       # Límite de seguridad absoluto para la fracción angular en DRIVE (0.0 a 1.0)
     invert_angular: true               # Inversión de signo angular para coincidir con la convención cinemática del robot
     control_loop_hz: 3.0               # Frecuencia del lazo principal de control (Hz)
@@ -41,6 +52,10 @@ gps_waypoint_controller:
     path_following_enabled: true       # Habilita seguimiento de trayectorias locales BEV
     path_topic: "earth_rover/planned_path"
     path_valid_topic: "earth_rover/planner_valid"
+    alive_paths_topic: "earth_rover/alive_paths"  # Tópico con conteo de caminos sobrevivientes al filtro de colisión (FIX 2)
+    alive_paths_nominal: 40            # Cantidad nominal de caminos libres; conteos menores indican congestión
+    min_congestion_ratio: 0.25         # Piso de velocidad lineal en congestión crítica (alive_paths=1)
+    alive_paths_max_stale_s: 5.0       # Antigüedad máxima permitida para telemetría de alive_paths (segundos)
     path_max_stale_s: 8.0              # Antigüedad máxima de trayectoria planificada antes de fallback a GPS (segundos)
     lookahead_distance_m: 1.0          # Distancia de persecución sobre la trayectoria (metros)
     recovery_turn_throttle: 0.30       # Fracción normalizada de acelerador angular en modo RECOVERY (0.0 a 1.0)

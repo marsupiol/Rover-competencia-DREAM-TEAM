@@ -11,6 +11,7 @@ bev_planner_node:
     visualization_topic: "earth_rover/planner_visualization"
     valid_topic: "earth_rover/planner_valid"
     local_bev_grid_topic: "earth_rover/local_bev_grid"
+    alive_paths_topic: "earth_rover/alive_paths"
     publish_visualization: false
 
     # Integración y Guía por Planificador Global (Fase 4)

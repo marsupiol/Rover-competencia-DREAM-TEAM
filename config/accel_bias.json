@@ -1,0 +1,17 @@
+{
+  "_comment": "Accelerometer calibration for Mini+ Rover. Derived from 125s continuous stationary telemetry capture (1,235 samples). Values in g. Derived after applying accel_scale_factor=0.5098. Measured 2026-09-08 with rover still and level. Must be regenerated if hardware unit changes.",
+  "date": "2026-09-08",
+  "conditions": "Rover stationary and level on horizontal surface",
+  "capture_duration_s": 125.09,
+  "num_samples": 1235,
+  "units": "g",
+  "accel_scale_factor_applied": 0.5098,
+  "raw_mean_norm_g": 1.9615,
+  "raw_std_norm_g": 0.0030,
+  "accel_bias_x": 0.020440,
+  "accel_bias_y": 0.000159,
+  "accel_bias_z": 0.000210,
+  "std_x_g": 0.001185,
+  "std_y_g": 0.001078,
+  "std_z_g": 0.001539
+}

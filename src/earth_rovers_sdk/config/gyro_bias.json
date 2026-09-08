@@ -1,0 +1,18 @@
+{
+  "_comment": "Inertial calibration for Mini+ Rover. Derived from 125s continuous stationary telemetry capture (1,235 samples). Values in rad/s. Measured 2026-09-08 with rover still and level. Must be regenerated if hardware unit changes.",
+  "date": "2026-09-08",
+  "conditions": "Rover stationary and level on horizontal surface",
+  "capture_duration_s": 125.09,
+  "num_samples": 1235,
+  "units": "rad/s",
+  "gyro_bias_x": -0.091933,
+  "gyro_bias_y": -0.017092,
+  "gyro_bias_z": 0.002804,
+  "std_x_rad_s": 0.000824,
+  "std_y_rad_s": 0.001108,
+  "std_z_rad_s": 0.000902,
+  "gyro_bias_x_deg_s": -5.2674,
+  "gyro_bias_y_deg_s": -0.9793,
+  "gyro_bias_z_deg_s": 0.1607,
+  "drift_gz_120s_deg_s": 0.0043
+}

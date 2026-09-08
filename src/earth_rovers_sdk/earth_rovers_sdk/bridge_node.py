@@ -173,6 +173,7 @@ class EarthRoverBridge(Node):
 
         # Parámetros del Filtro Complementario Roll/Pitch e Inercial (Brief 5 / E.1 & Brief 15 / O.4)
         self.declare_parameter("tilt_filter_alpha", 0.20)
+        self.declare_parameter("accel_scale_factor", 0.5098)  # Factor de escala por MPU6050 medido en reposo (125s, 1235 muestras)
         self.declare_parameter("gyro_bias_x", 0.0)
         self.declare_parameter("gyro_bias_y", 0.0)
         self.declare_parameter("gyro_bias_z", 0.0)
@@ -206,6 +207,9 @@ class EarthRoverBridge(Node):
         )
         self._tilt_filter_alpha = float(
             self.get_parameter("tilt_filter_alpha").value
+        )
+        self._accel_scale_factor = float(
+            self.get_parameter("accel_scale_factor").value
         )
         self._gyro_bias_x = float(self.get_parameter("gyro_bias_x").value)
         self._gyro_bias_y = float(self.get_parameter("gyro_bias_y").value)
@@ -257,9 +261,17 @@ class EarthRoverBridge(Node):
         # 1. Calibración de Giróscopo
         gyro_file = str(self.get_parameter("gyro_bias_file").value).strip()
         if not gyro_file:
-            default_gyro = os.path.join(os.getcwd(), "config", "gyro_bias.json")
-            if os.path.isfile(default_gyro):
-                gyro_file = default_gyro
+            candidates = [
+                os.path.join(os.getcwd(), "config", "gyro_bias.json"),
+                "/root/ros2_ws/config/gyro_bias.json",
+                "/home/marian/ros2_ws/config/gyro_bias.json",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "gyro_bias.json"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config", "gyro_bias.json"),
+            ]
+            for cand in candidates:
+                if os.path.isfile(cand):
+                    gyro_file = cand
+                    break
 
         if gyro_file and os.path.isfile(gyro_file):
             try:
@@ -283,9 +295,17 @@ class EarthRoverBridge(Node):
         # 2. Calibración de Acelerómetro
         accel_file = str(self.get_parameter("accel_bias_file").value).strip()
         if not accel_file:
-            default_accel = os.path.join(os.getcwd(), "config", "accel_bias.json")
-            if os.path.isfile(default_accel):
-                accel_file = default_accel
+            candidates = [
+                os.path.join(os.getcwd(), "config", "accel_bias.json"),
+                "/root/ros2_ws/config/accel_bias.json",
+                "/home/marian/ros2_ws/config/accel_bias.json",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "accel_bias.json"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "config", "accel_bias.json"),
+            ]
+            for cand in candidates:
+                if os.path.isfile(cand):
+                    accel_file = cand
+                    break
 
         if accel_file and os.path.isfile(accel_file):
             try:
@@ -592,9 +612,9 @@ class EarthRoverBridge(Node):
                 rolls_a = []
                 pitches_a = []
                 for s in accels:
-                    ax_s = float(s[0]) - self._accel_bias_x
-                    ay_s = float(s[1]) - self._accel_bias_y
-                    az_s = float(s[2]) - self._accel_bias_z
+                    ax_s = float(s[0]) * self._accel_scale_factor - self._accel_bias_x
+                    ay_s = float(s[1]) * self._accel_scale_factor - self._accel_bias_y
+                    az_s = float(s[2]) * self._accel_scale_factor - self._accel_bias_z
                     norm_s = math.sqrt(ax_s**2 + ay_s**2 + az_s**2)
                     mags_a.append(norm_s)
                     rolls_a.append(math.atan2(ay_s, az_s))
@@ -708,9 +728,9 @@ class EarthRoverBridge(Node):
 
             if accels:
                 num_samples = len(accels)
-                avg_ax = sum(float(sample[0]) for sample in accels) / num_samples * GRAVITY_M_S2 - (self._accel_bias_x * GRAVITY_M_S2)
-                avg_ay = sum(float(sample[1]) for sample in accels) / num_samples * GRAVITY_M_S2 - (self._accel_bias_y * GRAVITY_M_S2)
-                avg_az = sum(float(sample[2]) for sample in accels) / num_samples * GRAVITY_M_S2 - (self._accel_bias_z * GRAVITY_M_S2)
+                avg_ax = (sum(float(sample[0]) for sample in accels) / num_samples * self._accel_scale_factor - self._accel_bias_x) * GRAVITY_M_S2
+                avg_ay = (sum(float(sample[1]) for sample in accels) / num_samples * self._accel_scale_factor - self._accel_bias_y) * GRAVITY_M_S2
+                avg_az = (sum(float(sample[2]) for sample in accels) / num_samples * self._accel_scale_factor - self._accel_bias_z) * GRAVITY_M_S2
                 imu.linear_acceleration.x = avg_ax
                 imu.linear_acceleration.y = avg_ay
                 imu.linear_acceleration.z = avg_az

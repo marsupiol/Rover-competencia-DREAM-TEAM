@@ -13,7 +13,7 @@ from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Path
 from sensor_msgs.msg import NavSatFix, Imu
-from std_msgs.msg import Float32, String, Bool
+from std_msgs.msg import Float32, String, Bool, Int32
 
 class GPSWaypointController(Node):
     def __init__(self):
@@ -63,6 +63,7 @@ class GPSWaypointController(Node):
         self.declare_parameter("drive_abort_threshold_deg", 65.0)
         self.declare_parameter("drive_abort_dwell_s", 1.5)
         self.declare_parameter("max_bev_deviation_deg", 45.0)
+        self.declare_parameter("drive_pivot_threshold_deg", 30.0)
 
         # Parámetros FIX 2a / FIX 2b (Burst proporcional e incertidumbre de rumbo)
         self.declare_parameter("turn_burst_min_s", 0.15)
@@ -73,6 +74,17 @@ class GPSWaypointController(Node):
 
         # Parámetros FIX 3 (Sticky RECOVERY y timeout)
         self.declare_parameter("recovery_max_duration_s", 20.0)
+
+        # Parámetros FIX 1 (Acoplamiento lineal/angular y reducción de avance en giro)
+        self.declare_parameter("turn_slowdown_factor", 0.7)
+        self.declare_parameter("min_drive_throttle_ratio", 0.3)
+        self.declare_parameter("motor_deadband_throttle", 0.15)
+
+        # Parámetros FIX 2 (Reducción por congestión de obstáculos en BEV alive_paths)
+        self.declare_parameter("alive_paths_topic", "earth_rover/alive_paths")
+        self.declare_parameter("alive_paths_nominal", 40)
+        self.declare_parameter("min_congestion_ratio", 0.25)
+        self.declare_parameter("alive_paths_max_stale_s", 5.0)
 
         # 2. EXTRACCIÓN DIRECTA DE PARÁMETROS (sin clamps, valores tal cual el yaml)
 
@@ -142,12 +154,19 @@ class GPSWaypointController(Node):
         self.drive_abort_threshold_deg = float(self.get_parameter("drive_abort_threshold_deg").value)
         self.drive_abort_dwell_s = float(self.get_parameter("drive_abort_dwell_s").value)
         self.max_bev_deviation_deg = float(self.get_parameter("max_bev_deviation_deg").value)
+        self.drive_pivot_threshold_deg = float(self.get_parameter("drive_pivot_threshold_deg").value)
         self.turn_burst_min_s = float(self.get_parameter("turn_burst_min_s").value)
         self.turn_burst_max_s = float(self.get_parameter("turn_burst_max_s").value)
         self.yaw_rate_deg_s = float(self.get_parameter("yaw_rate_deg_s").value)
         self.turn_burst_damping = float(self.get_parameter("turn_burst_damping").value)
         self.heading_trust_threshold_deg = float(self.get_parameter("heading_trust_threshold_deg").value)
         self.recovery_max_duration_s = float(self.get_parameter("recovery_max_duration_s").value)
+        self.turn_slowdown_factor = float(self.get_parameter("turn_slowdown_factor").value)
+        self.min_drive_throttle_ratio = float(self.get_parameter("min_drive_throttle_ratio").value)
+        self.motor_deadband_throttle = float(self.get_parameter("motor_deadband_throttle").value)
+        self.alive_paths_nominal = int(self.get_parameter("alive_paths_nominal").value)
+        self.min_congestion_ratio = float(self.get_parameter("min_congestion_ratio").value)
+        self.alive_paths_max_stale_s = float(self.get_parameter("alive_paths_max_stale_s").value)
 
         # 3. Perfiles QoS Diferenciados (Crítico para Jazzy)
         sensor_qos = QoSProfile(
@@ -210,6 +229,13 @@ class GPSWaypointController(Node):
             self._on_heading_uncertainty,
             sensor_qos,
         )
+        alive_paths_topic = str(self.get_parameter("alive_paths_topic").value)
+        self.create_subscription(
+            Int32,
+            alive_paths_topic,
+            self._on_alive_paths,
+            sensor_qos,
+        )
 
         self.cmd_pub = self.create_publisher(Twist, "cmd_vel", reliable_qos)
         self.status_pub = self.create_publisher(String, "earth_rover/waypoint_status", reliable_qos)
@@ -239,6 +265,8 @@ class GPSWaypointController(Node):
         self._path_poses: list[tuple[float, float]] = []
         self._path_valid: bool = False
         self._path_last_update = None
+        self._alive_paths: int | None = None
+        self._alive_paths_last_rx = None
         
         # Flags de Máquina de Estados
         self.active_goal = False
@@ -259,6 +287,7 @@ class GPSWaypointController(Node):
 
         # Instrumentación de Ciclo de Trabajo (Brief 18 / R.3.1)
         self._duty_drive_s: float = 0.0
+        self._duty_pivot_s: float = 0.0
         self._duty_turn_s: float = 0.0
         self._duty_pause_s: float = 0.0
         self._duty_recovery_s: float = 0.0
@@ -326,6 +355,10 @@ class GPSWaypointController(Node):
     def _on_heading_uncertainty(self, msg: Float32):
         self._heading_uncertainty_deg = float(msg.data)
         self._heading_uncertainty_last_rx = self.get_clock().now()
+
+    def _on_alive_paths(self, msg: Int32):
+        self._alive_paths = int(msg.data)
+        self._alive_paths_last_rx = self.get_clock().now()
 
     # --- CALLBACKS DE MÁQUINA DE ESTADOS ---
     def _on_target(self, msg: NavSatFix):
@@ -501,26 +534,6 @@ class GPSWaypointController(Node):
         heading_error = -math.degrees(angle_base_link_rad)
         return float(heading_error)
 
-    # --- BUCLE CENTRAL DE CONTROL ---
-    def _control_loop(self):
-        now = self.get_clock().now()
-
-        # Guarda de seguridad 1: Pausa externa
-        if self._navigation_paused:
-            self._stop_robot()
-            return
-
-        # Guarda de seguridad 2: Esperando procesamiento de SDK
-        if self._awaiting_next_target:
-            self._stop_robot()
-            elapsed = 0.0
-            if self._last_reached_publish_at is not None:
-                elapsed = (now - self._last_reached_publish_at).nanoseconds / 1e9
-            # Re-publicar REACHED si el manager tardó en procesar
-            if elapsed >= self.reached_publish_period_s:
-                self._publish_reached(now)
-            return
-
     def _speed_to_throttle(self, v_mps: float) -> float:
         """Convierte una velocidad física (m/s) a fracción de acelerador normalizado [0.0, 1.0].
         
@@ -597,6 +610,32 @@ class GPSWaypointController(Node):
         bearing = self.calculate_bearing(self.current_lat, self.current_lon, self.target_lat, self.target_lon)
         geodesic_heading_error = self.angle_error_deg(bearing, self.current_heading)
 
+        # Rumbo deseado en marco mundo. Es la MISMA referencia para ALIGN y DRIVE.
+        # Por qué esto NO reintroduce el bucle infinito del brief 24: target_heading_world
+        # está anclado a bearing ± max_bev_deviation_deg en marco mundo. No rota con el
+        # chasis. Si el rover gira hacia el objetivo, el error decrece monótonamente.
+        # Verificación del caso límite (incluir como comentario en el código): si el rover
+        # ya está en bearing + 45° y el BEV pide otros +45° desde esa vista,
+        # bev_desired_world = bearing + 90°, que se recorta a bearing + 45° — el rumbo
+        # actual. Error cero. Punto fijo estable.
+        if self.path_following_enabled and self._path_is_fresh() and self._path_valid:
+            bev_delta = self._compute_path_heading_error_deg()      # relativo a base_link
+        else:
+            bev_delta = None
+
+        if bev_delta is not None:
+            bev_desired_world = (self.current_heading + bev_delta) % 360.0
+            deviation = self.angle_error_deg(bev_desired_world, bearing)
+            clamped_deviation = max(-self.max_bev_deviation_deg,
+                                    min(self.max_bev_deviation_deg, deviation))
+            target_heading_world = (bearing + clamped_deviation) % 360.0
+            heading_source = "bev_clamped"
+        else:
+            target_heading_world = bearing
+            heading_source = "geodesic"
+
+        heading_error = self.angle_error_deg(target_heading_world, self.current_heading)
+
         # Umbral dinámico de alineación (más estricto al acercarse)
         align_threshold = (
             self.align_threshold
@@ -632,8 +671,8 @@ class GPSWaypointController(Node):
                 )
 
         if self._control_mode == "ALIGN":
-            # ALIGN -> DRIVE: cuando error geodésico cae por debajo del umbral
-            if abs(geodesic_heading_error) <= align_threshold:
+            # ALIGN -> DRIVE: cuando error respecto al rumbo deseado cae por debajo del umbral
+            if abs(heading_error) <= align_threshold:
                 self._control_mode = "DRIVE"
                 self._drive_abort_started_at = None
         elif self._control_mode == "DRIVE":
@@ -665,9 +704,6 @@ class GPSWaypointController(Node):
 
         if self._control_mode == "ALIGN":
             mode = "ALIGN"
-            # En modo ALIGN, heading_error es ESTRICTAMENTE el error geodésico absoluto
-            heading_error = geodesic_heading_error
-            heading_source = "geodesic"
             twist.linear.x = 0.0
             elapsed = self._phase_elapsed(now)
 
@@ -784,31 +820,10 @@ class GPSWaypointController(Node):
 
         else: # self._control_mode == "DRIVE"
             mode = "DRIVE"
-            self._align_phase = "PAUSE"
             self._align_phase_started_at = None
             self._burst_turn_sign = 0
             self._last_turn_heading_seq = None
             self._last_turn_heading_rx = None
-
-            # En modo DRIVE, bev_path es la fuente de dirección para evasión reactiva de obstáculos
-            heading_error = None
-            heading_source = "none"
-            if self.path_following_enabled and self._path_is_fresh():
-                if self._path_valid and len(self._path_poses) >= 2:
-                    # FIX 1b: BEV corrige, no reemplaza (desviación acotada respecto a rumbo geodésico)
-                    bev_delta = self._compute_path_heading_error_deg()   # relativo a base_link
-                    bev_desired_world = (self.current_heading + bev_delta) % 360.0
-                    deviation = self.angle_error_deg(bev_desired_world, bearing)
-                    clamped_deviation = max(-self.max_bev_deviation_deg,
-                                            min(self.max_bev_deviation_deg, deviation))
-                    target_world = (bearing + clamped_deviation) % 360.0
-                    heading_error = self.angle_error_deg(target_world, self.current_heading)
-                    heading_source = "bev_clamped"
-
-            if heading_error is None:
-                # Fallback geodésico durante DRIVE si no hay camino BEV
-                heading_error = geodesic_heading_error
-                heading_source = "geodesic"
 
             # Gobernador de velocidad dinámico fail-safe (Brief 14 / N.1, Brief 15 / O.2, Brief 18 / R.1)
             safe_throttle_limit = self._speed_to_throttle(self._safe_velocity_limit)
@@ -852,24 +867,65 @@ class GPSWaypointController(Node):
                             throttle_duration_sec=2.0,
                         )
 
-            twist.linear.x = effective_throttle
             if effective_throttle <= 0.0:
-                # FIX 4: Si el gobernador expira o el fail-safe detiene el avance en DRIVE por pérdida de percepción,
+                # Si el gobernador expira o el fail-safe detiene el avance en DRIVE por pérdida de percepción,
                 # cancelar también el giro para no rotar en el lugar a ciegas.
+                twist.linear.x = 0.0
                 twist.angular.z = 0.0
-            else:
-                # Corrección suave sobre la marcha (Proporcional débil)
-                correction = self.drive_correction_gain * heading_error
-                clamped_angular = max(-self.max_drive_angular, min(self.max_drive_angular, correction))
+                self._align_phase = "PAUSE"
+            elif abs(heading_error) > self.drive_pivot_threshold_deg:
+                # FIX 2 (CRÍTICO): Pivote en el lugar dentro de DRIVE
+                # Pivote en el lugar: girar rápido hacia el rumbo deseado sin avanzar.
+                # Girar despacio mientras se avanza no alcanza para esquivar: a w=0.15 el
+                # giro es ~3.6 grados/s y corregir 45 grados toma 12 s, durante los cuales
+                # el rover recorre varios metros hacia el obstáculo.
+                twist.linear.x = 0.0
                 twist.angular.z = self._apply_angular_sign(
-                    max(-self.max_total_drive_angular, min(self.max_total_drive_angular, clamped_angular))
+                    math.copysign(self.turn_throttle, heading_error)
                 )
+                self._align_phase = "PIVOT"
+            else:
+                self._align_phase = "DRIVE"
+                # 1. Reducción de avance por congestión de obstáculos en BEV (alive_paths, FIX 2)
+                congestion_factor = 1.0
+                if self._alive_paths is not None and self._alive_paths_last_rx is not None:
+                    age_alive = (now - self._alive_paths_last_rx).nanoseconds / 1e9
+                    if age_alive <= self.alive_paths_max_stale_s:
+                        path_freedom = min(1.0, float(self._alive_paths) / max(1.0, float(self.alive_paths_nominal)))
+                        congestion_factor = max(self.min_congestion_ratio, path_freedom)
+
+                # 2. Corrección angular sobre la marcha y reducción por giro (FIX 1b)
+                correction = self.drive_correction_gain * heading_error
+                angular_demand = min(1.0, abs(correction) / max(self.max_drive_angular, 1e-6))
+                turn_slowdown = max(self.min_drive_throttle_ratio, 1.0 - self.turn_slowdown_factor * angular_demand)
+
+                # FIX A.1 (CRÍTICO): Las reducciones NO se multiplican: se toma la más restrictiva (el mínimo).
+                # Multiplicarlas lleva el comando por debajo de la zona muerta de los motores y produce deadlock.
+                reduction_factor = min(congestion_factor, turn_slowdown)
+                effective_throttle = effective_throttle * reduction_factor
+
+                # FIX A.2 (CRÍTICO): Piso de zona muerta. El comando es o cero explícito o por encima
+                # de la zona muerta estimada de arranque de motores, nunca un valor intermedio inmóvil.
+                if effective_throttle > 0.0 and effective_throttle < self.motor_deadband_throttle:
+                    effective_throttle = self.motor_deadband_throttle
+
+                # FIX 1a (CRÍTICO): Acotar el giro para que nunca supere al avance lineal
+                # El comando angular nunca puede superar al lineal: con mezcla diferencial,
+                # |w| > thr invierte la rueda interna produciendo un pivote violento en vez de un arco.
+                w_limit = min(self.max_drive_angular, self.max_total_drive_angular, effective_throttle)
+                clamped_angular = max(-w_limit, min(w_limit, correction))
+
+                twist.linear.x = effective_throttle
+                twist.angular.z = self._apply_angular_sign(clamped_angular)
 
             # Duty cycle tracking
             if self._last_duty_tick_at is not None:
                 dt_duty = (now - self._last_duty_tick_at).nanoseconds / 1e9
                 if 0.0 < dt_duty < 2.0:
-                    self._duty_drive_s += dt_duty
+                    if self._align_phase == "PIVOT":
+                        self._duty_pivot_s += dt_duty
+                    else:
+                        self._duty_drive_s += dt_duty
                     self._duty_total_s += dt_duty
             self._last_duty_tick_at = now
 
@@ -921,6 +977,7 @@ class GPSWaypointController(Node):
                 else None
             )
             pct_drive = (self._duty_drive_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
+            pct_pivot = (self._duty_pivot_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
             pct_turn = (self._duty_turn_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
             pct_pause = (self._duty_pause_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
             pct_rec = (self._duty_recovery_s / self._duty_total_s * 100.0) if self._duty_total_s > 0 else 0.0
@@ -981,6 +1038,7 @@ class GPSWaypointController(Node):
                 "distance_m": float(distance),
                 "duty_cycle": {
                     "drive_pct": round(pct_drive, 1),
+                    "pivot_pct": round(pct_pivot, 1),
                     "turn_pct": round(pct_turn, 1),
                     "pause_pct": round(pct_pause, 1),
                     "recovery_pct": round(pct_rec, 1),
@@ -996,11 +1054,12 @@ class GPSWaypointController(Node):
             self._last_duty_log_at = now
             if self._duty_total_s > 0.0:
                 pct_drive = self._duty_drive_s / self._duty_total_s * 100.0
+                pct_pivot = self._duty_pivot_s / self._duty_total_s * 100.0
                 pct_turn = self._duty_turn_s / self._duty_total_s * 100.0
                 pct_pause = self._duty_pause_s / self._duty_total_s * 100.0
                 pct_rec = self._duty_recovery_s / self._duty_total_s * 100.0
                 self.get_logger().info(
-                    f"[DUTY_CYCLE] DRIVE={pct_drive:.1f}% | TURN={pct_turn:.1f}% | PAUSE={pct_pause:.1f}% | RECOVERY={pct_rec:.1f}% (total={self._duty_total_s:.1f}s)"
+                    f"[DUTY_CYCLE] DRIVE={pct_drive:.1f}% | PIVOT={pct_pivot:.1f}% | TURN={pct_turn:.1f}% | PAUSE={pct_pause:.1f}% | RECOVERY={pct_rec:.1f}% (total={self._duty_total_s:.1f}s)"
                 )
 
 
