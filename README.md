@@ -443,17 +443,50 @@ Para iterar ágilmente sobre el código sin rebuilds innecesarios de Docker:
    * Las directrices de entorno, decisiones de arquitectura y métricas de referencia están consolidadas en `MEMORY.md` y `GEMINI.md` / `AGENTS.md` en la raíz del repo (ignoradas por Git).
    * Antigravity CLI / Gemini cargan automáticamente estas reglas al iniciar cualquier sesión de trabajo.
 
-### 5.5. Cómo Correr una Misión Completa (Punto de Entrada Único)
+### 5.5. Cómo Iniciar la Misión
 
-Una vez levantado el contenedor (`docker compose -f docker-compose.gpu.yml up -d`), se ejecuta la misión completa con una única instrucción de launch consolidada:
+Asegurate de que el contenedor esté corriendo en segundo plano (`docker compose -f docker-compose.gpu.yml up -d`). Para iniciar el sistema existen dos alternativas operativas:
+
+#### Opción 1: En Dos Terminales Separadas (Recomendado para Monitoreo y Depuración)
+
+Permite visualizar los logs de comunicación con Agora WebRTC / FrodoBots en la primera terminal, y la navegación/planificación de ROS 2 en la segunda.
+
+* **Terminal 1 — Servidor SDK (WebRTC Agora / Telemetría):**
+  ```bash
+  docker exec -it mini_plus_rover bash -c "python3 /root/ros2_ws/run_sdk.py"
+  ```
+  > **Verificación:** Aguardá hasta ver en consola:
+  > ```text
+  > INFO:     Application startup complete.
+  > INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+  > ```
+
+* **Terminal 2 — Stack Autónomo de Misión (ROS 2):**
+  Una vez que el SDK responde en `:8000`, ejecutá desde el host:
+  ```bash
+  ./run_mission1.sh
+  ```
+  *(O de forma explícita:)*
+  ```bash
+  docker exec -it mini_plus_rover bash -c "source /opt/ros/jazzy/setup.bash && source install/setup.bash && ros2 launch er_bringup mission1.launch.py"
+  ```
+  *(Para correr en modo reactivo puro sin mapa persistente ni D\* Lite, agregá `enable_global_planning:=false`)*.
+
+---
+
+#### Opción 2: En Una Sola Terminal (Lanzamiento Unificado)
+
+Lanza el SDK en segundo plano dentro del contenedor persistente, espera automáticamente a que el endpoint `:8000` esté listo y ejecuta inmediatamente el launch de la misión en el primer plano de la misma terminal:
 
 ```bash
-docker exec -it mini_plus_rover bash
-source /opt/ros/jazzy/setup.bash && source install/setup.bash
-ros2 launch er_bringup mission_manager.launch.py mission_slug:=mission-1 bot_slug:=luke-notch-quirk enable_global_planning:=false
+docker exec -it mini_plus_rover bash -c "python3 /root/ros2_ws/run_sdk.py > /root/ros2_ws/sdk.log 2>&1 & for i in {1..30}; do curl -sf http://localhost:8000/data > /dev/null 2>&1 && break || sleep 0.5; done && source /opt/ros/jazzy/setup.bash && source install/setup.bash && ros2 launch er_bringup mission1.launch.py"
 ```
 
-Este comando levanta de forma coordinada:
+*(Alternativamente, también podés utilizar el script orquestador integrado: `docker exec -it mini_plus_rover bash /root/ros2_ws/scripts/run_all.sh`)*.
+
+---
+
+Este pipeline levanta de forma coordinada:
 1. **Bridge SDK (`earth_rover_bridge`):** Enlace bidireccional WebSocket y HTTP con el servidor SDK del rover.
 2. **Fusión Sensorial EKF (`ekf.launch.py`):** Filtros odometría local, global y transformación geodésica `/fromLL`.
 3. **Percepción y Planificación Local BEV (`bev_planner_node`):** Inferencia SAM-TP en GPU y trayectorias GeNIE optimizadas.
